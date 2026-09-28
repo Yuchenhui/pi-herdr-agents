@@ -6488,9 +6488,28 @@ describe("worktree cleanup public surface", () => {
 					});
 				}
 				if (file === "git") {
-					assert.deepEqual(args, ["rev-parse", "--verify", "HEAD^{commit}"]);
 					assert.equal(options.cwd, "/repo");
-					return "a".repeat(40);
+					if (args[1] === "--verify") {
+						assert.deepEqual(args, ["rev-parse", "--verify", "HEAD^{commit}"]);
+						return "a".repeat(40);
+					}
+					if (args[1] === "--path-format=absolute") {
+						if (args[2] === "--git-dir")
+							assert.deepEqual(args, [
+								"rev-parse",
+								"--path-format=absolute",
+								"--git-dir",
+							]);
+						else if (args[2] === "--git-common-dir")
+							assert.deepEqual(args, [
+								"rev-parse",
+								"--path-format=absolute",
+								"--git-common-dir",
+							]);
+						else assert.fail(`unexpected Git path command: ${args.join(" ")}`);
+						return "/repo/.git\n";
+					}
+					assert.fail(`unexpected Git command: ${args.join(" ")}`);
 				}
 				assert.equal(file, "herdr");
 				assert.deepEqual(args, [
@@ -6563,7 +6582,7 @@ describe("worktree cleanup public surface", () => {
 				notices.at(-1),
 				"Worktree launch failed: fixture handoff creation stopped",
 			);
-			assert.equal(effects.length, 4);
+			assert.equal(effects.length, 6);
 			const manifestDir = join(dir, "artifacts", "child", "worktree-runs");
 			const manifests = readdirSync(manifestDir);
 			assert.equal(manifests.length, 1);
