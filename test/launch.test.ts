@@ -19,11 +19,14 @@ import {
 	type ResumePiLaunchRequest,
 } from "../pi-extension/subagents/launch.ts";
 import { createSubagentPaneFactory } from "../pi-extension/subagents/pane-config.ts";
-import { shellQuote } from "../pi-extension/subagents/terminal.ts";
 import {
 	readSubagentSessionPolicy,
 	writeSubagentSessionPolicy,
 } from "../pi-extension/subagents/session.ts";
+
+function expectedShellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
 
 function fixture() {
 	const root = mkdtempSync(
@@ -175,7 +178,7 @@ describe("Pi launch", () => {
 			assert.deepEqual(policy.deniedTools, ["subagent", "subagent_resume"]);
 			assert.equal(policy.persistent, false);
 			assert.equal(command.includes(projectAgentDir), false);
-			assert.ok(command.startsWith(`cd ${shellQuote(project)} && `));
+			assert.ok(command.startsWith(`cd ${expectedShellQuote(project)} && `));
 			assert.match(command, /--model 'fake\/worker'/);
 			assert.match(command, /--thinking 'high'/);
 			assert.match(command, /--tools 'read,bash,caller_ping'/);
@@ -763,17 +766,19 @@ describe("Pi launch", () => {
 				assert.equal(running.worktree, undefined);
 				assert.ok(
 					command.startsWith(
-						`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR!)} `,
+						`PI_CODING_AGENT_DIR=${expectedShellQuote(process.env.PI_CODING_AGENT_DIR!)} `,
 					),
 				);
 				assert.ok(
 					command.includes(
-						`pi --session ${shellQuote(sessionFile)} --tools 'read,bash,caller_ping' -e `,
+						`pi --session ${expectedShellQuote(sessionFile)} --tools 'read,bash,caller_ping' -e `,
 					),
 				);
 				assert.match(command, /PI_SUBAGENT_NAME='Resume worker'/);
 				assert.ok(
-					command.includes(`PI_SUBAGENT_SESSION=${shellQuote(sessionFile)}`),
+					command.includes(
+						`PI_SUBAGENT_SESSION=${expectedShellQuote(sessionFile)}`,
+					),
 				);
 				assert.match(command, /PI_SUBAGENT_ID='resume-1'/);
 				assert.match(command, /PI_SUBAGENT_ACTIVITY_FILE='/);
@@ -932,7 +937,9 @@ describe("Pi launch", () => {
 				readSubagentSessionPolicy(running.sessionFile).owner,
 				"managed-worktree",
 			);
-			assert.ok(command.startsWith(`cd ${shellQuote(worktreePath)} && `));
+			assert.ok(
+				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
+			);
 			const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
 			assert.equal(manifest.state, "running");
 			assert.equal(manifest.owner, "pi-herdr-subagents");
@@ -1002,7 +1009,9 @@ describe("Pi launch", () => {
 				readFileSync(join(worktreePath, "linked.txt"), "utf8"),
 				"linked\n",
 			);
-			assert.ok(command.startsWith(`cd ${shellQuote(worktreePath)} && `));
+			assert.ok(
+				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
+			);
 			const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
 			assert.equal(manifest.sourceCwd, linkedCwd);
 			assert.equal(manifest.baseSha, linkedSha);
@@ -1252,7 +1261,9 @@ describe("Pi launch", () => {
 				readFileSync(request.parent.sessionFile, "utf8"),
 				parentBefore,
 			);
-			assert.ok(command.startsWith(`cd ${shellQuote(worktreePath)} && `));
+			assert.ok(
+				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
+			);
 			assert.doesNotMatch(
 				command,
 				/subagent-done|PI_SUBAGENT_|__SUBAGENT_DONE_/,
