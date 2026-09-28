@@ -47,7 +47,7 @@ only the cleanup tools and removal subcommand are parent-only.
 
 Open workspaces are removed through Herdr. Git-only orphans use Git removal,
 verify checkout absence, and then prune stale registrations. Branches and their
-commits are retained. Session start only reports inventory counts.
+commits are retained. Session startup does not scan worktree inventory, avoiding blocking Pi initialization; use `/worktree list` or `worktree_list` for an explicit inventory.
 
 ## Rejected alternatives
 
