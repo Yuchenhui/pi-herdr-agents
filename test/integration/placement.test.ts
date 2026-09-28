@@ -1,10 +1,18 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, realpathSync, rmdirSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	realpathSync,
+	rmdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import {
 	launchPiSubagent,
+	readWorktreeManifest,
 	type FreshPiLaunchRequest,
 } from "../../pi-extension/subagents/launch.ts";
 import {
@@ -22,6 +30,7 @@ import {
 	loadPaneConfig,
 } from "../../pi-extension/subagents/pane-config.ts";
 import subagentsExtension from "../../pi-extension/subagents/index.ts";
+import { isNonEmptyString } from "../../pi-extension/subagents/type-guards.ts";
 import {
 	createEventBus,
 	SessionManager,
@@ -33,6 +42,7 @@ import {
 	getAvailableBackends,
 	getFocusedSurface,
 	sleep,
+	uniqueId,
 	waitForFile,
 	TEST_MODEL,
 	type TestEnv,
@@ -741,6 +751,139 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 					else process.env.PI_SUBAGENT_ID = previousId;
 				}
 			});
+
+		it("launches a worktree from a linked checkout through the real Herdr path", async () => {
+			const linked = join(env.dir, "linked-source");
+			const linkedCwd = join(linked, "nested caller");
+			const principalBranch = "integration/linked";
+			const branch = `integration/linked-child-${uniqueId()}`;
+			const childId = uniqueId();
+			const manifestFile = join(
+				env.dir,
+				"artifacts",
+				"parent",
+				"worktree-runs",
+				`${childId}.json`,
+			);
+			let repositoryInitialized = false;
+			let linkedWorktreeCreated = false;
+			let child: Awaited<ReturnType<typeof launchPiSubagent>> | undefined;
+			let childWorkspaceId: string | undefined;
+			try {
+				execFileSync("git", ["init", "-q", "-b", "main"], { cwd: env.dir });
+				repositoryInitialized = true;
+				execFileSync("git", ["config", "user.email", "test@example.com"], {
+					cwd: env.dir,
+				});
+				execFileSync("git", ["config", "user.name", "Integration Test"], {
+					cwd: env.dir,
+				});
+				execFileSync("git", ["config", "commit.gpgsign", "false"], {
+					cwd: env.dir,
+				});
+				writeFileSync(join(env.dir, "base.txt"), "base\n");
+				execFileSync("git", ["add", "base.txt"], { cwd: env.dir });
+				execFileSync("git", ["commit", "-qm", "base"], { cwd: env.dir });
+				execFileSync(
+					"git",
+					["worktree", "add", "-q", "-b", principalBranch, linked, "HEAD"],
+					{ cwd: env.dir },
+				);
+				linkedWorktreeCreated = true;
+				writeFileSync(join(linked, "linked.txt"), "linked\n");
+				execFileSync("git", ["add", "linked.txt"], { cwd: linked });
+				execFileSync("git", ["commit", "-qm", "linked"], { cwd: linked });
+				mkdirSync(linkedCwd);
+				const linkedSha = execFileSync("git", ["rev-parse", "HEAD"], {
+					cwd: linkedCwd,
+					encoding: "utf8",
+				}).trim();
+				const focusedPane = getFocusedSurface(backend);
+				child = await launchPiSubagent({
+					...request(3),
+					id: childId,
+					cwd: linkedCwd,
+					worktree: { branch },
+				});
+				childWorkspaceId = child.worktree?.workspaceId;
+				assert.ok(child.worktree);
+				assert.equal(child.worktree.branch, branch);
+				assert.notEqual(child.worktree.path, linked);
+				assert.equal(
+					panes(child.worktree.workspaceId).find(
+						(pane) => pane.pane_id === child.surface,
+					)?.cwd,
+					realpathSync(child.worktree.path),
+				);
+				assert.equal(
+					readFileSync(join(child.worktree.path, "linked.txt"), "utf8"),
+					"linked\n",
+				);
+				assert.equal(
+					execFileSync("git", ["rev-parse", "HEAD"], {
+						cwd: linkedCwd,
+						encoding: "utf8",
+					}).trim(),
+					linkedSha,
+				);
+				assert.equal(
+					getFocusedSurface(backend),
+					focusedPane,
+					"linked checkout provisioning must not steal focus",
+				);
+				await waitForFile(`${child.sessionFile}.exit`, 60_000);
+			} finally {
+				const deleteBranch = (name: string) => {
+					if (!repositoryInitialized) return;
+					try {
+						execFileSync(
+							"git",
+							["show-ref", "--verify", "--quiet", `refs/heads/${name}`],
+							{ cwd: env.dir },
+						);
+					} catch {
+						return;
+					}
+					execFileSync("git", ["branch", "-D", name], {
+						cwd: env.dir,
+						stdio: "ignore",
+					});
+				};
+				if (!childWorkspaceId && existsSync(manifestFile)) {
+					const manifest = readWorktreeManifest(manifestFile);
+					if (
+						manifest?.id === childId &&
+						manifest.branch === branch &&
+						isNonEmptyString(manifest.workspaceId)
+					) {
+						childWorkspaceId = manifest.workspaceId;
+					}
+				}
+				try {
+					if (childWorkspaceId)
+						execFileSync("herdr", [
+							"worktree",
+							"remove",
+							"--workspace",
+							childWorkspaceId,
+							"--force",
+						]);
+				} finally {
+					try {
+						if (linkedWorktreeCreated)
+							execFileSync("git", ["worktree", "remove", "--force", linked], {
+								cwd: env.dir,
+							});
+					} finally {
+						try {
+							if (linkedWorktreeCreated) deleteBranch(principalBranch);
+						} finally {
+							deleteBranch(branch);
+						}
+					}
+				}
+			}
+		});
 
 		it("keeps the writer root shell and places a reviewer in the retained worktree tab", async () => {
 			execFileSync("git", ["init", "-q", "-b", "main"], { cwd: env.dir });

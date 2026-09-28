@@ -44,7 +44,7 @@ Worktrees isolate checkouts, indexes, and `HEAD`. They are **not security sandbo
 
 For a worktree launch:
 
-- `cwd` selects the source Git repository. A relative tool argument is resolved from the parent Pi process's current directory.
+- `cwd` selects the source Git repository. A relative tool argument is resolved from the parent Pi process's current directory. When `cwd` is a linked checkout, Herdr provisioning uses its principal checkout while the requested checkout supplies the base SHA and manifest provenance.
 - `worktree.branch` is a new, unique branch name. Git/Herdr rejects a branch that cannot be created or is already checked out elsewhere.
 - `worktree.base` may be any revision that resolves to a commit in the source repository. It defaults to committed `HEAD`.
 - The extension resolves `base` to an exact SHA, writes an ownership manifest, then calls `herdr worktree create --no-focus`.

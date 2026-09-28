@@ -391,6 +391,7 @@ function prepareLaunchSurface(
 
 	const baseRef = request.worktree.base ?? "HEAD";
 	const baseSha = resolveGitCommit(resolved.sourceCwd, baseRef);
+	const provisionCwd = resolveWorktreeProvisionCwd(resolved.sourceCwd);
 	const manifestFile = join(
 		resolved.artifactDir,
 		"worktree-runs",
@@ -414,7 +415,7 @@ function prepareLaunchSurface(
 	try {
 		created = operations.createWorktree(
 			request.name,
-			resolved.sourceCwd,
+			provisionCwd,
 			request.worktree.branch,
 			baseSha,
 		);
@@ -916,6 +917,50 @@ function resolveGitCommit(cwd: string, ref: string): string {
 		cwd,
 		encoding: "utf8",
 	}).trim();
+}
+
+function resolveWorktreeProvisionCwd(sourceCwd: string): string {
+	let gitDir: string;
+	let commonDir: string;
+	try {
+		gitDir = resolveGitPath(sourceCwd, "--git-dir");
+		commonDir = resolveGitPath(sourceCwd, "--git-common-dir");
+	} catch (error) {
+		throw new Error(
+			`Unable to identify the Git checkout for worktree provisioning from ${sourceCwd}: ${errorMessage(error)}`,
+		);
+	}
+	if (gitDir === commonDir) return sourceCwd;
+
+	try {
+		const output = execFileSync(
+			"git",
+			["worktree", "list", "--porcelain", "-z"],
+			{ cwd: sourceCwd },
+		).toString("utf8");
+		const principal = output
+			.split("\0")
+			.find((record) => record.startsWith("worktree "))
+			?.slice("worktree ".length);
+		if (!principal) throw new Error("Git returned no principal worktree");
+		return principal;
+	} catch (error) {
+		throw new Error(
+			`Unable to determine the principal Git checkout for linked worktree ${sourceCwd}: ${errorMessage(error)}`,
+		);
+	}
+}
+
+function resolveGitPath(
+	cwd: string,
+	flag: "--git-dir" | "--git-common-dir",
+): string {
+	const output = execFileSync(
+		"git",
+		["rev-parse", "--path-format=absolute", flag],
+		{ cwd, encoding: "utf8" },
+	);
+	return output.endsWith("\n") ? output.slice(0, -1) : output;
 }
 
 export function readWorktreeManifest(path: string): JsonObject | undefined {

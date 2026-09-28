@@ -81,6 +81,39 @@ function withFixture(
 	});
 }
 
+function initializeGitRepository(cwd: string): void {
+	execFileSync("git", ["init", "-q", "-b", "main"], { cwd });
+	execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+	execFileSync("git", ["config", "user.name", "Test"], { cwd });
+	execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd });
+}
+
+function commitAll(cwd: string, message: string): string {
+	execFileSync("git", ["add", "."], { cwd });
+	execFileSync("git", ["commit", "-qm", message], { cwd });
+	return execFileSync("git", ["rev-parse", "HEAD"], {
+		cwd,
+		encoding: "utf8",
+	}).trim();
+}
+
+function createLinkedGitFixture(root: string, principal: string) {
+	initializeGitRepository(principal);
+	writeFileSync(join(principal, "base.txt"), "base\n");
+	const principalSha = commitAll(principal, "base");
+	const linked = join(root, "linked source α\ncheckout");
+	execFileSync(
+		"git",
+		["worktree", "add", "-q", "-b", "linked/source", linked, principalSha],
+		{ cwd: principal },
+	);
+	writeFileSync(join(linked, "linked.txt"), "linked\n");
+	const linkedSha = commitAll(linked, "linked change");
+	const linkedCwd = join(linked, "nested caller");
+	mkdirSync(linkedCwd);
+	return { linked, linkedCwd, linkedSha };
+}
+
 function writePublicResumePolicy(sessionFile: string): void {
 	writeSubagentSessionPolicy(sessionFile, {
 		owner: "public",
@@ -905,6 +938,194 @@ describe("Pi launch", () => {
 			assert.equal(manifest.state, "running");
 			assert.equal(manifest.owner, "pi-herdr-subagents");
 			assert.equal(manifest.paneId, "root-pane-1");
+		});
+	});
+
+	it("provisions a linked checkout from its principal while preserving its base", async () => {
+		await withFixture(async ({ request, project, root, sessionDir }) => {
+			const { linkedCwd, linkedSha } = createLinkedGitFixture(root, project);
+			const worktreePath = join(root, "linked-child");
+			const worktreeRequest: FreshPiLaunchRequest = {
+				...request,
+				cwd: linkedCwd,
+				worktree: { branch: "issue/59-fresh", base: "HEAD" },
+			};
+			const manifestFile = join(
+				sessionDir,
+				"artifacts",
+				"parent",
+				"worktree-runs",
+				"child-1.json",
+			);
+			let command = "";
+			const operations: PiLaunchOperations = {
+				createPane() {
+					throw new Error("unexpected pane creation");
+				},
+				createWorktree(name, cwd, branch, base) {
+					assert.equal(name, "Worker");
+					assert.equal(cwd, project);
+					assert.equal(branch, "issue/59-fresh");
+					assert.equal(base, linkedSha);
+					const provisioning = JSON.parse(readFileSync(manifestFile, "utf8"));
+					assert.equal(provisioning.sourceCwd, linkedCwd);
+					assert.equal(provisioning.baseSha, linkedSha);
+					execFileSync(
+						"git",
+						["worktree", "add", "-q", "-b", branch, worktreePath, base],
+						{ cwd },
+					);
+					return {
+						path: worktreePath,
+						branch,
+						workspaceId: "workspace-linked-fresh",
+						paneId: "pane-linked-fresh",
+					};
+				},
+				async waitForShellReady(surface) {
+					assert.equal(surface, "pane-linked-fresh");
+				},
+				runScript(surface, value, options) {
+					assert.equal(surface, "pane-linked-fresh");
+					command = value;
+					return options.scriptPath;
+				},
+				closePane: () => {
+					throw new Error("must retain the worktree workspace");
+				},
+			};
+
+			const running = await launchPiSubagent(worktreeRequest, operations);
+
+			assert.equal(running.worktree?.baseSha, linkedSha);
+			assert.equal(running.worktree?.path, worktreePath);
+			assert.equal(
+				readFileSync(join(worktreePath, "linked.txt"), "utf8"),
+				"linked\n",
+			);
+			assert.match(command, new RegExp(`^cd '${worktreePath}' && `));
+			const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+			assert.equal(manifest.sourceCwd, linkedCwd);
+			assert.equal(manifest.baseSha, linkedSha);
+		});
+	});
+
+	it("uses the principal checkout for linked worktree handoffs", async () => {
+		await withFixture(async ({ request, project, root, sessionDir }) => {
+			const { linked, linkedCwd, linkedSha } = createLinkedGitFixture(
+				root,
+				project,
+			);
+			writeFileSync(
+				request.parent.sessionFile,
+				[
+					{
+						type: "session",
+						version: 3,
+						id: "parent",
+						cwd: linked,
+					},
+					{
+						type: "message",
+						id: "user-1",
+						parentId: null,
+						message: {
+							role: "user",
+							content: [{ type: "text", text: "Start the feature" }],
+							timestamp: 1,
+						},
+					},
+					{
+						type: "message",
+						id: "assistant-1",
+						parentId: "user-1",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "Continue" }],
+							api: "test",
+							provider: "fake",
+							model: "worker",
+							usage: {},
+							stopReason: "stop",
+							timestamp: 2,
+						},
+					},
+				]
+					.map((entry) => JSON.stringify(entry))
+					.join("\n") + "\n",
+			);
+			const worktreePath = join(root, "linked-handoff-child");
+			const manifestFile = join(
+				sessionDir,
+				"artifacts",
+				"parent",
+				"worktree-runs",
+				"child-1.json",
+			);
+			const operations: PiLaunchOperations = {
+				createPane() {
+					throw new Error("unexpected pane creation");
+				},
+				createWorktree(name, cwd, branch, base) {
+					assert.equal(name, "Handoff");
+					assert.equal(cwd, project);
+					assert.equal(branch, "handoff/59");
+					assert.equal(base, linkedSha);
+					assert.equal(
+						JSON.parse(readFileSync(manifestFile, "utf8")).sourceCwd,
+						linkedCwd,
+					);
+					execFileSync(
+						"git",
+						["worktree", "add", "-q", "-b", branch, worktreePath, base],
+						{ cwd },
+					);
+					return {
+						path: worktreePath,
+						branch,
+						workspaceId: "workspace-linked-handoff",
+						paneId: "pane-linked-handoff",
+					};
+				},
+				async waitForShellReady(surface) {
+					assert.equal(surface, "pane-linked-handoff");
+				},
+				runScript(surface, _command, options) {
+					assert.equal(surface, "pane-linked-handoff");
+					return options.scriptPath;
+				},
+				async waitForPiReady(surface) {
+					assert.equal(surface, "pane-linked-handoff");
+				},
+				focusWorkspace(workspaceId) {
+					assert.equal(workspaceId, "workspace-linked-handoff");
+				},
+				closePane: () => {
+					throw new Error("must retain the worktree workspace");
+				},
+			};
+
+			const result = await launchPiWorktreeHandoff(
+				{
+					...request,
+					name: "Handoff",
+					cwd: linkedCwd,
+					worktree: { branch: "handoff/59" },
+					handoff: { leafId: "assistant-1" },
+				},
+				operations,
+			);
+
+			assert.equal(result.running.worktree?.baseSha, linkedSha);
+			assert.equal(result.running.worktree?.path, worktreePath);
+			assert.equal(
+				readFileSync(join(worktreePath, "linked.txt"), "utf8"),
+				"linked\n",
+			);
+			assert.equal(
+				JSON.parse(readFileSync(manifestFile, "utf8")).sourceCwd,
+				linkedCwd,
+			);
 		});
 	});
 
