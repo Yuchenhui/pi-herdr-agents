@@ -1227,7 +1227,7 @@ interface PartialSubagentArgs {
 	task?: unknown;
 	agent?: unknown;
 	cwd?: unknown;
-	worktree?: PartialWorktreeArgs;
+	worktree?: PartialWorktreeArgs | null;
 }
 
 function sendSubagentResult(
