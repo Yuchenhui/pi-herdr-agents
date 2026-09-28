@@ -129,7 +129,6 @@ import {
 	listContainedWorktrees,
 	removeContainedWorktree,
 	formatWorktreeInventory,
-	worktreeInventoryNotice,
 	type WorktreeCleanupOperations,
 } from "./worktree-cleanup.ts";
 import {
@@ -2431,6 +2430,7 @@ export const __test__ = {
 	resolveUnexpectedErrorPresentation,
 	shouldAdvanceToFallback,
 	deliverPersistentTaskEvent,
+	drainPersistentTaskEvents,
 	notifyPersistentCrash,
 	sendSubagentResult,
 	shouldRetainSubagentSurface,
@@ -2666,11 +2666,13 @@ function deliverPersistentTaskEvent(
 	running: RunningSubagent,
 	event: ReturnType<typeof readPersistentTaskEvents>[number],
 	api: Pick<ExtensionAPI, "sendMessage">,
+	ledgerSnapshot?: ReturnType<typeof readPersistentDeliveryLedger>,
 ): void {
 	if (!running.persistent || event.generation !== running.generationId) return;
 	const deliveryKey = `${running.id}:${event.type}:${event.task}`;
 	if (inFlightPersistentTaskDeliveries.has(deliveryKey)) return;
-	const ledger = readPersistentDeliveryLedger(running.sessionFile);
+	const ledger =
+		ledgerSnapshot ?? readPersistentDeliveryLedger(running.sessionFile);
 	if (event.type === "help-request") {
 		if (
 			ledger.some(
@@ -2694,13 +2696,15 @@ function deliverPersistentTaskEvent(
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
-			appendPersistentDeliveryLedger(running.sessionFile, {
-				task: event.task,
-				outcome: "help-requested",
-				generation: running.generationId!,
-				logicalId: running.logicalId!,
-				policyHash: running.policyHash!,
-			});
+			ledger.push(
+				appendPersistentDeliveryLedger(running.sessionFile, {
+					task: event.task,
+					outcome: "help-requested",
+					generation: running.generationId!,
+					logicalId: running.logicalId!,
+					policyHash: running.policyHash!,
+				}),
+			);
 			if (running.taskId === event.task) running.taskId = undefined;
 		} finally {
 			inFlightPersistentTaskDeliveries.delete(deliveryKey);
@@ -2733,13 +2737,15 @@ function deliverPersistentTaskEvent(
 				policyHash: running.policyHash!,
 			},
 		);
-		appendPersistentDeliveryLedger(running.sessionFile, {
-			task: event.task,
-			outcome: "delivered",
-			generation: running.generationId!,
-			logicalId: running.logicalId!,
-			policyHash: running.policyHash!,
-		});
+		ledger.push(
+			appendPersistentDeliveryLedger(running.sessionFile, {
+				task: event.task,
+				outcome: "delivered",
+				generation: running.generationId!,
+				logicalId: running.logicalId!,
+				policyHash: running.policyHash!,
+			}),
+		);
 		running.tasksCompleted = completed;
 		if (running.taskId === event.task) running.taskId = undefined;
 		if (running.stopState === "pending")
@@ -2752,13 +2758,25 @@ function deliverPersistentTaskEvent(
 function drainPersistentTaskEvents(
 	running: RunningSubagent,
 	api: Pick<ExtensionAPI, "sendMessage">,
+	readLedger = readPersistentDeliveryLedger,
 ): void {
 	const events = readPersistentTaskEvents(running.sessionFile);
+	let ledger: ReturnType<typeof readPersistentDeliveryLedger> | undefined;
 	for (const event of events.slice(running.observedTaskEvents ?? 0)) {
+		if (!running.persistent || event.generation !== running.generationId)
+			continue;
+		if (
+			inFlightPersistentTaskDeliveries.has(
+				`${running.id}:${event.type}:${event.task}`,
+			)
+		)
+			continue;
+		ledger ??= readLedger(running.sessionFile);
 		deliverPersistentTaskEvent(
 			running,
 			event,
 			selectCompletionApi(api, runtime.pi),
+			ledger,
 		);
 	}
 	running.observedTaskEvents = events.length;
@@ -3139,19 +3157,6 @@ export default function subagentsExtension(
 			startWidgetRefresh();
 			startStatusRefresh(pi);
 			updateWidget();
-		}
-		if (parentSession && ctx.cwd && ctx.hasUI && isTerminalAvailable()) {
-			try {
-				const notice = worktreeInventoryNotice(
-					await listContainedWorktrees(cleanupInput(ctx)),
-				);
-				if (notice) ctx.ui.notify(notice, "info");
-			} catch (error) {
-				ctx.ui.notify(
-					`Worktree inventory unavailable: ${error instanceof Error ? error.message : String(error)}`,
-					"warning",
-				);
-			}
 		}
 	});
 
