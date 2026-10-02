@@ -1221,30 +1221,29 @@ describe("session.ts", () => {
 		});
 
 		it("fails when Pi does not persist the child snapshot", () => {
+			// Pi 1.0.0 persists a branched session as soon as it contains any user
+			// or assistant message, so the branch must end at a non-conversation
+			// entry for createBranchedSession to return an unwritten file path.
 			const timestamp = "2026-07-31T00:00:00.000Z";
 			const parentFile = createSessionFile(dir, [
 				{
 					type: "session",
 					version: 3,
-					id: "btw-user-only",
+					id: "btw-no-conversation",
 					timestamp,
 					cwd: dir,
 				},
 				{
-					type: "message",
-					id: "only-user",
+					type: "thinking_level_change",
+					id: "only-thinking-level",
 					parentId: null,
 					timestamp,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "hello" }],
-						timestamp: 1,
-					},
+					thinkingLevel: "medium",
 				},
 			]);
 
 			assert.throws(
-				() => createBtwSessionSnapshot(parentFile, "only-user"),
+				() => createBtwSessionSnapshot(parentFile, "only-thinking-level"),
 				/did not persist/i,
 			);
 		});
