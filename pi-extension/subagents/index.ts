@@ -14,24 +14,25 @@ import {
 } from "@earendil-works/pi-tui";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-	readdirSync,
-	readFileSync,
-	existsSync,
-	rmSync,
-	statSync,
-} from "node:fs";
+import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
-import { shellQuote } from "../../maestro/core/shell.ts";
-import type { SurfaceProvider } from "../../maestro/core/surface-provider.ts";
-import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
-import { PiHarnessAdapter } from "../../maestro/adapters/pi/pi-harness-adapter.ts";
-import type { AgentHandle } from "../../maestro/core/types.ts";
+import type { Task } from "../../maestro/core/types.ts";
 import {
-	SupervisionCoordinator,
-	type SupervisionRegistration,
-} from "./supervision.ts";
+	createDefaultRunSession,
+	type PiRunSession,
+	type PiRunSessionInfrastructure,
+	type PiRunRecord,
+	type PiLaunchSnapshot,
+	type PiLaunchInput,
+	type PiAttemptSnapshot,
+	type PiCompletedMetadata,
+	type PiPersistentIO,
+	type PiSettlementIO,
+	type PiPersistentEvent,
+	type PiLedgerEntry,
+	type PiProgressEvidence,
+} from "../../maestro/runtime/index.ts";
 import { loadSupervisionConfig } from "./supervision-config.ts";
 import {
 	buildAuthenticatedModelCatalog,
@@ -69,19 +70,11 @@ import {
 	type PersistentConfig,
 } from "./persistent-config.ts";
 import { loadPaneConfig } from "./pane-config.ts";
-import {
-	appendPersistentDeliveryLedger,
-	findLastAssistantMessage,
-	findObservedSessionRuntime,
-	inspectNoProgressSessionTail,
-	type NoProgressClassification,
-	type NoProgressSessionTail,
-	getNewEntries,
-	createBtwSessionSnapshot,
-	readPersistentDeliveryLedger,
-	readPersistentTaskEvents,
-	writePersistentTaskInbox,
-} from "../../maestro/adapters/pi/session.ts";
+type NoProgressClassification = PiProgressEvidence["classification"];
+type NoProgressSessionTail = Pick<
+	PiProgressEvidence,
+	"classification" | "lastEntryKind"
+>;
 import {
 	type SubagentStatusState,
 	capStatusLines,
@@ -101,10 +94,7 @@ import {
 	createLifecycle,
 	formatLifecycleTransitionLine,
 	lifecycleTransition,
-	markCompleted,
-	markCompletionDetected,
 	markDelivery,
-	markFailed,
 	markInterruptRequested,
 	markProcessRunning,
 	observeActivity,
@@ -122,13 +112,10 @@ import {
 } from "./worktree-cleanup.ts";
 import {
 	captureWorktreeHandoff,
-	launchOperationsFromSurface,
 	launchPiWorktreeHandoff,
-	persistWorktreeResult,
 	runSubagentScript,
 	writeWorktreeManifest,
 	buildSubagentToolAllowlist,
-	type PiLaunchOperations,
 	type WorktreeHandoff,
 	type WorktreeLaunch,
 } from "../../maestro/adapters/pi/launch.ts";
@@ -152,20 +139,6 @@ function readGlobalSlot<T>(key: symbol): T | undefined {
 function writeGlobalSlot<T>(key: symbol, value: T): void {
 	// SAFETY: see readGlobalSlot above; this module is the sole writer.
 	(globalThis as Record<symbol, T | undefined>)[key] = value;
-}
-
-const BTW_BOUNDARY = `You are answering an ephemeral BTW side question.
-Treat inherited conversation history only as reference context. Do not resume or complete an
-earlier task. Answer only the question after this boundary. Do not modify the workspace unless
-that side question explicitly requests a mutation.
-
-BTW question:
-`;
-
-interface BtwChild {
-	surface: string;
-	sessionFile: string;
-	launchScriptFile: string;
 }
 
 function getFirstText(
@@ -893,7 +866,7 @@ function formatLivePersistentSpecialists(): string[] {
 }
 
 function formatSupervisionDiagnostics(): string[] {
-	const diagnostics = runtime.supervision?.diagnostics() ?? {
+	const diagnostics = runtime.session?.diagnostics() ?? {
 		mode: supervisionConfig.forcePolling ? "polling(forced)" : "wake+batch",
 		watcherCount: 0,
 	};
@@ -1006,21 +979,11 @@ function muxUnavailableResult() {
 		content: [
 			{
 				type: "text" as const,
-				text: `Subagents require herdr. ${surfaceProvider.setupHint()}`,
+				text: `Subagents require herdr. ${runtime.session!.availability().setupHint}`,
 			},
 		],
 		details: { error: "herdr not available" },
 	};
-}
-
-/**
- * Build the internal artifact directory path for the current session.
- * Used by the subagents extension to stash task files, system prompts, and
- * launch scripts for sub-agents. Path convention:
- *   <sessionDir>/artifacts/<session-id>/
- */
-function getArtifactDir(sessionDir: string, sessionId: string): string {
-	return join(sessionDir, "artifacts", sessionId);
 }
 
 function shouldRetainSubagentSurface(
@@ -1057,43 +1020,6 @@ function resolveWorktreeLaunchWarning(
 	return warning && dirname(definition?.path ?? "") === getBundledAgentsDir()
 		? warning
 		: undefined;
-}
-
-function finalizeSubagentWorktree(
-	running: RunningSubagent,
-	state: "ready_for_review" | "failed" | "needs_help",
-): WorktreeHandoff | undefined {
-	if (running.worktree) {
-		let handoff = captureWorktreeHandoff(running.worktree);
-		try {
-			persistWorktreeResult(running.worktree, state, handoff);
-		} catch (error: any) {
-			handoff = {
-				...handoff,
-				gitError: [
-					handoff.gitError,
-					`Manifest update failed: ${error?.message ?? String(error)}`,
-				]
-					.filter(Boolean)
-					.join("; "),
-			};
-		}
-		return handoff;
-	}
-
-	return undefined;
-}
-
-function closeCompletedPanes(panes: Iterable<string>): void {
-	for (const pane of panes) {
-		try {
-			void Promise.resolve(surfaceProvider.closeSurface(pane)).catch(() => {
-				/* Result delivery remains authoritative. */
-			});
-		} catch {
-			/* Result delivery remains authoritative. */
-		}
-	}
 }
 
 const statusConfig = loadStatusConfig();
@@ -1192,21 +1118,6 @@ interface SubagentPingDetails {
 	agent?: string;
 	sessionFile: string;
 	worktree?: WorktreeHandoff;
-}
-
-interface SubagentStartedDetails {
-	id: string;
-	name: string;
-	task: string;
-	agent?: string;
-	sessionFile: string;
-	launchScriptFile?: string;
-	model?: string;
-	thinking?: ThinkingLevel;
-	runtimePlan?: ResolvedRuntimePlan;
-	worktree?: WorktreeLaunch;
-	warning?: string;
-	status: "started";
 }
 
 interface PartialWorktreeArgs {
@@ -1424,48 +1335,26 @@ interface RunningSubagent {
 	stopTimeout?: ReturnType<typeof setTimeout>;
 	stopTimeoutMs?: number;
 	crashNotified?: boolean;
-	/** Pre-adapter records keep their existing watcher; new handles retain their owner across reload. */
-	adapter?: PiHarnessAdapter;
-	handle?: AgentHandle;
-	supervisionRegistration?: SupervisionRegistration;
 }
 
 const paneConfig = loadPaneConfig();
 
 interface SubagentRuntime {
 	runningSubagents: Map<string, RunningSubagent>;
-	surfaceProvider: SurfaceProvider;
-	launchOperations: PiLaunchOperations;
-	supervision?: SupervisionCoordinator;
+	session?: PiRunSession;
 	pi?: ExtensionAPI;
 	latestCtx?: ExtensionContext;
 	modelCatalog?: string;
 }
 
-function createSurfaceRuntime(
-	provider: SurfaceProvider = new HerdrSurfaceProvider({ paneConfig }),
-): Pick<SubagentRuntime, "surfaceProvider" | "launchOperations"> {
-	return {
-		surfaceProvider: provider,
-		launchOperations: launchOperationsFromSurface(provider, paneConfig),
-	};
-}
-
-function createSubagentRuntime(): SubagentRuntime {
-	return {
-		runningSubagents: new Map<string, RunningSubagent>(),
-		...createSurfaceRuntime(),
-	};
-}
-
-/** Runtime state preserved across /reload. */
-const runtime: SubagentRuntime =
-	readGlobalSlot<SubagentRuntime>(RUNTIME_KEY) ?? createSubagentRuntime();
-Object.assign(runtime, createSurfaceRuntime());
+/** Presentation rows share the adapter's records; only RunSession owns runs. */
+const runtime: SubagentRuntime = readGlobalSlot<SubagentRuntime>(
+	RUNTIME_KEY,
+) ?? {
+	runningSubagents: new Map<string, RunningSubagent>(),
+};
 writeGlobalSlot(RUNTIME_KEY, runtime);
 const runningSubagents = runtime.runningSubagents;
-const surfaceProvider = runtime.surfaceProvider;
-const launchOperations = runtime.launchOperations;
 
 export function shouldPreserveSubagentsOnShutdown(
 	reason: SessionShutdownEvent["reason"] | undefined,
@@ -1798,6 +1687,11 @@ function observeRunningSubagent(
 	running: RunningSubagent,
 	observedAt = Date.now(),
 ) {
+	const control = runtime.session?.getControlTaskId(running.id);
+	if (control) {
+		runtime.session!.observe(control, observedAt);
+		return;
+	}
 	ensureLifecycle(running);
 
 	const activityFile = running.activityFile;
@@ -1838,6 +1732,14 @@ function evaluateNoProgressAdvisory(
 	projection: LifecycleProjection,
 	now: number,
 	hangWarningMinutes: number,
+	inspectProgress: (running: RunningSubagent) => NoProgressSessionTail = (
+		running,
+	) => {
+		const control = runtime.session?.getControlTaskId(running.id);
+		return control
+			? runtime.session!.inspectProgress(control)
+			: { classification: "generic-no-progress", lastEntryKind: "other" };
+	},
 ): NoProgressAdvisoryEvent | undefined {
 	if (hangWarningMinutes === 0) {
 		delete running.noProgressEpisode;
@@ -1885,7 +1787,7 @@ function evaluateNoProgressAdvisory(
 	try {
 		// The bounded reader is deliberately cold-path only: mtime/snapshot checks
 		// above run on every refresh, but JSONL parsing happens once per episode.
-		tail = inspectNoProgressSessionTail(running.sessionFile);
+		tail = inspectProgress(running);
 	} catch {
 		// A session can disappear between stat and read; preserve a facts-only
 		// generic advisory rather than failing the status loop.
@@ -1961,6 +1863,12 @@ function resolvePersistentTarget(params: { id?: string; name?: string }) {
 	return resolved;
 }
 
+function asPiRecord(running: RunningSubagent): PiRunRecord {
+	// SAFETY: live rows are the adapter's actual records. Legacy presentation
+	// fixtures omit script/activity paths, which persistent I/O never consumes.
+	return running as PiRunRecord;
+}
+
 function persistentSpecialistState(
 	running: RunningSubagent,
 ): "idle" | "working" | "stalled" | "stopped" {
@@ -2013,12 +1921,14 @@ interface PersistentSpecialistFacts {
 
 function persistentSpecialistFacts(
 	running: RunningSubagent,
+	io: PiPersistentIO,
+	worktree?: WorktreeHandoff,
 ): PersistentSpecialistFacts {
 	const facts: PersistentSpecialistFacts = {
 		logicalId: running.logicalId!,
 		generationId: running.generationId!,
 		policyHash: running.policyHash!,
-		tasks: readPersistentDeliveryLedger(running.sessionFile).map((entry) => ({
+		tasks: io.readLedger(asPiRecord(running)).map((entry) => ({
 			task: entry.task,
 			outcome: entry.outcome,
 		})),
@@ -2026,8 +1936,7 @@ function persistentSpecialistFacts(
 		lastObservedPhase: projectLifecycle(ensureLifecycle(running), Date.now())
 			.kind,
 	};
-	if (running.worktree)
-		facts.worktree = captureWorktreeHandoff(running.worktree);
+	if (worktree) facts.worktree = worktree;
 	return facts;
 }
 
@@ -2062,8 +1971,13 @@ function persistentCapacityError(
 function sendPersistentStopFailure(
 	api: Pick<ExtensionAPI, "sendMessage">,
 	running: RunningSubagent,
+	io: PiPersistentIO,
 ): void {
-	const facts = persistentSpecialistFacts(running);
+	const facts = persistentSpecialistFacts(
+		running,
+		io,
+		running.worktree ? captureWorktreeHandoff(running.worktree) : undefined,
+	);
 	api.sendMessage(
 		{
 			customType: "subagent_stop",
@@ -2079,6 +1993,7 @@ function startPersistentStopTimeout(
 	running: RunningSubagent,
 	api: Pick<ExtensionAPI, "sendMessage">,
 	stopTimeoutMs = 15_000,
+	io: PiPersistentIO,
 ): void {
 	if (
 		running.stopTimeout ||
@@ -2092,7 +2007,10 @@ function startPersistentStopTimeout(
 			running.stopState = "failed";
 			running.stopFailure =
 				"process exit was not confirmed within the bounded stop wait";
-			sendPersistentStopFailure(api, running);
+			const completionApi = runtime.session?.getControlTaskId(running.id)
+				? selectCompletionApi(api, runtime.pi)
+				: api;
+			sendPersistentStopFailure(completionApi, running, io);
 		}
 	}, stopTimeoutMs);
 	running.stopTimeout.unref();
@@ -2109,6 +2027,7 @@ function handleSubagentStop(
 	params: { id?: string; name?: string },
 	api: Pick<ExtensionAPI, "sendMessage">,
 	stopTimeoutMs = 15_000,
+	io: PiPersistentIO,
 ): AgentToolResult<SubagentStopDetails> {
 	const resolved = resolvePersistentTarget(params);
 	if ("error" in resolved) {
@@ -2133,25 +2052,11 @@ function handleSubagentStop(
 			details: { error, id: running.id, name: running.name },
 		};
 	}
-	const task = running.taskId ?? "stop";
 	const pending = running.taskId != null;
 	running.stopState = pending ? "pending" : "requested";
 	running.stopTimeoutMs = stopTimeoutMs;
-	if (pending) {
-		appendPersistentDeliveryLedger(running.sessionFile, {
-			task,
-			outcome: "stop-pending",
-			generation: running.generationId!,
-			logicalId: running.logicalId!,
-			policyHash: running.policyHash!,
-		});
-	}
-	writePersistentTaskInbox(
-		running.sessionFile,
-		(running.inboxSequence = (running.inboxSequence ?? 0) + 1),
-		{ type: "stop", task, message: "" },
-	);
-	if (!pending) startPersistentStopTimeout(running, api, stopTimeoutMs);
+	io.requestStop(asPiRecord(running));
+	if (!pending) startPersistentStopTimeout(running, api, stopTimeoutMs, io);
 	return {
 		content: [
 			{
@@ -2169,11 +2074,14 @@ function handleSubagentStop(
 	};
 }
 
-function handleSubagentSend(params: {
-	id?: string;
-	name?: string;
-	message: string;
-}): AgentToolResult<SubagentSendDetails> {
+function handleSubagentSend(
+	params: {
+		id?: string;
+		name?: string;
+		message: string;
+	},
+	io: PiPersistentIO,
+): AgentToolResult<SubagentSendDetails> {
 	const resolved = resolvePersistentTarget(params);
 	if ("error" in resolved)
 		return {
@@ -2183,13 +2091,7 @@ function handleSubagentSend(params: {
 	const running = resolved.running;
 	const task = randomUUID();
 	if (running.stopState === "failed") {
-		appendPersistentDeliveryLedger(running.sessionFile, {
-			task,
-			outcome: "rejected-busy",
-			generation: running.generationId!,
-			logicalId: running.logicalId!,
-			policyHash: running.policyHash!,
-		});
+		io.rejectBusy(asPiRecord(running), task);
 		const error = `Persistent specialist "${running.name}" is in an unconfirmed-stop state; task ${task} was rejected-busy. Process exit is unconfirmed and evidence is retained at session ${running.sessionFile}. Request subagent_stop again or spawn a new specialist.`;
 		return {
 			content: [{ type: "text", text: error }],
@@ -2198,32 +2100,14 @@ function handleSubagentSend(params: {
 	}
 	const state = persistentSpecialistState(running);
 	if (state !== "idle") {
-		appendPersistentDeliveryLedger(running.sessionFile, {
-			task,
-			outcome: "rejected-busy",
-			generation: running.generationId!,
-			logicalId: running.logicalId!,
-			policyHash: running.policyHash!,
-		});
+		io.rejectBusy(asPiRecord(running), task);
 		const error = `Persistent specialist "${running.name}" is ${state}; task ${task} was rejected-busy. Resend after the pending result.`;
 		return {
 			content: [{ type: "text", text: error }],
 			details: { error, task, outcome: "rejected-busy" },
 		};
 	}
-	const inbox = writePersistentTaskInbox(
-		running.sessionFile,
-		(running.inboxSequence = (running.inboxSequence ?? 0) + 1),
-		{ task, message: params.message },
-	);
-	running.taskId = task;
-	appendPersistentDeliveryLedger(running.sessionFile, {
-		task,
-		outcome: "dispatched",
-		generation: running.generationId!,
-		logicalId: running.logicalId!,
-		policyHash: running.policyHash!,
-	});
+	const inbox = io.dispatch(asPiRecord(running), task, params.message);
 	return {
 		content: [
 			{
@@ -2237,8 +2121,8 @@ function handleSubagentSend(params: {
 
 async function requestSubagentInterrupt(
 	running: RunningSubagent,
-	interruptPaneKey: (surface: string) => void | Promise<void> = (surface) =>
-		surfaceProvider.sendKeys(surface, "Escape"),
+	interruptPaneKey: (surface: string) => void | Promise<void> = () =>
+		runtime.session!.interrupt(runtime.session!.getControlTaskId(running.id)!),
 ): Promise<{ ok: true } | { error: string }> {
 	try {
 		await interruptPaneKey(running.surface);
@@ -2261,8 +2145,7 @@ interface SubagentInterruptDetails {
 
 async function handleSubagentInterrupt(
 	params: { id?: string; name?: string },
-	interruptPaneKey: (surface: string) => void | Promise<void> = (surface) =>
-		surfaceProvider.sendKeys(surface, "Escape"),
+	interruptPaneKey?: (surface: string) => void | Promise<void>,
 ): Promise<AgentToolResult<SubagentInterruptDetails>> {
 	const resolved = resolveInterruptTarget(params);
 	if ("error" in resolved) {
@@ -2392,31 +2275,6 @@ function startStatusRefresh(pi: ExtensionAPI) {
 	writeGlobalSlot(STATUS_INTERVAL_KEY, statusInterval);
 }
 
-function buildBtwLaunchCommand(params: {
-	cwd: string;
-	sessionFile: string;
-	question: string;
-	model: string;
-	thinking: string;
-	agentDir?: string;
-}): string {
-	const parts = [
-		"pi",
-		"--session",
-		shellQuote(params.sessionFile),
-		"--no-extensions",
-		"--model",
-		shellQuote(params.model),
-		"--thinking",
-		shellQuote(params.thinking),
-		shellQuote(BTW_BOUNDARY + params.question),
-	];
-	const envPrefix = params.agentDir
-		? `PI_CODING_AGENT_DIR=${shellQuote(params.agentDir)} `
-		: "";
-	return `cd ${shellQuote(params.cwd)} && ${envPrefix}${parts.join(" ")}`;
-}
-
 export const __test__ = {
 	borderLine,
 	renderSubagentWidgetLines,
@@ -2429,7 +2287,6 @@ export const __test__ = {
 	resolveEffectiveInteractive,
 	buildSubagentToolAllowlist,
 	buildPiPromptArgs,
-	buildBtwLaunchCommand,
 	resolveEffectivePersistent,
 	observeRunningSubagent,
 	evaluateNoProgressAdvisory,
@@ -2456,7 +2313,6 @@ export const __test__ = {
 	captureWorktreeHandoff,
 	runSubagentScript,
 	writeWorktreeManifest,
-	launchOperations,
 	runningSubagents,
 	formatElapsed,
 };
@@ -2471,12 +2327,10 @@ function startWidgetRefresh() {
 }
 
 /**
- * Launch a subagent: creates the herdr pane, builds the command, and
- * sends it. Returns a RunningSubagent — does NOT poll.
- *
- * Call watchSubagent() on the returned object to observe completion.
+ * Normalize each actual attempt against its invocation context. Role files may
+ * change between attempts; the validated runtime candidates do not.
  */
-async function launchSubagent(
+function normalizePiAttempt(
 	params: typeof SubagentParams.static,
 	ctx: {
 		sessionManager: {
@@ -2494,12 +2348,11 @@ async function launchSubagent(
 		};
 	},
 	parentThinking: ThinkingLevel,
-	options?: {
-		surface?: string;
-		runtimePlan?: ResolvedRuntimePlan;
-		id?: string;
+	options: {
+		id: string;
+		controlTaskId: string;
 	},
-): Promise<RunningSubagent> {
+): PiAttemptSnapshot {
 	const agentDefs = params.agent
 		? loadAgentDefaults(params.agent, runtime.pi)
 		: null;
@@ -2513,38 +2366,41 @@ async function launchSubagent(
 	}
 	if (!ctx.model)
 		throw new Error("Subagent launch requires a resolved parent model");
-	const runtimePlan =
-		options?.runtimePlan ??
-		resolveRuntimePlan(
-			{ model: params.model, thinking: params.thinking },
-			{
-				model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
-				thinking: agentDefs?.thinking,
-			},
-			{
-				provider: ctx.model.provider,
-				modelId: ctx.model.id,
-				thinking: parentThinking,
-			},
-			wrapPiModelRegistry(ctx.modelRegistry),
-		);
+
 	const effectiveTools = params.tools ?? agentDefs?.tools;
 	const effectiveSkills = params.skills ?? agentDefs?.skills;
 	const persistent = resolveEffectivePersistent(params, agentDefs);
 	const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
 	const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
-	const logicalId = options?.id ?? randomUUID();
+	const logicalId = options.id;
 	const generationId = randomUUID();
 	const taskId = randomUUID();
 	const parentSessionFile = ctx.sessionManager.getSessionFile();
 	if (!parentSessionFile) throw new Error("No session file");
 
-	const adapter = createPiHarnessAdapter(ctx, parentThinking);
-	const handle = await adapter.spawn({
-		name: params.name,
-		task: params.task,
-		cwd: ctx.cwd,
-		sessionId: ctx.sessionManager.getSessionId(),
+	return {
+		snapshot: launchSnapshot(ctx, parentThinking),
+		task: {
+			id: options.controlTaskId,
+			name: params.name,
+			prompt: params.task,
+			role: params.agent ?? "",
+			cwd: ctx.cwd,
+			worktree: params.worktree ?? undefined,
+			session: { mode: resolveEffectiveSessionMode(params, agentDefs) },
+			behavior: {
+				skills: effectiveSkills
+					?.split(",")
+					.map((s) => s.trim())
+					.filter(Boolean),
+				denyTools: [...resolveDenyTools(agentDefs)],
+				autoExit: effectiveAutoExit,
+				interactive: effectiveInteractive,
+				persistent,
+				systemPromptMode: agentDefs?.systemPromptMode,
+			},
+			systemPrompt: params.agent ? undefined : params.systemPrompt,
+		},
 		role: {
 			name: params.agent ?? "",
 			version: "1",
@@ -2552,37 +2408,14 @@ async function launchSubagent(
 			systemPrompt: agentDefs?.body ?? params.systemPrompt ?? "",
 			allowedTools: [],
 		},
-		resolvedLaunch: {
-			runtimePlan,
+		resolved: {
 			agent: params.agent,
 			cwd: params.cwd,
 			roleCwd: agentDefs?.cwd,
 			tools: effectiveTools,
 		},
-		launchIdentity: { id: logicalId, logicalId, generationId, taskId },
-		worktreeRequest: params.worktree ?? undefined,
-		surface: options?.surface
-			? surfaceProvider.attachSurface(options.surface)
-			: undefined,
-		session: { mode: resolveEffectiveSessionMode(params, agentDefs) },
-		behavior: {
-			skills: effectiveSkills
-				?.split(",")
-				.map((skill) => skill.trim())
-				.filter(Boolean),
-			denyTools: [...resolveDenyTools(agentDefs)],
-			autoExit: effectiveAutoExit,
-			interactive: effectiveInteractive,
-			persistent,
-			systemPromptMode: agentDefs?.systemPromptMode,
-		},
-	});
-	// Share the adapter's actual mutable record, including its one initial persistent ledger row.
-	const running: RunningSubagent = adapter.getRunningChild(handle);
-	running.adapter = adapter;
-	running.handle = handle;
-	runningSubagents.set(logicalId, running);
-	return running;
+		identity: { id: logicalId, logicalId, generationId, taskId },
+	};
 }
 
 /**
@@ -2592,7 +2425,7 @@ async function launchSubagent(
  */
 function resolveSubagentRuntimePlans(
 	params: typeof SubagentParams.static,
-	ctx: Parameters<typeof launchSubagent>[1],
+	ctx: Parameters<typeof normalizePiAttempt>[1],
 	parentThinking: ThinkingLevel,
 ): ResolvedRuntimePlan[] {
 	const agentDefs = params.agent
@@ -2631,51 +2464,46 @@ function resolveSubagentRuntimePlans(
 	return plans;
 }
 
-async function launchSubagentWithFallbacks(
-	params: typeof SubagentParams.static,
-	ctx: Parameters<typeof launchSubagent>[1],
-	parentThinking: ThinkingLevel,
-	plans: ResolvedRuntimePlan[],
-): Promise<{
-	running: RunningSubagent;
-	index: number;
-	launchFailures: ModelFailure[];
-}> {
-	const launchFailures: ModelFailure[] = [];
-	for (const [index, plan] of plans.entries()) {
-		try {
-			return {
-				running: await launchSubagent(params, ctx, parentThinking, {
-					runtimePlan: plan,
-				}),
-				index,
-				launchFailures,
-			};
-		} catch (error) {
-			launchFailures.push({
-				model: plan.model,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-	}
-	throw new Error(
-		`Subagent could not launch with any configured model. Attempted: ${plans.map((plan) => plan.model).join(", ")}. ${launchFailures.map(({ model, error }) => `${model}: ${error}`).join("; ")}`,
-	);
+function launchSnapshot(
+	ctx: Parameters<typeof normalizePiAttempt>[1],
+	thinking?: ThinkingLevel,
+): PiLaunchSnapshot {
+	return {
+		parent: {
+			cwd: ctx.cwd,
+			invocationCwd: process.cwd(),
+			sessionFile: ctx.sessionManager.getSessionFile() ?? "",
+			sessionId: ctx.sessionManager.getSessionId(),
+			sessionDir: ctx.sessionManager.getSessionDir(),
+			agentDir: getAgentConfigDir(),
+		},
+		parentRuntime:
+			ctx.model && thinking
+				? { provider: ctx.model.provider, modelId: ctx.model.id, thinking }
+				: undefined,
+		modelRegistry: wrapPiModelRegistry(ctx.modelRegistry),
+		paneConfig,
+	};
 }
 
 const inFlightPersistentTaskDeliveries = new Set<string>();
 
 function deliverPersistentTaskEvent(
 	running: RunningSubagent,
-	event: ReturnType<typeof readPersistentTaskEvents>[number],
+	event: PiPersistentEvent,
 	api: Pick<ExtensionAPI, "sendMessage">,
-	ledgerSnapshot?: ReturnType<typeof readPersistentDeliveryLedger>,
+	io: PiPersistentIO,
+	ledgerSnapshot?: PiLedgerEntry[],
 ): void {
-	if (!running.persistent || event.generation !== running.generationId) return;
+	if (
+		!shouldDeliverSubagentCompletion(running) ||
+		!running.persistent ||
+		event.generation !== running.generationId
+	)
+		return;
 	const deliveryKey = `${running.id}:${event.type}:${event.task}`;
 	if (inFlightPersistentTaskDeliveries.has(deliveryKey)) return;
-	const ledger =
-		ledgerSnapshot ?? readPersistentDeliveryLedger(running.sessionFile);
+	const ledger = ledgerSnapshot ?? io.readLedger(asPiRecord(running));
 	if (event.type === "help-request") {
 		if (
 			ledger.some(
@@ -2699,16 +2527,7 @@ function deliverPersistentTaskEvent(
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
-			ledger.push(
-				appendPersistentDeliveryLedger(running.sessionFile, {
-					task: event.task,
-					outcome: "help-requested",
-					generation: running.generationId!,
-					logicalId: running.logicalId!,
-					policyHash: running.policyHash!,
-				}),
-			);
-			if (running.taskId === event.task) running.taskId = undefined;
+			ledger.push(io.acknowledge(asPiRecord(running), event));
 		} finally {
 			inFlightPersistentTaskDeliveries.delete(deliveryKey);
 		}
@@ -2723,10 +2542,7 @@ function deliverPersistentTaskEvent(
 	inFlightPersistentTaskDeliveries.add(deliveryKey);
 	try {
 		const completed = (running.tasksCompleted ?? 0) + 1;
-		const summary = existsSync(running.sessionFile)
-			? (findLastAssistantMessage(getNewEntries(running.sessionFile, 0)) ??
-				"Persistent specialist completed without output.")
-			: "Persistent specialist session is unavailable.";
+		const summary = io.readTaskSummary(asPiRecord(running));
 		sendSubagentResult(
 			api,
 			`Persistent specialist "${running.name}" completed task ${event.task} (${completed} tasks completed) and is idle and accepting subagent_send.\n\n${summary}`,
@@ -2740,19 +2556,9 @@ function deliverPersistentTaskEvent(
 				policyHash: running.policyHash!,
 			},
 		);
-		ledger.push(
-			appendPersistentDeliveryLedger(running.sessionFile, {
-				task: event.task,
-				outcome: "delivered",
-				generation: running.generationId!,
-				logicalId: running.logicalId!,
-				policyHash: running.policyHash!,
-			}),
-		);
-		running.tasksCompleted = completed;
-		if (running.taskId === event.task) running.taskId = undefined;
+		ledger.push(io.acknowledge(asPiRecord(running), event));
 		if (running.stopState === "pending")
-			startPersistentStopTimeout(running, api, running.stopTimeoutMs);
+			startPersistentStopTimeout(running, api, running.stopTimeoutMs, io);
 	} finally {
 		inFlightPersistentTaskDeliveries.delete(deliveryKey);
 	}
@@ -2761,10 +2567,11 @@ function deliverPersistentTaskEvent(
 function drainPersistentTaskEvents(
 	running: RunningSubagent,
 	api: Pick<ExtensionAPI, "sendMessage">,
-	readLedger = readPersistentDeliveryLedger,
+	io: PiPersistentIO,
 ): void {
-	const events = readPersistentTaskEvents(running.sessionFile);
-	let ledger: ReturnType<typeof readPersistentDeliveryLedger> | undefined;
+	if (!shouldDeliverSubagentCompletion(running)) return;
+	const events = io.readEvents(asPiRecord(running));
+	let ledger: PiLedgerEntry[] | undefined;
 	for (const event of events.slice(running.observedTaskEvents ?? 0)) {
 		if (!running.persistent || event.generation !== running.generationId)
 			continue;
@@ -2774,11 +2581,12 @@ function drainPersistentTaskEvents(
 			)
 		)
 			continue;
-		ledger ??= readLedger(running.sessionFile);
+		ledger ??= io.readLedger(asPiRecord(running));
 		deliverPersistentTaskEvent(
 			running,
 			event,
 			selectCompletionApi(api, runtime.pi),
+			io,
 			ledger,
 		);
 	}
@@ -2788,11 +2596,13 @@ function drainPersistentTaskEvents(
 function notifyPersistentCrash(
 	running: RunningSubagent,
 	api: Pick<ExtensionAPI, "sendMessage">,
+	io: PiPersistentIO,
+	worktree?: WorktreeHandoff,
 ): void {
-	drainPersistentTaskEvents(running, api);
+	drainPersistentTaskEvents(running, api, io);
 	if (running.crashNotified) return;
 	running.crashNotified = true;
-	const facts = persistentSpecialistFacts(running);
+	const facts = persistentSpecialistFacts(running, io, worktree);
 	api.sendMessage(
 		{
 			customType: "subagent_result",
@@ -2804,207 +2614,102 @@ function notifyPersistentCrash(
 	);
 }
 
-function getSupervisionCoordinator(): SupervisionCoordinator {
-	if (runtime.supervision) return runtime.supervision;
-	runtime.supervision = new SupervisionCoordinator(
-		async () => {
-			try {
-				const surfaces = await surfaceProvider.listSurfaces();
-				return {
-					complete: true,
-					panes: surfaces.map((surface) => ({
-						paneId: surface.id,
-						workspaceId: surface.workspaceId ?? "",
-					})),
-				};
-			} catch {
-				return { complete: false, panes: [] };
-			}
-		},
-		(surface) => surfaceProvider.inspectSurface(surface),
-		supervisionConfig.forcePolling,
-	);
-	return runtime.supervision;
-}
-
-/** One adapter per launch snapshot; existing watchers retain their owning instance on reload. */
-function createPiHarnessAdapter(
-	ctx: Parameters<typeof launchSubagent>[1],
-	parentThinking?: ThinkingLevel,
-): PiHarnessAdapter {
-	return new PiHarnessAdapter({
-		surface: surfaceProvider,
-		paneConfig,
-		operations: launchOperations,
-		supervision: getSupervisionCoordinator(),
-		modelRegistry: wrapPiModelRegistry(ctx.modelRegistry),
-		parent: {
-			cwd: ctx.cwd,
-			invocationCwd: process.cwd(),
-			sessionFile: ctx.sessionManager.getSessionFile() ?? "",
-			sessionId: ctx.sessionManager.getSessionId(),
-			sessionDir: ctx.sessionManager.getSessionDir(),
-			agentDir: getAgentConfigDir(),
-		},
-		parentRuntime:
-			ctx.model && parentThinking
-				? {
-						provider: ctx.model.provider,
-						modelId: ctx.model.id,
-						thinking: parentThinking,
-					}
-				: undefined,
-		onObservation(child, kind) {
-			// These are cheap local reads only. Never recursively inspect through getState.
-			if (kind === "local-evidence") drainPersistentEventsSafely(child);
-			else if (kind === "tick") observeRunningSubagent(child);
-			else updateWidget();
-		},
-	});
-}
-
-function drainPersistentEventsSafely(running: RunningSubagent): void {
-	if (!running.persistent || !runtime.pi) return;
-	try {
-		drainPersistentTaskEvents(running, runtime.pi);
-	} catch {
-		// Leave an unread task event for the next file wake-up or reconciliation.
+function deliverPiCompletion(
+	record: PiRunRecord,
+	result: PiCompletedMetadata,
+	task: Task,
+	io: PiSettlementIO,
+): "delivered" | "suppressed" {
+	const running: RunningSubagent = record;
+	if (running.stopTimeout) clearTimeout(running.stopTimeout);
+	if (!shouldDeliverSubagentCompletion(running)) {
+		running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+		runningSubagents.delete(running.id);
+		updateWidget();
+		return "suppressed";
 	}
-}
-
-async function watchSubagent(
-	running: RunningSubagent,
-	signal: AbortSignal,
-): Promise<SubagentResult> {
-	const { name, task, startTime, sessionFile } = running;
-
-	try {
-		if (!running.adapter || !running.handle)
-			throw new Error(
-				"Pre-adapter child completion remains owned by its existing watcher.",
+	const api = runtime.pi!;
+	if (running.persistent) {
+		// Task sends remain retryable while the process is live. This is the distinct
+		// terminal PROCESS handoff; failed terminal delivery retires runtime ownership.
+		drainPersistentTaskEvents(running, api, io);
+		running.lifecycle = markDelivery(running.lifecycle, "delivered");
+		if (running.stopState === "requested" || running.stopState === "pending") {
+			io.recordStopped(record);
+			const facts = persistentSpecialistFacts(running, io, result.worktree);
+			api.sendMessage(
+				{
+					customType: "subagent_stop",
+					content: `Persistent specialist stopped.\n\n${formatPersistentSpecialistFacts(facts)}`,
+					display: true,
+					details: { status: "stopped", facts },
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
 			);
-		ensureLifecycle(running);
-		const result = await running.adapter.awaitCompletion(
-			running.handle,
-			signal,
-		);
-
-		const detectedAt = Date.now();
-		running.lifecycle = markCompletionDetected(
-			running.lifecycle,
-			result,
-			detectedAt,
-		);
+		} else if (running.stopState !== "failed")
+			notifyPersistentCrash(running, api, io, result.worktree);
+		runningSubagents.delete(running.id);
 		updateWidget();
-		const elapsed = Math.floor((detectedAt - startTime) / 1000);
-
-		let summary: string;
-		if (existsSync(sessionFile)) {
-			const allEntries = getNewEntries(sessionFile, 0);
-			const observed = findObservedSessionRuntime(allEntries);
-			if (running.runtimePlan && observed.provider && observed.modelId) {
-				const observedModel = `${observed.provider}/${observed.modelId}`;
-				const observedThinking =
-					observed.thinking === "off" ||
-					observed.thinking === "minimal" ||
-					observed.thinking === "low" ||
-					observed.thinking === "medium" ||
-					observed.thinking === "high" ||
-					observed.thinking === "xhigh" ||
-					observed.thinking === "max"
-						? observed.thinking
-						: undefined;
-				const mismatch =
-					observedModel === running.runtimePlan.model
-						? undefined
-						: `Resolved model ${running.runtimePlan.model} but child reported ${observedModel}`;
-				const updatedPlan: ResolvedRuntimePlan = { ...running.runtimePlan };
-				if (observedThinking) updatedPlan.thinking = observedThinking;
-				updatedPlan.observed = { model: observedModel };
-				if (observedThinking) updatedPlan.observed.thinking = observedThinking;
-				if (mismatch) updatedPlan.runtimeMismatch = mismatch;
-				running.runtimePlan = updatedPlan;
-			}
-			summary =
-				findLastAssistantMessage(allEntries) ??
-				(result.errorMessage
-					? `Subagent error: ${result.errorMessage}`
-					: result.exitCode === 0
-						? "Sub-agent exited without output"
-						: `Sub-agent exited with code ${result.exitCode}`);
-		} else {
-			summary = result.errorMessage
-				? `Subagent error: ${result.errorMessage}`
-				: result.exitCode === 0
-					? "Sub-agent exited without output"
-					: `Sub-agent exited with code ${result.exitCode}`;
-		}
-
-		const worktreeHandoff = finalizeSubagentWorktree(
-			running,
-			result.ping
-				? "needs_help"
-				: result.exitCode === 0
-					? "ready_for_review"
-					: "failed",
-		);
-		running.lifecycle =
-			result.exitCode === 0
-				? markCompleted(running.lifecycle, Date.now())
-				: markFailed(
-						running.lifecycle,
-						result.errorMessage ?? summary,
-						Date.now(),
-						result.exitCode,
-					);
-
-		const watchResult: SubagentResult = {
-			name,
-			task,
-			summary,
-			sessionFile,
-			exitCode: result.exitCode,
-			elapsed,
-			ping: result.ping,
-			runtimePlan: running.runtimePlan,
-		};
-		if (result.errorMessage) watchResult.errorMessage = result.errorMessage;
-		if (worktreeHandoff) watchResult.worktree = worktreeHandoff;
-		return watchResult;
-	} catch (err: any) {
-		const worktreeHandoff = finalizeSubagentWorktree(running, "failed");
-		running.lifecycle = markFailed(
-			running.lifecycle,
-			signal.aborted ? "Subagent cancelled." : (err?.message ?? String(err)),
-			Date.now(),
-			1,
-		);
-		updateWidget();
-
-		if (signal.aborted) {
-			const cancelledResult: SubagentResult = {
-				name,
-				task,
-				summary: "Subagent cancelled.",
-				exitCode: 1,
-				elapsed: Math.floor((Date.now() - startTime) / 1000),
-				error: "cancelled",
-				sessionFile,
-			};
-			if (worktreeHandoff) cancelledResult.worktree = worktreeHandoff;
-			return cancelledResult;
-		}
-		const errorResult: SubagentResult = {
-			name,
-			task,
-			summary: `Subagent error: ${err?.message ?? String(err)}`,
-			exitCode: 1,
-			elapsed: Math.floor((Date.now() - startTime) / 1000),
-			error: err?.message ?? String(err),
-		};
-		if (worktreeHandoff) errorResult.worktree = worktreeHandoff;
-		return errorResult;
+		return "delivered";
 	}
+	// Preserve ordinary mark-delivered/delete-before-send and failed-send retention.
+	running.lifecycle = markDelivery(running.lifecycle, "delivered");
+	runningSubagents.delete(running.id);
+	updateWidget();
+	if (result.ping) {
+		const worktreeRef = result.worktree
+			? `\n\n${formatWorktreeHandoff(result.worktree)}`
+			: "";
+		const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+		const details: SubagentPingDetails = {
+			name: result.ping.name,
+			message: result.ping.message,
+			sessionFile: result.sessionFile!,
+		};
+		if (task.role) details.agent = running.agent;
+		if (result.worktree) details.worktree = result.worktree;
+		api.sendMessage(
+			{
+				customType: "subagent_ping",
+				content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${worktreeRef}${sessionRef}`,
+				display: true,
+				details,
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	} else {
+		// Resume's second read belongs after the absorbing delivery mark/map delete
+		// and ping branch. A real read rejection retains the manual pane via the
+		// existing rejected-settlement path; do not suppress, resend or close it.
+		const presentationResult = io.readResumeResult
+			? { ...result, ...io.readResumeResult() }
+			: result;
+		const details: SubagentResultDetails = {
+			name: running.name,
+			task: task.prompt,
+			exitCode: result.exitCode,
+			elapsed: result.elapsed,
+			sessionFile: presentationResult.sessionFile,
+		};
+		if (!io.readResumeResult) details.agent = running.agent;
+		if (result.errorMessage) details.errorMessage = result.errorMessage;
+		if (result.fallbackAttempts)
+			details.fallbackAttempts = result.fallbackAttempts;
+		if (result.fallbackFailures)
+			details.fallbackFailures = result.fallbackFailures;
+		if (result.worktree) details.worktree = result.worktree;
+		if (running.runtimePlan) details.runtimePlan = running.runtimePlan;
+		sendSubagentResult(
+			api,
+			resolveResultPresentation(
+				presentationResult,
+				running.name,
+				running.runtimePlan?.runtimeMismatch,
+			),
+			details,
+		);
+	}
+	return "delivered";
 }
 
 export function shouldAdvanceToFallback(
@@ -3015,95 +2720,92 @@ export function shouldAdvanceToFallback(
 	return !persistent && result.errorMessage !== undefined && remainingPlans > 0;
 }
 
-async function watchSubagentWithFallbacks(
-	initial: RunningSubagent,
-	initialPlanIndex: number,
-	params: typeof SubagentParams.static,
-	ctx: Parameters<typeof launchSubagent>[1],
-	parentThinking: ThinkingLevel,
-	plans: ResolvedRuntimePlan[],
-	signal: AbortSignal,
-	completedPanes: Set<string>,
-	initialLaunchFailures: ModelFailure[] = [],
-): Promise<{ running: RunningSubagent; result: SubagentResult }> {
-	let running = initial;
-	let nextPlan = initialPlanIndex + 1;
-	const attempts = plans
-		.slice(0, initialPlanIndex + 1)
-		.map((plan) => plan.model);
-	const modelFailures = [...initialLaunchFailures];
-
-	for (;;) {
-		const result = await watchSubagent(running, signal);
-		if (!running.worktree) completedPanes.add(running.surface);
-		const shouldRetry = shouldAdvanceToFallback(
-			result,
-			plans.length - nextPlan,
-			running.persistent,
-		);
-		if (result.errorMessage) {
-			modelFailures.push({
-				model: running.runtimePlan?.model ?? attempts[attempts.length - 1],
-				error: result.errorMessage,
-			});
-		}
-		if (!shouldRetry) {
-			return {
-				running,
-				result: {
-					...result,
-					fallbackAttempts: attempts,
-					fallbackFailures: modelFailures,
-				},
-			};
-		}
-
-		runningSubagents.delete(running.id);
-		updateWidget();
-		const launchFailures: ModelFailure[] = [];
-		let launchedFallback = false;
-		while (nextPlan < plans.length) {
-			const plan = plans[nextPlan++];
-			attempts.push(plan.model);
-			try {
-				running = await launchSubagent(params, ctx, parentThinking, {
-					runtimePlan: plan,
-					id: initial.id,
-				});
-				running.abortController = initial.abortController;
-				launchedFallback = true;
-				startWidgetRefresh();
-				startStatusRefresh(runtime.pi!);
-				break;
-			} catch (error) {
-				launchFailures.push({
-					model: plan.model,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}
-		modelFailures.push(...launchFailures);
-		if (!launchedFallback) {
-			return {
-				running,
-				result: {
-					...result,
-					errorMessage: `${result.errorMessage}\n\nFallback launch failures: ${launchFailures.map(({ model, error }) => `${model}: ${error}`).join("; ")}`,
-					fallbackAttempts: attempts,
-					fallbackFailures: modelFailures,
-				},
-			};
-		}
-	}
-}
-
 export default function subagentsExtension(
 	pi: ExtensionAPI,
 	options: {
 		cleanupOperations?: (ctx: ExtensionContext) => WorktreeCleanupOperations;
+		infrastructure?: PiRunSessionInfrastructure;
 	} = {},
 ) {
 	runtime.pi = pi;
+	runtime.session = createDefaultRunSession(
+		{
+			configDir: getAgentConfigDir(),
+			roles: [],
+			forcePolling: supervisionConfig.forcePolling,
+			infrastructure: options.infrastructure,
+			getLaunchSnapshot() {
+				const ctx = runtime.latestCtx;
+				if (!ctx) throw new Error("No parent launch context");
+				const thinking = runtime.pi!.getThinkingLevel();
+				if (!isThinkingLevel(thinking))
+					throw new Error(`Unsupported parent thinking level: ${thinking}`);
+				return launchSnapshot(ctx, thinking);
+			},
+			hooks: {
+				onSpawned(record) {
+					runningSubagents.set(record.id, record);
+					startWidgetRefresh();
+					startStatusRefresh(runtime.pi!);
+				},
+				onObserved(record, observation) {
+					const running: RunningSubagent = record;
+					if (observation.activityRead) {
+						const read = observation.activityRead;
+						running.activityRead = read.ok
+							? { ok: true }
+							: { ok: false, reason: read.reason, error: read.error };
+					}
+					if (observation.activity) running.activity = observation.activity;
+					if (
+						observation.kind !== "local-evidence" &&
+						observation.kind !== "tick" &&
+						observation.kind !== "refresh"
+					)
+						updateWidget();
+				},
+				onSettled: deliverPiCompletion,
+			},
+			persistent: {
+				send(record, text, io) {
+					const details = handleSubagentSend(
+						{ id: record.id, message: text },
+						io,
+					).details;
+					if (details.error)
+						return {
+							error: details.error,
+							task: details.task,
+							outcome:
+								details.outcome === "rejected-busy"
+									? details.outcome
+									: undefined,
+						};
+					return {
+						id: record.id,
+						task: details.task!,
+						inbox: details.inbox!,
+						outcome: "dispatched",
+					};
+				},
+				stop(record, timeout, io) {
+					const details = handleSubagentStop(
+						{ id: record.id },
+						runtime.pi!,
+						timeout,
+						io,
+					).details;
+					return details.error
+						? { error: details.error, id: details.id, name: details.name }
+						: { id: record.id, name: record.name, status: details.status! };
+				},
+				drain(record, io) {
+					if (runtime.pi) drainPersistentTaskEvents(record, runtime.pi, io);
+				},
+			},
+		},
+		runtime.session,
+	);
 	const parentSession = !process.env.PI_SUBAGENT_ID;
 	const cleanupInput = (ctx: ExtensionContext) => ({
 		cwd: ctx.cwd,
@@ -3124,41 +2826,6 @@ export default function subagentsExtension(
 					),
 			}),
 	});
-	let btwChild: BtwChild | undefined;
-
-	const closeBtw = async (): Promise<boolean> => {
-		const child = btwChild;
-		if (!child) return false;
-
-		let paneMissing = false;
-		try {
-			paneMissing =
-				(await surfaceProvider.inspectSurface(child.surface)).kind ===
-				"missing";
-		} catch {
-			// Best effort: try closing the pane directly when inspection is unavailable.
-		}
-
-		if (!paneMissing) {
-			try {
-				await surfaceProvider.sendKeys(child.surface, "Escape");
-			} catch {
-				// Escape is best effort; pane close is authoritative for this MVP.
-			}
-			await surfaceProvider.closeSurface(child.surface);
-		}
-
-		btwChild = undefined;
-		for (const file of [child.sessionFile, child.launchScriptFile]) {
-			try {
-				rmSync(file, { force: true });
-			} catch {
-				// Ephemeral artifact cleanup is best effort.
-			}
-		}
-		return true;
-	};
-
 	// Capture the UI context for widget updates and restore presentation for
 	// subagents whose watchers survived a reload.
 	pi.on("session_start", async (_event, ctx) => {
@@ -3208,16 +2875,19 @@ export default function subagentsExtension(
 			);
 		}
 
-		cleanupSubagentsForShutdown(event.reason, runningSubagents);
+		const session = runtime.session;
+		const shutdown = session?.shutdown(event.reason);
 		if (!shouldPreserveSubagentsOnShutdown(event.reason)) {
-			runtime.supervision?.close();
-			runtime.supervision = undefined;
+			for (const running of runningSubagents.values())
+				if (running.stopTimeout) clearTimeout(running.stopTimeout);
+			// Also gate/abort legacy rows retained from a pre-composition reload.
+			// Do not infer ownership or reconstruct their watchers.
+			cleanupSubagentsForShutdown(event.reason, runningSubagents);
+			// The coordinator is already closed synchronously. Clear only this owner
+			// before the BTW await so another in-process host cannot adopt it.
+			if (runtime.session === session) runtime.session = undefined;
 		}
-		try {
-			await closeBtw();
-		} catch {
-			// Best effort during parent shutdown; the Herdr pane remains recoverable.
-		}
+		await shutdown;
 	});
 
 	// Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -3410,7 +3080,7 @@ export default function subagentsExtension(
 				}
 
 				// Validate prerequisites
-				if (!surfaceProvider.isAvailable()) {
+				if (!runtime.session!.availability().available) {
 					return muxUnavailableResult();
 				}
 
@@ -3450,220 +3120,36 @@ export default function subagentsExtension(
 					params,
 					runtime.pi,
 				);
-				const {
-					running: initialRunning,
-					index: initialPlanIndex,
-					launchFailures: initialLaunchFailures,
-				} = await launchSubagentWithFallbacks(
-					params,
-					ctx,
-					parentThinking,
-					runtimePlans,
-				);
-
-				let running = initialRunning;
-
-				// Create a separate AbortController for the watcher
-				// (the tool's signal completes when we return)
-				const watcherAbort = new AbortController();
-				running.abortController = watcherAbort;
-
-				// Start widget refresh and status supervision when the first agent launches
-				startWidgetRefresh();
-				startStatusRefresh(pi);
-
-				// Keep all temporary attempt panes until the final parent handoff.
-				const completedPanes = new Set<string>();
-				// Close after accepted delivery or explicit parent shutdown, not failed delivery.
-				let shouldCloseTemporaryPanes = false;
-				// Fire-and-forget: start watching in background
-				watchSubagentWithFallbacks(
-					running,
-					initialPlanIndex,
-					params,
-					ctx,
-					parentThinking,
-					runtimePlans,
-					watcherAbort.signal,
-					completedPanes,
-					initialLaunchFailures,
-				)
-					.then(({ running: completedRunning, result }) => {
-						running = completedRunning;
-						if (completedRunning.stopTimeout)
-							clearTimeout(completedRunning.stopTimeout);
-						if (completedRunning.persistent) {
-							if (!shouldDeliverSubagentCompletion(completedRunning)) {
-								shouldCloseTemporaryPanes = true;
-								return;
-							}
-							drainPersistentTaskEvents(
-								completedRunning,
-								selectCompletionApi(pi, runtime.pi),
-							);
-							completedRunning.lifecycle = markDelivery(
-								completedRunning.lifecycle,
-								"delivered",
-							);
-							const completionApi = selectCompletionApi(pi, runtime.pi);
-							if (
-								completedRunning.stopState === "requested" ||
-								completedRunning.stopState === "pending"
-							) {
-								appendPersistentDeliveryLedger(completedRunning.sessionFile, {
-									task: "stop",
-									outcome: "stopped",
-									generation: completedRunning.generationId!,
-									logicalId: completedRunning.logicalId!,
-									policyHash: completedRunning.policyHash!,
-								});
-								const facts = persistentSpecialistFacts(completedRunning);
-								completionApi.sendMessage(
-									{
-										customType: "subagent_stop",
-										content: `Persistent specialist stopped.\n\n${formatPersistentSpecialistFacts(facts)}`,
-										display: true,
-										details: { status: "stopped", facts },
-									},
-									{ triggerTurn: true, deliverAs: "steer" },
-								);
-							} else if (completedRunning.stopState !== "failed") {
-								notifyPersistentCrash(completedRunning, completionApi);
-							}
-							shouldCloseTemporaryPanes = true;
-							runningSubagents.delete(completedRunning.id);
-							updateWidget();
-							return;
-						}
-						if (!shouldDeliverSubagentCompletion(completedRunning)) {
-							// Explicit parent shutdown still releases temporary panes.
-							shouldCloseTemporaryPanes = true;
-							completedRunning.lifecycle = markDelivery(
-								completedRunning.lifecycle,
-								"suppressed",
-							);
-							runningSubagents.delete(completedRunning.id);
-							updateWidget();
-							return;
-						}
-						completedRunning.lifecycle = markDelivery(
-							completedRunning.lifecycle,
-							"delivered",
-						);
-						runningSubagents.delete(completedRunning.id);
-						updateWidget();
-						const completionApi = selectCompletionApi(pi, runtime.pi);
-
-						if (result.ping) {
-							// Subagent is requesting help — steer a ping message with session path for resume
-							const worktreeRef = result.worktree
-								? `\n\n${formatWorktreeHandoff(result.worktree)}`
-								: "";
-							const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-							const pingDetails: SubagentPingDetails = {
-								name: result.ping.name,
-								message: result.ping.message,
-								agent: running.agent,
-								sessionFile: result.sessionFile!,
-							};
-							if (result.worktree) pingDetails.worktree = result.worktree;
-							completionApi.sendMessage(
-								{
-									customType: "subagent_ping",
-									content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${worktreeRef}${sessionRef}`,
-									display: true,
-									details: pingDetails,
-								},
-								{ triggerTurn: true, deliverAs: "steer" },
-							);
-							shouldCloseTemporaryPanes = true;
-							return;
-						}
-
-						const presentation = resolveResultPresentation(
-							result,
-							completedRunning.name,
-							completedRunning.runtimePlan?.runtimeMismatch,
-						);
-
-						const resultDetails: SubagentResultDetails = {
-							name: completedRunning.name,
-							task: completedRunning.task,
-							agent: completedRunning.agent,
-							exitCode: result.exitCode,
-							elapsed: result.elapsed,
-							sessionFile: result.sessionFile,
-						};
-						if (result.errorMessage)
-							resultDetails.errorMessage = result.errorMessage;
-						if (result.fallbackAttempts)
-							resultDetails.fallbackAttempts = result.fallbackAttempts;
-						if (result.fallbackFailures)
-							resultDetails.fallbackFailures = result.fallbackFailures;
-						if (result.worktree)
-							resultDetails.worktree = captureWorktreeHandoff(result.worktree);
-						if (completedRunning.runtimePlan)
-							resultDetails.runtimePlan = completedRunning.runtimePlan;
-						sendSubagentResult(completionApi, presentation, resultDetails);
-						shouldCloseTemporaryPanes = true;
-					})
-					.catch((err) => {
-						if (!shouldDeliverSubagentCompletion(running)) {
-							running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-							runningSubagents.delete(running.id);
-							updateWidget();
-							return;
-						}
-						running.lifecycle = markDelivery(running.lifecycle, "delivered");
+				runtime.latestCtx = ctx;
+				const id = randomUUID();
+				const first = normalizePiAttempt(params, ctx, parentThinking, {
+					id,
+					controlTaskId: id,
+				});
+				const [plan, ...fallbacks] = runtimePlans;
+				if (!plan) throw new Error("No resolved runtime plans");
+				const input: PiLaunchInput = {
+					...first,
+					plans: [plan, ...fallbacks],
+					warning: worktreeLaunchWarning,
+					prepareAttempt: () =>
+						normalizePiAttempt(params, ctx, parentThinking, {
+							id,
+							controlTaskId: id,
+						}),
+				};
+				const session = runtime.session!;
+				const handle = await session.spawnPi(input);
+				const running = session.getRecord(id)!;
+				const startedDetails = session.getStarted(id)!;
+				// The tool's signal is not a producer signal. Delivery belongs to RunSession.
+				void session.supervise(handle, session.getTask(id)!).catch(() => {
+					// Delivery failure retains manual panes; no second send or cleanup producer.
+					if (!session.getTask(id)) {
 						runningSubagents.delete(running.id);
 						updateWidget();
-						if (running.persistent) {
-							notifyPersistentCrash(
-								running,
-								selectCompletionApi(pi, runtime.pi),
-							);
-							shouldCloseTemporaryPanes = true;
-							return;
-						}
-						const errDetails: SubagentResultDetails = {
-							name: running.name,
-							task: running.task,
-							error: err?.message,
-							sessionFile: running.sessionFile,
-						};
-						if (running.worktree)
-							errDetails.worktree = captureWorktreeHandoff(running.worktree);
-						sendSubagentResult(
-							selectCompletionApi(pi, runtime.pi),
-							resolveUnexpectedErrorPresentation(
-								`Sub-agent "${running.name}" error`,
-								err,
-								running.sessionFile,
-							),
-							errDetails,
-						);
-						shouldCloseTemporaryPanes = true;
-					})
-					.finally(() => {
-						if (shouldCloseTemporaryPanes) closeCompletedPanes(completedPanes);
-					});
-
-				// Return immediately
-				const startedDetails: SubagentStartedDetails = {
-					id: running.id,
-					name: params.name,
-					task: params.task,
-					agent: params.agent,
-					sessionFile: running.sessionFile,
-					launchScriptFile: running.launchScriptFile,
-					model: running.runtimePlan?.model,
-					thinking: running.runtimePlan?.thinking,
-					runtimePlan: running.runtimePlan,
-					status: "started",
-				};
-				if (running.worktree) startedDetails.worktree = running.worktree;
-				if (worktreeLaunchWarning)
-					startedDetails.warning = worktreeLaunchWarning;
+					}
+				});
 				return {
 					content: [
 						{
@@ -3786,7 +3272,21 @@ export default function subagentsExtension(
 				message: Type.String({ description: "The next task" }),
 			}),
 			async execute(_toolCallId, params) {
-				return handleSubagentSend(params);
+				const target = resolvePersistentTarget(params);
+				if ("error" in target)
+					return {
+						content: [{ type: "text", text: target.error }],
+						details: { error: target.error },
+					};
+				const details = await runtime.session!.sendPersistent(
+					runtime.session!.getControlTaskId(target.running.id)!,
+					params.message,
+				);
+				const text =
+					"error" in details
+						? details.error
+						: `Task ${details.task} dispatched to persistent specialist "${target.running.name}".`;
+				return { content: [{ type: "text", text }], details };
 			},
 		});
 
@@ -3810,7 +3310,22 @@ export default function subagentsExtension(
 				),
 			}),
 			async execute(_toolCallId, params) {
-				return handleSubagentStop(params, selectCompletionApi(pi, runtime.pi));
+				const target = resolvePersistentTarget(params);
+				if ("error" in target)
+					return {
+						content: [{ type: "text", text: target.error }],
+						details: { error: target.error },
+					};
+				const details = await runtime.session!.stopPersistent(
+					runtime.session!.getControlTaskId(target.running.id)!,
+				);
+				const text =
+					"error" in details
+						? details.error
+						: details.status === "stop_pending"
+							? `Stop pending for persistent specialist "${target.running.name}"; its active task will settle first.`
+							: `Stop requested for persistent specialist "${target.running.name}".`;
+				return { content: [{ type: "text", text }], details };
 			},
 		});
 
@@ -4022,7 +3537,7 @@ export default function subagentsExtension(
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				const name = params.name ?? "Resume";
 
-				if (!surfaceProvider.isAvailable()) {
+				if (!runtime.session!.availability().available) {
 					return muxUnavailableResult();
 				}
 
@@ -4038,118 +3553,25 @@ export default function subagentsExtension(
 					};
 				}
 
-				// Record entry count before resuming so we can extract new messages
-				const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
-
-				const adapter = createPiHarnessAdapter(ctx);
-				const handle = await adapter.resume({
+				runtime.latestCtx = ctx;
+				const controlTaskId = randomUUID();
+				const session = runtime.session!;
+				const handle = await session.resumePi({
+					taskId: controlTaskId,
 					name,
-					sessionId: params.sessionPath,
+					sessionPath: params.sessionPath,
 					message: params.message,
 					autoExit: params.autoExit,
 				});
-				const running: RunningSubagent = adapter.getRunningChild(handle);
-				running.adapter = adapter;
-				running.handle = handle;
-				const id = handle.id;
-				runningSubagents.set(id, running);
-				startWidgetRefresh();
-				startStatusRefresh(pi);
-
-				// Fire-and-forget watcher
-				const watcherAbort = new AbortController();
-				running.abortController = watcherAbort;
-
-				// Close after accepted delivery or explicit parent shutdown, not failed delivery.
-				let shouldCloseTemporaryPanes = false;
-				watchSubagent(running, watcherAbort.signal)
-					.then((result) => {
-						if (!shouldDeliverSubagentCompletion(running)) {
-							shouldCloseTemporaryPanes = true;
-							running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-							runningSubagents.delete(running.id);
+				const started = session.getStarted(controlTaskId)!;
+				const id = started.id;
+				void session
+					.supervise(handle, session.getTask(controlTaskId)!)
+					.catch(() => {
+						if (!session.getTask(controlTaskId)) {
+							runningSubagents.delete(id);
 							updateWidget();
-							return;
 						}
-						running.lifecycle = markDelivery(running.lifecycle, "delivered");
-						runningSubagents.delete(running.id);
-						updateWidget();
-						const completionApi = selectCompletionApi(pi, runtime.pi);
-
-						if (result.ping) {
-							const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
-							completionApi.sendMessage(
-								{
-									customType: "subagent_ping",
-									content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-									display: true,
-									details: {
-										name: result.ping.name,
-										message: result.ping.message,
-										sessionFile: params.sessionPath,
-									},
-								},
-								{ triggerTurn: true, deliverAs: "steer" },
-							);
-							shouldCloseTemporaryPanes = true;
-							return;
-						}
-
-						const allEntries = getNewEntries(
-							params.sessionPath,
-							entryCountBefore,
-						);
-						const summary =
-							findLastAssistantMessage(allEntries) ??
-							(result.errorMessage
-								? `Subagent error: ${result.errorMessage}`
-								: result.exitCode === 0
-									? "Resumed session exited without new output"
-									: `Resumed session exited with code ${result.exitCode}`);
-						const presentation = resolveResultPresentation(
-							{ ...result, summary, sessionFile: params.sessionPath },
-							name,
-							running.runtimePlan?.runtimeMismatch,
-						);
-
-						const resumeDetails: SubagentResultDetails = {
-							name,
-							task: params.message ?? "resumed session",
-							exitCode: result.exitCode,
-							elapsed: result.elapsed,
-							sessionFile: params.sessionPath,
-						};
-						if (result.errorMessage)
-							resumeDetails.errorMessage = result.errorMessage;
-						if (running.runtimePlan)
-							resumeDetails.runtimePlan = running.runtimePlan;
-						sendSubagentResult(completionApi, presentation, resumeDetails);
-						shouldCloseTemporaryPanes = true;
-					})
-					.catch((err) => {
-						if (!shouldDeliverSubagentCompletion(running)) {
-							running.lifecycle = markDelivery(running.lifecycle, "suppressed");
-							runningSubagents.delete(running.id);
-							updateWidget();
-							return;
-						}
-						running.lifecycle = markDelivery(running.lifecycle, "delivered");
-						runningSubagents.delete(running.id);
-						updateWidget();
-						sendSubagentResult(
-							selectCompletionApi(pi, runtime.pi),
-							resolveUnexpectedErrorPresentation(
-								"Resume error",
-								err,
-								params.sessionPath,
-							),
-							{ name, error: err?.message, sessionFile: params.sessionPath },
-						);
-						shouldCloseTemporaryPanes = true;
-					})
-					.finally(() => {
-						if (shouldCloseTemporaryPanes)
-							closeCompletedPanes([running.surface]);
 					});
 
 				return {
@@ -4158,7 +3580,7 @@ export default function subagentsExtension(
 						id,
 						name,
 						sessionPath: params.sessionPath,
-						launchScriptFile: running.launchScriptFile,
+						launchScriptFile: started.launchScriptFile,
 						status: "started",
 					},
 				};
@@ -4188,17 +3610,12 @@ export default function subagentsExtension(
 				ctx.ui.notify("Usage: /btw <question>", "warning");
 				return;
 			}
-			if (!surfaceProvider.isAvailable()) {
-				ctx.ui.notify(surfaceProvider.setupHint(), "error");
+			if (!runtime.session!.availability().available) {
+				ctx.ui.notify(runtime.session!.availability().setupHint, "error");
 				return;
 			}
-
-			let sessionFile: string | undefined;
-			let surface: string | undefined;
-			let launchScriptFile: string | undefined;
 			try {
 				await ctx.waitForIdle();
-				if (btwChild) await closeBtw();
 
 				const parentSessionFile = ctx.sessionManager.getSessionFile();
 				const leafId = ctx.sessionManager.getLeafId();
@@ -4207,57 +3624,23 @@ export default function subagentsExtension(
 				}
 				if (!ctx.model) throw new Error("No parent model is selected");
 
-				sessionFile = createBtwSessionSnapshot(parentSessionFile, leafId);
-				surface = await surfaceProvider.createSurface({
-					name: "BTW",
-					cwd: process.cwd(),
-					placement: { kind: "tab" },
-				});
-				await surfaceProvider.waitForShellReady(surface);
-
-				const artifactDir = getArtifactDir(
-					ctx.sessionManager.getSessionDir(),
-					ctx.sessionManager.getSessionId(),
-				);
-				launchScriptFile = join(
-					artifactDir,
-					"subagent-scripts",
-					`btw-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-				);
-				const command = buildBtwLaunchCommand({
-					cwd: ctx.cwd,
-					sessionFile,
+				const thinking = pi.getThinkingLevel();
+				if (!isThinkingLevel(thinking))
+					throw new Error(`Unsupported parent thinking level: ${thinking}`);
+				await runtime.session!.openBtw({
 					question,
+					parentSessionFile,
+					leafId,
+					cwd: ctx.cwd,
+					invocationCwd: process.cwd(),
+					sessionDir: ctx.sessionManager.getSessionDir(),
+					sessionId: ctx.sessionManager.getSessionId(),
 					model: `${ctx.model.provider}/${ctx.model.id}`,
-					thinking: pi.getThinkingLevel(),
+					thinking,
 					agentDir: process.env.PI_CODING_AGENT_DIR,
 				});
-				await surfaceProvider.runScript(surface, command, {
-					scriptPath: launchScriptFile,
-					scriptPreamble: [
-						"# BTW side-question session",
-						`# Session: ${sessionFile}`,
-						`# Generated: ${new Date().toISOString()}`,
-					].join("\n"),
-				});
-				btwChild = { surface, sessionFile, launchScriptFile };
 				ctx.ui.notify("BTW opened in a background Herdr tab.", "info");
 			} catch (error) {
-				if (surface) {
-					try {
-						await surfaceProvider.closeSurface(surface);
-					} catch {
-						// Leave the pane for manual recovery if launch cleanup fails.
-					}
-				}
-				for (const file of [sessionFile, launchScriptFile]) {
-					if (!file) continue;
-					try {
-						rmSync(file, { force: true });
-					} catch {
-						// Best effort.
-					}
-				}
 				ctx.ui.notify(
 					`BTW failed: ${error instanceof Error ? error.message : String(error)}`,
 					"error",
@@ -4270,7 +3653,7 @@ export default function subagentsExtension(
 		description: "Close the current BTW side-question session",
 		handler: async (_args, ctx) => {
 			try {
-				if (!(await closeBtw())) {
+				if (!(await runtime.session!.closeBtw())) {
 					ctx.ui.notify("No BTW session is open.", "info");
 					return;
 				}
@@ -4292,8 +3675,8 @@ export default function subagentsExtension(
 			const trimmed = args.trim();
 			const parts = trimmed.split(/\s+/).filter(Boolean);
 			if (trimmed === "list") {
-				if (!surfaceProvider.isAvailable()) {
-					ctx.ui.notify(surfaceProvider.setupHint(), "error");
+				if (!runtime.session!.availability().available) {
+					ctx.ui.notify(runtime.session!.availability().setupHint, "error");
 					return;
 				}
 				try {
@@ -4302,7 +3685,7 @@ export default function subagentsExtension(
 							? formatWorktreeInventory(
 									await listContainedWorktrees(cleanupInput(ctx)),
 								)
-							: (await surfaceProvider.listWorktreeSurfaces({ cwd: ctx.cwd }))
+							: (await runtime.session!.listWorktreeSurfaces({ cwd: ctx.cwd }))
 									.map(
 										(worktree) =>
 											`${worktree.branch || "(detached HEAD)"} — ${worktree.path}${worktree.workspaceId ? ` (${worktree.workspaceId})` : ""}`,
@@ -4359,8 +3742,8 @@ export default function subagentsExtension(
 				);
 				return;
 			}
-			if (!surfaceProvider.isAvailable()) {
-				ctx.ui.notify(surfaceProvider.setupHint(), "error");
+			if (!runtime.session!.availability().available) {
+				ctx.ui.notify(runtime.session!.availability().setupHint, "error");
 				return;
 			}
 
@@ -4390,32 +3773,29 @@ export default function subagentsExtension(
 					},
 					wrapPiModelRegistry(ctx.modelRegistry),
 				);
-				const result = await launchPiWorktreeHandoff(
-					{
-						kind: "fresh",
-						name: `wt: ${branch}`,
-						task,
+				const result = await launchPiWorktreeHandoff({
+					kind: "fresh",
+					name: `wt: ${branch}`,
+					task,
+					cwd: ctx.cwd,
+					worktree: { branch },
+					handoff: { leafId },
+					parent: {
 						cwd: ctx.cwd,
-						worktree: { branch },
-						handoff: { leafId },
-						parent: {
-							cwd: ctx.cwd,
-							invocationCwd: process.cwd(),
-							sessionFile,
-							sessionId: ctx.sessionManager.getSessionId(),
-							sessionDir: ctx.sessionManager.getSessionDir(),
-							agentDir: getAgentConfigDir(),
-						},
-						runtimePlan,
-						behavior: {
-							deniedTools: [],
-							autoExit: false,
-							interactive: true,
-							sessionMode: "standalone",
-						},
+						invocationCwd: process.cwd(),
+						sessionFile,
+						sessionId: ctx.sessionManager.getSessionId(),
+						sessionDir: ctx.sessionManager.getSessionDir(),
+						agentDir: getAgentConfigDir(),
 					},
-					launchOperations,
-				);
+					runtimePlan,
+					behavior: {
+						deniedTools: [],
+						autoExit: false,
+						interactive: true,
+						sessionMode: "standalone",
+					},
+				});
 				const worktree = result.running.worktree;
 				if (!worktree) {
 					throw new Error("Worktree handoff did not return worktree metadata");

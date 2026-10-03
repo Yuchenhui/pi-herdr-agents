@@ -29,7 +29,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { Value } from "@sinclair/typebox/value";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import * as hostModule from "../pi-extension/subagents/index.ts";
 import {
 	isPlainObject,
 	isRecord,
@@ -145,7 +145,17 @@ import {
 	projectLifecycle,
 	type SubagentLifecycle,
 } from "../pi-extension/subagents/lifecycle.ts";
-import { launchPiSubagent } from "../maestro/adapters/pi/launch.ts";
+import {
+	launchPiSubagent,
+	launchOperationsFromSurface,
+} from "../maestro/adapters/pi/launch.ts";
+import { HerdrSurfaceProvider } from "../maestro/surfaces/herdr/herdr-surface-provider.ts";
+import {
+	createDefaultRunSession,
+	type PiPersistentIO,
+	type PiRunSession,
+	type PiRunRecord,
+} from "../maestro/runtime/index.ts";
 import {
 	buildAuthenticatedModelCatalog,
 	wrapPiModelRegistry,
@@ -355,6 +365,161 @@ const TOOL_RESULT: SessionEntry = {
 	},
 };
 
+// Persistent policy fixtures inject the production I/O implementation, obtained
+// through an actual Pi composition acquisition. No session helper is laundered
+// through the host or runtime barrel just for these tests.
+async function persistentFixtureIO(): Promise<PiPersistentIO> {
+	const dir = createTestDir();
+	const surface = new FakeSurfaceProvider();
+	const ops = launchOperationsFromSurface(surface, {
+		mode: "tab",
+		direction: "right",
+		maxPerTab: 4,
+	});
+	ops.waitForShellReady = async () => {};
+	ops.runScript = (_id, _command, options) => options.scriptPath;
+	const supervision = new SupervisionCoordinator(
+		async () => ({ complete: true, panes: [] }),
+		(id) => surface.inspectSurface(id),
+	);
+	let captured!: PiPersistentIO;
+	const session = createDefaultRunSession({
+		configDir: dir,
+		roles: [],
+		forcePolling: false,
+		infrastructure: {
+			surfaceProvider: surface,
+			launchOperations: ops,
+			supervision,
+		},
+		getLaunchSnapshot: () => ({
+			parent: {
+				cwd: dir,
+				sessionFile: "",
+				sessionId: "fixture",
+				sessionDir: dir,
+				agentDir: dir,
+			},
+			modelRegistry: {
+				find: (provider, id) => ({ provider, id, reasoning: true }),
+				available: () => [],
+				hasConfiguredAuth: () => true,
+			},
+			paneConfig: { mode: "tab", direction: "right", maxPerTab: 4 },
+		}),
+		hooks: { onSettled() {} },
+		persistent: {
+			send(_r, _text, io) {
+				captured = io;
+				return { error: "fixture captures I/O only" };
+			},
+			stop() {
+				return { error: "unused" };
+			},
+			drain() {},
+		},
+	});
+	try {
+		await session.spawnPi({
+			task: {
+				id: "io-fixture",
+				name: "fixture",
+				prompt: "first",
+				role: "",
+				cwd: dir,
+				behavior: { persistent: true },
+			},
+			role: {
+				name: "",
+				version: "1",
+				description: "fixture",
+				systemPrompt: "",
+				allowedTools: [],
+			},
+			plans: [
+				{
+					provider: "fake",
+					modelId: "fixture",
+					model: "fake/fixture",
+					thinking: "off",
+					modelSource: "request",
+					thinkingSource: "request",
+				},
+			],
+			resolved: {},
+			identity: {
+				id: "public-io",
+				logicalId: "logical-io",
+				generationId: "generation-io",
+				taskId: "task-io",
+			},
+		});
+		await session.sendPersistent("io-fixture", "capture");
+		return captured;
+	} finally {
+		await session.shutdown("quit");
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+const testIO = await persistentFixtureIO();
+const subagentsModule = {
+	...hostModule,
+	__test__: {
+		...hostModule.__test__,
+		handleSubagentSend: (
+			params: Parameters<typeof hostModule.__test__.handleSubagentSend>[0],
+		) => hostModule.__test__.handleSubagentSend(params, testIO),
+		handleSubagentStop: (
+			params: Parameters<typeof hostModule.__test__.handleSubagentStop>[0],
+			api: Parameters<typeof hostModule.__test__.handleSubagentStop>[1],
+			timeout = 15_000,
+		) => hostModule.__test__.handleSubagentStop(params, api, timeout, testIO),
+		deliverPersistentTaskEvent: (
+			record: Parameters<
+				typeof hostModule.__test__.deliverPersistentTaskEvent
+			>[0],
+			event: Parameters<
+				typeof hostModule.__test__.deliverPersistentTaskEvent
+			>[1],
+			api: Parameters<typeof hostModule.__test__.deliverPersistentTaskEvent>[2],
+			ledger?: ReturnType<PiPersistentIO["readLedger"]>,
+		) =>
+			hostModule.__test__.deliverPersistentTaskEvent(
+				record,
+				event,
+				api,
+				testIO,
+				ledger,
+			),
+		drainPersistentTaskEvents: (
+			record: Parameters<
+				typeof hostModule.__test__.drainPersistentTaskEvents
+			>[0],
+			api: Parameters<typeof hostModule.__test__.drainPersistentTaskEvents>[1],
+			readLedger = readPersistentDeliveryLedger,
+		) =>
+			hostModule.__test__.drainPersistentTaskEvents(record, api, {
+				...testIO,
+				readLedger: (r) => readLedger(r.sessionFile),
+			}),
+		notifyPersistentCrash: (
+			record: Parameters<typeof hostModule.__test__.notifyPersistentCrash>[0],
+			api: Parameters<typeof hostModule.__test__.notifyPersistentCrash>[1],
+		) => hostModule.__test__.notifyPersistentCrash(record, api, testIO),
+		evaluateNoProgressAdvisory: (
+			...args: [
+				Parameters<typeof hostModule.__test__.evaluateNoProgressAdvisory>[0],
+				Parameters<typeof hostModule.__test__.evaluateNoProgressAdvisory>[1],
+				number,
+				number,
+			]
+		) =>
+			hostModule.__test__.evaluateNoProgressAdvisory(...args, (r) =>
+				inspectNoProgressSessionTail(r.sessionFile),
+			),
+	},
+};
+
 // --- Tests ---
 
 // Keep the real host/adapter/launch/sidecar path; fake only Herdr and starting Pi.
@@ -365,10 +530,9 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 		const previous = {
 			pi: runtime.pi,
 			latestCtx: runtime.latestCtx,
-			supervision: runtime.supervision,
-			surfaceProvider: runtime.surfaceProvider,
-			launchOperations: runtime.launchOperations,
+			session: runtime.session,
 		};
+		runtime.session = undefined;
 		const surface = new FakeSurfaceProvider();
 		const restorers: Array<() => void> = [];
 		const commands: string[] = [];
@@ -391,7 +555,16 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 			registrations++;
 			return register(...args);
 		};
-		runtime.supervision = supervision;
+		const launchOperations = launchOperationsFromSurface(surface, {
+			mode: "tab",
+			direction: "right",
+			maxPerTab: 4,
+		});
+		const infrastructure = {
+			surfaceProvider: surface,
+			launchOperations,
+			supervision,
+		};
 		function patch(target: any, name: string, value: any) {
 			const original = target[name];
 			target[name] = value;
@@ -400,35 +573,33 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 			});
 		}
 		function patchTransport() {
-			patch(runtime.surfaceProvider, "isAvailable", () => true);
-			patch(runtime.surfaceProvider, "listSurfaces", () =>
-				surface.listSurfaces(),
-			);
-			patch(runtime.surfaceProvider, "inspectSurface", (id: string) =>
-				surface.inspectSurface(id),
-			);
-			patch(
-				runtime.surfaceProvider,
-				"readScreen",
-				(id: string, lines?: number) => surface.readScreen(id, lines),
-			);
-			patch(runtime.surfaceProvider, "closeSurface", async (id: string) => {
+			patch(surface, "isAvailable", () => true);
+			const close = surface.closeSurface.bind(surface);
+			patch(surface, "closeSurface", async (id: string) => {
 				closed.push(id);
-				await surface.closeSurface(id);
+				await close(id);
 			});
-			patch(
-				runtime.launchOperations,
-				"createPane",
-				(name: string, cwd?: string) =>
-					surface.createSurface({
-						name,
-						cwd: cwd ?? paths.projectDir,
-						placement: { kind: "tab" },
-					}),
+			patch(launchOperations, "createPane", (name: string, cwd?: string) =>
+				surface.createSurface({
+					name,
+					cwd: cwd ?? paths.projectDir,
+					placement: { kind: "tab" },
+				}),
 			);
-			patch(runtime.launchOperations, "waitForShellReady", async () => {});
+			patch(launchOperations, "waitForShellReady", async () => {});
+			patch(surface, "waitForShellReady", async () => {});
 			patch(
-				runtime.launchOperations,
+				surface,
+				"runScript",
+				(_id: string, command: string, opts: { scriptPath: string }) => {
+					commands.push(command);
+					mkdirSync(dirname(opts.scriptPath), { recursive: true });
+					writeFileSync(opts.scriptPath, command);
+					return opts.scriptPath;
+				},
+			);
+			patch(
+				launchOperations,
 				"runScript",
 				(_id: string, command: string, opts: any) => {
 					commands.push(command);
@@ -440,7 +611,7 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 		const mock = createMockExtensionApi();
 		const apis = [mock];
 		mock.api.getThinkingLevel = () => "high";
-		subagentsModule.default(mock.api);
+		subagentsModule.default(mock.api, { infrastructure });
 		const sessionDir = join(paths.projectDir, "parent-sessions");
 		mkdirSync(sessionDir);
 		const sessionFile = createSessionFile(sessionDir, [
@@ -482,10 +653,16 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 			} = { type: "done" },
 		) {
 			writeFileSync(`${child.sessionFile}.exit`, JSON.stringify(result));
-			await child.adapter.awaitCompletion(
-				child.handle,
-				new AbortController().signal,
-			);
+			// Observe this actual attempt, not the logical producer that may continue
+			// through another candidate. The real adapter/coordinator still reads it.
+			const deadline = Date.now() + 3_000;
+			while (
+				child.lifecycle.process.kind !== "completed" &&
+				child.lifecycle.process.kind !== "failed"
+			) {
+				assert.ok(Date.now() < deadline, "actual Pi attempt did not settle");
+				await turn();
+			}
 			await turn();
 		}
 		try {
@@ -503,12 +680,15 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 				patchTransport,
 				patch,
 				apis,
+				launchOperations,
+				infrastructure,
+				handle: (child: any) =>
+					runtime.session.getHandle(runtime.session.getControlTaskId(child.id)),
 				registrations: () => registrations,
 			});
 		} finally {
 			for (const child of runtime.runningSubagents.values()) {
-				child.lifecycle = { ...child.lifecycle, delivery: "suppressed" };
-				child.abortController?.abort();
+				runtime.session.suppress(runtime.session.getControlTaskId(child.id));
 				if (child.stopTimeout) clearTimeout(child.stopTimeout);
 			}
 			await turn();
@@ -525,6 +705,323 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 }
 
 describe("host adapter migration", () => {
+	it("quit then a second host load creates a healthy coordinator without resetting the global session", async () =>
+		withAdapterHost(async (f) => {
+			const first = f.runtime.session;
+			let finishBtw!: () => void;
+			const btw = new Promise<boolean>((resolve) => {
+				finishBtw = () => resolve(false);
+			});
+			f.patch(first, "closeBtw", () => btw);
+			const shutdown = f.mock.eventHandlers.get("session_shutdown")[0];
+			const quitting = shutdown({ reason: "quit" }, { ui: { setWidget() {} } });
+			const wake = new FileWakeRegistry();
+			const supervision = new SupervisionCoordinator(
+				async () => ({
+					complete: true,
+					panes: f.surface
+						.listSurfaces()
+						.map((s: any) => ({ paneId: s.id, workspaceId: "fixture" })),
+				}),
+				(id) => f.surface.inspectSurface(id),
+				false,
+				wake,
+			);
+			try {
+				const next = createMockExtensionApi();
+				f.apis.push(next);
+				next.api.getThinkingLevel = () => "high";
+				// No withAdapterHost reset between quit and this actual second load.
+				hostModule.default(next.api, {
+					infrastructure: { ...f.infrastructure, supervision },
+				});
+				const child = await f.launch(
+					{ name: "after-quit", task: "bounded" },
+					next,
+				);
+				assert.notEqual(f.runtime.session, first);
+				assert.deepEqual(f.runtime.session.diagnostics(), {
+					mode: "wake+batch",
+					watcherCount: 1,
+				});
+				assert.deepEqual(supervision.diagnostics(), {
+					mode: "wake+batch",
+					watcherCount: 1,
+				});
+				const second = f.runtime.session;
+				finishBtw();
+				await quitting;
+				assert.equal(
+					f.runtime.session,
+					second,
+					"an old shutdown must not clear the replacement after await",
+				);
+				await f.finish(child);
+				assert.equal(next.sentMessages.length, 1);
+			} finally {
+				finishBtw();
+				await quitting;
+				supervision.close();
+				wake.close();
+			}
+		}));
+
+	it("local evidence keeps the host presentation cold while pane observations still redraw", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({ name: "cold-widget", task: "bounded" });
+			let widgets = 0;
+			f.ctx.hasUI = true;
+			f.ctx.ui = {
+				setWidget() {
+					widgets++;
+				},
+			};
+			const owner =
+				f.runtime.session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+			const onObserved = owner.options.hooks.onObserved;
+			const observation = {
+				observedAt: Date.now(),
+				lifecycle: child.lifecycle,
+				projection: projectLifecycle(child.lifecycle, Date.now()),
+			};
+			onObserved(child, { ...observation, kind: "local-evidence" });
+			assert.equal(widgets, 0);
+			onObserved(child, { ...observation, kind: "pane" });
+			assert.equal(widgets, 1);
+			await f.finish(child);
+		}));
+
+	it("final quit suppresses and aborts unowned legacy rows synchronously", async () =>
+		withAdapterHost(async (f) => {
+			const abortController = new AbortController();
+			const legacy = {
+				id: "legacy",
+				lifecycle: createLifecycle(0),
+				abortController,
+			};
+			f.runtime.runningSubagents.set(legacy.id, legacy);
+			let gatedAtAbort = false;
+			abortController.signal.addEventListener("abort", () => {
+				gatedAtAbort = legacy.lifecycle.delivery === "suppressed";
+			});
+			const shutdown = f.mock.eventHandlers.get("session_shutdown")[0](
+				{ reason: "quit" },
+				{ ui: { setWidget() {} } },
+			);
+			assert.equal(gatedAtAbort, true);
+			assert.equal(abortController.signal.aborted, true);
+			assert.equal(f.runtime.runningSubagents.size, 0);
+			await shutdown;
+		}));
+
+	it("public launch owns the four-argument advisory route and keeps duplicate and fresh evaluations cold", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({ name: "advisory", task: "bounded" });
+			const session = f.runtime.session;
+			const control = session.getControlTaskId(child.id);
+			assert.equal(control, session.getTask(control).id);
+			assert.equal(session.getRecord(control), child);
+			const inspect = session.inspectProgress.bind(session);
+			let inspections = 0;
+			f.patch(session, "inspectProgress", (id: string) => {
+				assert.equal(id, control);
+				assert.equal(session.getRecord(id), child);
+				inspections++;
+				return inspect(id);
+			});
+			writeFileSync(
+				child.sessionFile,
+				JSON.stringify({
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call", name: "bash" }],
+						stopReason: "toolUse",
+					},
+				}) + "\n",
+			);
+			utimesSync(child.sessionFile, 0, 0);
+			child.lifecycle = observePaneInspection(
+				createLifecycle(0),
+				{ kind: "present", observedAt: 1, agentStatus: "working" },
+				1,
+			);
+			const now = 120_000;
+			const evaluate = (at: number) =>
+				hostModule.__test__.evaluateNoProgressAdvisory(
+					child,
+					projectLifecycle(child.lifecycle, at),
+					at,
+					1,
+				);
+			const advisory = evaluate(now)!;
+			assert.equal(advisory.classification, "blocked-tool");
+			assert.equal(advisory.lastEntryKind, "assistant");
+			assert.equal(advisory.notify, true);
+			assert.equal(inspections, 1);
+			assert.equal(evaluate(now + 1000), undefined);
+			utimesSync(child.sessionFile, 0, (now + 2000) / 1000);
+			assert.equal(evaluate(now + 2000)?.kind, "recovered");
+			assert.equal(evaluate(now + 3000), undefined);
+			assert.equal(inspections, 1);
+			await f.finish(child);
+		}));
+
+	for (const boundary of ["adapter", "finalizer"])
+		for (const accepted of [true, false])
+			it(`ordinary ${boundary} transcript failure preserves Stage3 payload and ${accepted ? "nonblocking close" : "rejected-send manual retention"}`, async () =>
+				withAdapterHost(async (f) => {
+					writeAgentFile(
+						f.projectAgentsDir,
+						"error-role",
+						"spawning: false\nauto-exit: true",
+						"Bounded identity",
+					);
+					const child = await f.launch({
+						name: "processing",
+						agent: "error-role",
+						task: "bounded",
+						model: "fake/first, fake/second",
+					});
+					child.startTime = Date.now() - 12000;
+					assert.deepEqual(child.runtimePlan, {
+						provider: "fake",
+						modelId: "first",
+						model: "fake/first",
+						thinking: "high",
+						modelSource: "request",
+						thinkingSource: "parent",
+						requestedModel: "fake/first",
+					});
+					const session = f.runtime.session;
+					const controlTaskId = session.getControlTaskId(child.id);
+					const owner =
+						session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+					const observed = owner.options.hooks.onObserved;
+					const completions: any[] = [];
+					owner.options.hooks.onObserved = (record: any, observation: any) => {
+						observed(record, observation);
+						if (observation.kind !== "completion") return;
+						completions.push({
+							record,
+							process: record.lifecycle.process.kind,
+						});
+						if (boundary === "finalizer") {
+							rmSync(child.sessionFile);
+							mkdirSync(child.sessionFile);
+						}
+					};
+					const sends: any[] = [];
+					const send = f.mock.api.sendMessage;
+					f.mock.api.sendMessage = (...args: any[]) => {
+						sends.push({
+							message: args[0],
+							options: args[1],
+							delivery: child.lifecycle.delivery,
+							tracked: f.runtime.runningSubagents.has(child.id),
+							closes: f.closed.length,
+						});
+						if (!accepted) throw new Error("ordinary error send rejected");
+						send(...args);
+					};
+					let releaseClose!: () => void;
+					const closeWait = new Promise<void>((resolve) => {
+						releaseClose = resolve;
+					});
+					const close = f.surface.closeSurface.bind(f.surface);
+					let closeStarted = false;
+					f.patch(f.surface, "closeSurface", async (id: string) => {
+						closeStarted = true;
+						await closeWait;
+						await close(id);
+					});
+					try {
+						if (boundary === "adapter") mkdirSync(child.sessionFile);
+						else
+							writeFileSync(
+								child.sessionFile,
+								JSON.stringify({
+									type: "session",
+									version: 3,
+									id: child.id,
+									cwd: f.projectDir,
+								}) + "\n",
+							);
+						writeFileSync(
+							`${child.sessionFile}.exit`,
+							JSON.stringify({
+								type: "error",
+								errorMessage: "real provider evidence",
+							}),
+						);
+						const deadline = Date.now() + 3000;
+						while (session.getTask(controlTaskId)) {
+							assert.ok(Date.now() < deadline);
+							await f.turn();
+						}
+						await f.turn();
+						assert.equal(completions.length, boundary === "finalizer" ? 1 : 0);
+						if (boundary === "finalizer") {
+							assert.equal(completions[0].record, child);
+							assert.equal(completions[0].process, "finalizing");
+						}
+						assert.equal(sends.length, 1);
+						assert.equal(sends[0].delivery, "delivered");
+						assert.equal(sends[0].tracked, false);
+						assert.equal(sends[0].closes, 0);
+						assert.equal(
+							owner.entries.size,
+							0,
+							"retirement must precede close resolution, without Pi getters",
+						);
+						assert.equal(f.commands.length, 1);
+						assert.equal(f.registrations(), 1);
+						assert.equal(closeStarted, accepted);
+						assert.equal(
+							f.closed.length,
+							0,
+							"ordinary close is still unresolved",
+						);
+						const { message, options } = sends[0];
+						assert.equal(message.customType, "subagent_result");
+						assert.equal(message.display, true);
+						assert.deepEqual(options, {
+							triggerTurn: true,
+							deliverAs: "steer",
+						});
+						assert.ok(Number.isInteger(message.details.elapsed));
+						assert.ok(
+							message.details.elapsed >= 12 && message.details.elapsed <= 14,
+						);
+						// Stage3 watchSubagent catch -> fallback wrapper -> ordinary .then:
+						// no result runtimePlan/session/errorMessage; details retain the live plan.
+						const rawError = `EISDIR: illegal operation on a directory, read`;
+						const resultContent = `Sub-agent "processing" failed (exit code 1).\n\nSubagent error: ${rawError}\n\nRequested model: fake/first`;
+						assert.deepEqual(message.details, {
+							name: "processing",
+							task: "bounded",
+							agent: "error-role",
+							exitCode: 1,
+							elapsed: message.details.elapsed,
+							sessionFile: undefined,
+							fallbackAttempts: ["fake/first"],
+							fallbackFailures: [],
+							runtimePlan: child.runtimePlan,
+							resultContent,
+						});
+						assert.equal(message.details.resultContent, resultContent);
+						assert.equal(
+							message.content,
+							`${resultContent}\n\nParent action: Continue the parent task using this result; do not return an empty response.`,
+						);
+						assert.equal(f.mock.sentMessages.length, accepted ? 1 : 0);
+					} finally {
+						releaseClose();
+						await f.turn();
+					}
+					assert.equal(f.closed.length, accepted ? 1 : 0);
+					assert.equal(f.surface.listSurfaces().length, accepted ? 0 : 1);
+				}));
 	it("preserves clamped runtime provenance, bare identity and omitted cwd configuration", async () =>
 		withAdapterHost(async (f) => {
 			mkdirSync(join(f.projectDir, ".pi", "agent"), { recursive: true });
@@ -535,11 +1032,16 @@ describe("host adapter migration", () => {
 				systemPrompt: "Bare identity",
 			});
 			assert.ok(
-				child.handle,
-				"host launch must retain the adapter handle for completion and reload",
+				f.handle(child),
+				"composition retains the actual handle for completion and reload",
 			);
-			assert.equal(child.adapter.getRunningChild(child.handle), child);
-			assert.equal(child.handle.sessionId, child.sessionFile);
+			assert.equal(
+				f.runtime.session.getRecord(
+					f.runtime.session.getControlTaskId(child.id),
+				),
+				child,
+			);
+			assert.equal(f.handle(child).sessionId, child.sessionFile);
 			assert.equal(child.agent, undefined);
 			assert.equal(child.interactive, false);
 			assert.deepEqual(child.runtimePlan, {
@@ -593,10 +1095,10 @@ describe("host adapter migration", () => {
 				skills: "one, two",
 				tools: "read",
 			});
-			assert.ok(child.handle);
+			assert.ok(f.handle(child));
 			assert.equal(child.agent, "host-role");
 			assert.equal(child.interactive, true);
-			assert.equal(child.handle.cwd, roleCwd);
+			assert.equal(f.handle(child).cwd, roleCwd);
 			const policy = readSubagentSessionPolicy(child.sessionFile);
 			assert.deepEqual(policy.tools, ["read"]);
 			assert.ok(policy.deniedTools.includes("subagents_write_task_models"));
@@ -623,7 +1125,7 @@ describe("host adapter migration", () => {
 				task: "bounded",
 				cwd: ".",
 			});
-			assert.equal(explicit.handle.cwd, f.projectDir);
+			assert.equal(f.handle(explicit).cwd, f.projectDir);
 			assert.ok(
 				f.commands[1].includes(
 					`PI_CODING_AGENT_DIR='${join(f.projectDir, ".pi", "agent")}'`,
@@ -638,8 +1140,13 @@ describe("host adapter migration", () => {
 				task: "first",
 				persistent: true,
 			});
-			assert.ok(child.handle);
-			assert.equal(child.adapter.getRunningChild(child.handle), child);
+			assert.ok(f.handle(child));
+			assert.equal(
+				f.runtime.session.getRecord(
+					f.runtime.session.getControlTaskId(child.id),
+				),
+				child,
+			);
 			assert.equal(readPersistentDeliveryLedger(child.sessionFile).length, 1);
 			assert.equal(f.registrations(), 1);
 			appendPersistentTaskEvent(child.sessionFile, {
@@ -699,7 +1206,9 @@ describe("host adapter migration", () => {
 				error: undefined,
 			});
 			assert.equal(
-				child.adapter.getRunningChild(child.handle).tasksCompleted,
+				f.runtime.session.getRecord(
+					f.runtime.session.getControlTaskId(child.id),
+				).tasksCompleted,
 				1,
 			);
 			child.stopState = "requested";
@@ -710,23 +1219,24 @@ describe("host adapter migration", () => {
 	it("retains each owning adapter and watcher through reload while new launches use the new parent snapshot", async () =>
 		withAdapterHost(async (f) => {
 			const old = await f.launch({ name: "old", task: "bounded" });
-			assert.ok(old.handle);
-			const owner = old.adapter;
+			assert.ok(f.handle(old));
+			const owner = f.runtime.session;
+			const oldHandle = f.handle(old);
 			const reloaded = await import(
 				`../pi-extension/subagents/index.ts?task11-${Date.now()}`
 			);
-			f.patchTransport();
 			const replacement = createMockExtensionApi();
 			f.apis.push(replacement);
 			replacement.api.getThinkingLevel = () => "low";
-			reloaded.default(replacement.api);
+			reloaded.default(replacement.api, { infrastructure: f.infrastructure });
 			f.ctx.model = { provider: "fake", id: "replacement" };
 			const next = await f.launch(
 				{ name: "new", task: "bounded" },
 				replacement,
 			);
-			assert.equal(old.adapter, owner);
-			assert.notEqual(next.adapter, owner);
+			assert.equal(owner.getRecord(owner.getControlTaskId(old.id)), old);
+			assert.equal(f.handle(old), oldHandle);
+			assert.notEqual(f.handle(next), oldHandle);
 			assert.deepEqual(next.runtimePlan, {
 				provider: "fake",
 				modelId: "replacement",
@@ -750,13 +1260,13 @@ describe("host adapter migration", () => {
 				task: "bounded",
 				model: "fake/first, fake/second",
 			});
-			assert.ok(first.handle);
+			assert.ok(f.handle(first));
 			let launched!: () => void;
 			const secondLaunch = new Promise<void>((resolve) => {
 				launched = resolve;
 			});
-			const runScript = f.runtime.launchOperations.runScript;
-			f.patch(f.runtime.launchOperations, "runScript", (...args: any[]) => {
+			const runScript = f.launchOperations.runScript;
+			f.patch(f.launchOperations, "runScript", (...args: any[]) => {
 				const script = runScript(...args);
 				launched();
 				return script;
@@ -770,8 +1280,16 @@ describe("host adapter migration", () => {
 			const second = f.runtime.runningSubagents.get(first.id);
 			assert.equal(second.id, first.id);
 			assert.notEqual(second.sessionFile, first.sessionFile);
-			assert.notEqual(second.adapter, first.adapter);
-			assert.equal(second.abortController, first.abortController);
+			assert.equal(
+				f.runtime.session.getHandle(
+					f.runtime.session.getControlTaskId(first.id),
+				).sessionId,
+				second.sessionFile,
+			);
+			assert.equal(
+				f.runtime.session.getControlTaskId(second.id),
+				f.runtime.session.getControlTaskId(first.id),
+			);
 			assert.equal(f.closed.length, 0);
 			assert.equal(f.surface.listSurfaces().length, 2);
 			await f.finish(second);
@@ -787,7 +1305,7 @@ describe("host adapter migration", () => {
 		it(`ordinary completion ${accepted ? "closes only after accepted delivery" : "retains the pane after rejected delivery"}`, async () =>
 			withAdapterHost(async (f) => {
 				const child = await f.launch({ name: "delivery", task: "bounded" });
-				assert.ok(child.handle);
+				assert.ok(f.handle(child));
 				let closesAtDelivery = -1;
 				const send = f.mock.api.sendMessage;
 				f.mock.api.sendMessage = (...args: any[]) => {
@@ -800,60 +1318,400 @@ describe("host adapter migration", () => {
 				assert.equal(f.closed.length, accepted ? 1 : 0);
 				assert.equal(f.surface.listSurfaces().length, accepted ? 0 : 1);
 			}));
-	it("finalizes the retained worktree manifest before delivery without closing its root pane", async () =>
-		withAdapterHost(async (f) => {
-			execFileSync("git", ["init", "-q"], { cwd: f.projectDir });
-			writeFileSync(join(f.projectDir, "tracked"), "base");
-			execFileSync("git", ["add", "tracked"], { cwd: f.projectDir });
-			execFileSync(
-				"git",
-				[
-					"-c",
-					"user.name=Test",
-					"-c",
-					"user.email=test@example.com",
-					"-c",
-					"commit.gpgsign=false",
-					"commit",
-					"-qm",
-					"fixture",
-				],
-				{ cwd: f.projectDir },
-			);
-			const retained = join(f.globalDir, "retained");
-			execFileSync("git", ["clone", "-q", f.projectDir, retained]);
-			f.patch(f.runtime.launchOperations, "createWorktree", () => ({
-				path: retained,
-				workspaceId: "owned-workspace",
-				paneId: f.surface.createSurface({
-					name: "worktree-root",
-					cwd: retained,
-				}),
-				branch: "bounded-worktree",
-			}));
-			const child = await f.launch({
-				name: "worktree",
-				task: "bounded",
-				worktree: { branch: "bounded-worktree" },
-			});
-			assert.ok(child.handle.worktree);
-			const deliveredStates: string[] = [];
-			const send = f.mock.api.sendMessage;
-			f.mock.api.sendMessage = (...args: any[]) => {
-				deliveredStates.push(
-					JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state,
+	for (const warning of [false, true])
+		it(`finalizes the retained worktree manifest before delivery without closing its root pane${warning ? " and preserves manifest warnings" : ""}`, async () =>
+			withAdapterHost(async (f) => {
+				execFileSync("git", ["init", "-q"], { cwd: f.projectDir });
+				writeFileSync(join(f.projectDir, "tracked"), "base");
+				execFileSync("git", ["add", "tracked"], { cwd: f.projectDir });
+				execFileSync(
+					"git",
+					[
+						"-c",
+						"user.name=Test",
+						"-c",
+						"user.email=test@example.com",
+						"-c",
+						"commit.gpgsign=false",
+						"commit",
+						"-qm",
+						"fixture",
+					],
+					{ cwd: f.projectDir },
 				);
-				send(...args);
-			};
-			await f.finish(child);
-			assert.deepEqual(deliveredStates, ["ready_for_review"]);
-			assert.equal(f.closed.length, 0);
-			assert.equal(f.surface.listSurfaces().length, 1);
-			assert.equal(
-				f.mock.sentMessages.at(-1).message.details.worktree.clean,
-				true,
+				const retained = join(f.globalDir, "retained");
+				execFileSync("git", ["clone", "-q", f.projectDir, retained]);
+				f.patch(f.launchOperations, "createWorktree", () => ({
+					path: retained,
+					workspaceId: "owned-workspace",
+					paneId: f.surface.createSurface({
+						name: "worktree-root",
+						cwd: retained,
+					}),
+					branch: "bounded-worktree",
+				}));
+				const child = await f.launch({
+					name: "worktree",
+					task: "bounded",
+					worktree: { branch: "bounded-worktree" },
+				});
+				assert.ok(f.handle(child).worktree);
+				if (warning) {
+					rmSync(child.worktree.manifestFile);
+					mkdirSync(child.worktree.manifestFile);
+				}
+				const deliveredStates: string[] = [];
+				const send = f.mock.api.sendMessage;
+				f.mock.api.sendMessage = (...args: any[]) => {
+					deliveredStates.push(
+						warning
+							? args[0].details.worktree.gitError
+							: JSON.parse(readFileSync(child.worktree.manifestFile, "utf8"))
+									.state,
+					);
+					send(...args);
+				};
+				await f.finish(child);
+				if (warning) assert.match(deliveredStates[0], /Manifest update failed/);
+				else assert.deepEqual(deliveredStates, ["ready_for_review"]);
+				const handoff = f.mock.sentMessages.at(-1).message.details.worktree;
+				assert.equal(handoff.workspaceId, "owned-workspace");
+				assert.equal(handoff.paneId, child.surface);
+				assert.equal(f.closed.length, 0);
+				assert.equal(f.surface.listSurfaces().length, 1);
+				assert.equal(
+					f.mock.sentMessages.at(-1).message.details.worktree.clean,
+					true,
+				);
+			}));
+	it("public resume prelaunch transcript rejection acquires nothing", async () =>
+		withAdapterHost(async (f) => {
+			const path = join(f.projectDir, "unreadable.jsonl");
+			mkdirSync(path);
+			const tool = f.mock.registeredTools.find(
+				(t: any) => t.name === "subagent_resume",
 			);
+			await assert.rejects(
+				tool.execute(
+					"resume",
+					{ sessionPath: path },
+					new AbortController().signal,
+					undefined,
+					f.ctx,
+				),
+				/EISDIR/,
+			);
+			const owner =
+				f.runtime.session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+			assert.equal(owner.entries.size, 0);
+			assert.equal(f.runtime.runningSubagents.size, 0);
+			assert.equal(f.registrations(), 0);
+			assert.equal(f.commands.length, 0);
+			assert.equal(f.closed.length, 0);
+			assert.equal(f.surface.listSurfaces().length, 0);
+			assert.equal(f.mock.sentMessages.length, 0);
 		}));
+
+	for (const boundary of ["adapter", "finalizer"])
+		for (const recover of [false, "output", "empty"])
+			it(`public resume ${boundary} failure ${recover ? `recovers at the late read (${recover})` : "silently retains its manual pane"} after delivered/map-delete`, async () =>
+				withAdapterHost(async (f) => {
+					const path = join(f.projectDir, "saved.jsonl");
+					const header =
+						JSON.stringify({
+							type: "session",
+							version: 3,
+							id: "saved",
+							cwd: f.projectDir,
+						}) + "\n";
+					writeFileSync(path, header);
+					writeSubagentSessionPolicy(path, {
+						owner: "public",
+						deniedTools: [],
+					});
+					const tool = f.mock.registeredTools.find(
+						(t: any) => t.name === "subagent_resume",
+					);
+					const started = await tool.execute(
+						"resume",
+						{ name: "resumed", sessionPath: path, message: "followup" },
+						new AbortController().signal,
+						undefined,
+						f.ctx,
+					);
+					const child = f.runtime.runningSubagents.get(started.details.id);
+					const session = f.runtime.session;
+					const control = session.getControlTaskId(child.id);
+					const owner =
+						session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+					const corrupt = () => {
+						rmSync(path);
+						mkdirSync(path);
+					};
+					let completions = 0;
+					const observed = owner.options.hooks.onObserved;
+					owner.options.hooks.onObserved = (record: any, observation: any) => {
+						observed(record, observation);
+						if (observation.kind === "completion") {
+							completions++;
+							if (boundary === "finalizer") corrupt();
+						}
+					};
+					const late: any[] = [];
+					let readError: unknown;
+					const settled = owner.options.hooks.onSettled;
+					owner.options.hooks.onSettled = (
+						record: any,
+						result: any,
+						task: any,
+						io: any,
+					) => {
+						if (recover) {
+							rmSync(path, { recursive: true });
+							writeFileSync(
+								path,
+								recover === "empty"
+									? header
+									: header +
+											JSON.stringify({
+												type: "message",
+												message: {
+													role: "assistant",
+													content: [
+														{ type: "text", text: "Recovered new output" },
+													],
+												},
+											}) +
+											"\n",
+							);
+						}
+						const read = io.readResumeResult;
+						const scopedIO = { ...io };
+						if (read)
+							scopedIO.readResumeResult = () => {
+								late.push({
+									delivery: child.lifecycle.delivery,
+									tracked: f.runtime.runningSubagents.has(child.id),
+									sends: f.mock.sentMessages.length,
+									closes: f.closed.length,
+								});
+								try {
+									return read();
+								} catch (error) {
+									readError = error;
+									throw error;
+								}
+							};
+						return settled(record, result, task, scopedIO);
+					};
+					if (boundary === "adapter") corrupt();
+					writeFileSync(`${path}.exit`, JSON.stringify({ type: "done" }));
+					const deadline = Date.now() + 3000;
+					while (session.getTask(control)) {
+						assert.ok(Date.now() < deadline);
+						await f.turn();
+					}
+					assert.equal(
+						owner.entries.size,
+						0,
+						"retire without Pi metadata getters",
+					);
+					assert.deepEqual(late, [
+						{ delivery: "delivered", tracked: false, sends: 0, closes: 0 },
+					]);
+					assert.equal(child.lifecycle.delivery, "delivered");
+					assert.equal(completions, boundary === "finalizer" ? 1 : 0);
+					assert.equal(f.registrations(), 1);
+					assert.equal(f.commands.length, 1);
+					assert.equal(f.mock.sentMessages.length, recover ? 1 : 0);
+					assert.equal(f.closed.length, recover ? 1 : 0);
+					assert.equal(f.surface.listSurfaces().length, recover ? 0 : 1);
+					if (recover) {
+						assert.equal(readError, undefined);
+						assert.deepEqual(f.mock.sentMessages[0].message.details, {
+							name: "resumed",
+							task: "followup",
+							exitCode: 1,
+							elapsed: f.mock.sentMessages[0].message.details.elapsed,
+							sessionFile: path,
+							resultContent: `Sub-agent "resumed" failed (exit code 1).\n\n${recover === "empty" ? "Resumed session exited with code 1" : "Recovered new output"}\n\nSession: ${path}\nResume: pi --session ${path}`,
+						});
+					} else assert.match(String(readError), /EISDIR/);
+				}));
+
+	for (const scenario of [
+		"fresh",
+		"empty",
+		"provider-error",
+		"rejected-send",
+		"ping",
+		"suppressed",
+	])
+		it(`public resume ${scenario} preserves late-read demand and delivery retention`, async () =>
+			withAdapterHost(async (f) => {
+				const path = join(f.projectDir, "saved.jsonl");
+				const header =
+					JSON.stringify({
+						type: "session",
+						version: 3,
+						id: "saved",
+						cwd: f.projectDir,
+					}) + "\n";
+				const old =
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "Old output" }],
+						},
+					}) + "\n";
+				writeFileSync(path, header + old);
+				writeSubagentSessionPolicy(path, { owner: "public", deniedTools: [] });
+				const started = await f.mock.registeredTools
+					.find((t: any) => t.name === "subagent_resume")
+					.execute(
+						"resume",
+						{ name: "resumed", sessionPath: path },
+						new AbortController().signal,
+						undefined,
+						f.ctx,
+					);
+				const child = f.runtime.runningSubagents.get(started.details.id);
+				const session = f.runtime.session;
+				const control = session.getControlTaskId(child.id);
+				const owner = session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+				const settled = owner.options.hooks.onSettled;
+				const late: any[] = [],
+					sends: any[] = [],
+					summaries: string[] = [];
+				owner.options.hooks.onSettled = (
+					record: any,
+					result: any,
+					task: any,
+					io: any,
+				) => {
+					if (scenario === "ping") {
+						rmSync(path);
+						mkdirSync(path);
+					}
+					if (scenario === "fresh" || scenario === "rejected-send")
+						writeFileSync(
+							path,
+							header +
+								old +
+								JSON.stringify({
+									type: "message",
+									message: {
+										role: "assistant",
+										content: [{ type: "text", text: "Late fresh output" }],
+									},
+								}) +
+								"\n",
+						);
+					const read = io.readResumeResult;
+					const scopedIO = { ...io };
+					if (read)
+						scopedIO.readResumeResult = () => {
+							late.push({
+								delivery: child.lifecycle.delivery,
+								tracked: f.runtime.runningSubagents.has(child.id),
+								sends: sends.length,
+							});
+							const value = read();
+							summaries.push(value.summary);
+							return value;
+						};
+					return settled(record, result, task, scopedIO);
+				};
+				const send = f.mock.api.sendMessage;
+				f.mock.api.sendMessage = (...args: any[]) => {
+					sends.push(args);
+					if (scenario === "rejected-send")
+						throw new Error("resume send rejected");
+					send(...args);
+				};
+				let releaseClose!: () => void;
+				const closeWait = new Promise<void>((resolve) => {
+					releaseClose = resolve;
+				});
+				const close = f.surface.closeSurface.bind(f.surface);
+				let closes = 0;
+				f.patch(f.surface, "closeSurface", async (id: string) => {
+					closes++;
+					await closeWait;
+					await close(id);
+				});
+				try {
+					if (scenario === "suppressed") session.suppress(control);
+					else
+						writeFileSync(
+							`${path}.exit`,
+							JSON.stringify(
+								scenario === "ping"
+									? { type: "ping", name: "resumed", message: "help" }
+									: scenario === "provider-error"
+										? { type: "error", errorMessage: "account rejected" }
+										: { type: "done" },
+							),
+						);
+					const deadline = Date.now() + 3000;
+					while (session.getTask(control)) {
+						assert.ok(Date.now() < deadline);
+						await f.turn();
+					}
+					assert.equal(
+						owner.entries.size,
+						0,
+						"retire even while close is unresolved",
+					);
+					assert.deepEqual(
+						late,
+						["ping", "suppressed"].includes(scenario)
+							? []
+							: [{ delivery: "delivered", tracked: false, sends: 0 }],
+					);
+					assert.equal(sends.length, scenario === "suppressed" ? 0 : 1);
+					assert.equal(closes, scenario === "rejected-send" ? 0 : 1);
+					assert.equal(f.closed.length, 0);
+					assert.equal(f.registrations(), 1);
+					assert.equal(f.commands.length, 1);
+					if (scenario !== "suppressed") {
+						assert.equal(child.lifecycle.delivery, "delivered");
+						const message = sends[0][0];
+						assert.deepEqual(sends[0][1], {
+							triggerTurn: true,
+							deliverAs: "steer",
+						});
+						assert.equal(message.details.sessionFile, path);
+						assert.equal(Object.hasOwn(message.details, "agent"), false);
+						assert.doesNotMatch(message.content, /Old output/);
+						if (scenario === "ping")
+							assert.equal(message.customType, "subagent_ping");
+						else {
+							assert.deepEqual(summaries, [
+								scenario === "empty"
+									? "Resumed session exited without new output"
+									: scenario === "provider-error"
+										? "Subagent error: account rejected"
+										: "Late fresh output",
+							]);
+							assert.match(
+								message.content,
+								scenario === "empty"
+									? /Resumed session exited without new output/
+									: scenario === "provider-error"
+										? /Error: account rejected/
+										: /Late fresh output/,
+							);
+						}
+					}
+				} finally {
+					releaseClose();
+					await f.turn();
+				}
+				assert.equal(f.closed.length, scenario === "rejected-send" ? 0 : 1);
+			}));
+
 	it("public resume retains its actual adapter ID and delivers only post-resume output", async () =>
 		withAdapterHost(async (f) => {
 			const child = await f.launch({
@@ -861,7 +1719,7 @@ describe("host adapter migration", () => {
 				task: "bounded",
 				tools: "read",
 			});
-			assert.ok(child.handle);
+			assert.ok(f.handle(child));
 			writeFileSync(
 				child.sessionFile,
 				JSON.stringify({
@@ -887,9 +1745,14 @@ describe("host adapter migration", () => {
 				f.ctx,
 			);
 			const resumed = f.runtime.runningSubagents.get(result.details.id);
-			assert.ok(resumed.handle);
-			assert.equal(result.details.id, resumed.handle.id);
-			assert.equal(resumed.adapter.getRunningChild(resumed.handle), resumed);
+			assert.ok(f.handle(resumed));
+			assert.equal(result.details.id, f.handle(resumed).id);
+			assert.equal(
+				f.runtime.session.getRecord(
+					f.runtime.session.getControlTaskId(resumed.id),
+				),
+				resumed,
+			);
 			assert.deepEqual(readSubagentSessionPolicy(resumed.sessionFile).tools, [
 				"read",
 			]);
@@ -2572,6 +3435,7 @@ describe("shared subagent configuration path", () => {
 describe("runtime reload configuration", () => {
 	const runtimeKey = Symbol.for("pi-subagents/runtime");
 	type ReloadRuntime = {
+		session?: PiRunSession;
 		runningSubagents?: Map<string, object>;
 		surfaceProvider?: object;
 		launchOperations?: {
@@ -2657,10 +3521,10 @@ describe("runtime reload configuration", () => {
 				},
 				async () => {
 					assert.equal(
-						await reloaded.__test__.launchOperations.createPane(
-							"reload-config",
-							"/repo",
-						),
+						await launchOperationsFromSurface(
+							new HerdrSurfaceProvider({ paneConfig: loadPaneConfig() }),
+							loadPaneConfig(),
+						).createPane("reload-config", "/repo"),
 						"pane-new",
 					);
 				},
@@ -2724,7 +3588,9 @@ describe("runtime reload configuration", () => {
 			runtimeSlot[runtimeKey] = { runningSubagents };
 			const reloaded = await importReloadedSubagents();
 			assert.equal(reloaded.__test__.runningSubagents, runningSubagents);
-			assert.ok(reloaded.__test__.launchOperations.createPane);
+			const mock = createMockExtensionApi();
+			reloaded.default(mock.api);
+			assert.ok(runtimeSlot[runtimeKey]?.session);
 		} finally {
 			runtimeSlot[runtimeKey] = beforeRuntime;
 		}
@@ -6995,24 +7861,57 @@ describe("commands", () => {
 		assert.equal(sentUserMessages.length, 0);
 	});
 
-	it("builds a standalone BTW command without worker control machinery", () => {
-		const command = subagentsModule.__test__.buildBtwLaunchCommand({
-			cwd: "/tmp/project path",
-			sessionFile: "/tmp/btw.jsonl",
-			question: "What does that API do?",
-			model: "openai-codex/gpt-5.6-sol",
-			thinking: "high",
-			agentDir: "/tmp/pi-agent",
-		});
-
-		assert.match(command, /--session/);
-		assert.match(command, /--no-extensions/);
-		assert.match(command, /openai-codex\/gpt-5\.6-sol/);
-		assert.match(command, /BTW question:/);
-		assert.match(command, /What does that API do\?/);
-		assert.match(command, /PI_CODING_AGENT_DIR=/);
-		assert.doesNotMatch(command, /subagent-done|PI_SUBAGENT_|subagent_result/);
-	});
+	it("runs BTW through the production composition's script-backed unwatched surface", () =>
+		withAdapterHost(async (f) => {
+			const file = f.ctx.sessionManager.getSessionFile();
+			writeFileSync(
+				file,
+				JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "parent",
+					cwd: f.projectDir,
+				}) +
+					"\n" +
+					JSON.stringify({
+						type: "message",
+						id: "leaf",
+						parentId: null,
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "context" }],
+						},
+					}) +
+					"\n",
+			);
+			const btw = await f.runtime.session.openBtw({
+				cwd: f.projectDir,
+				invocationCwd: f.projectDir,
+				parentSessionFile: file,
+				leafId: "leaf",
+				sessionDir: f.ctx.sessionManager.getSessionDir(),
+				sessionId: "parent",
+				question: "What does that API do?",
+				model: "openai-codex/gpt-5.6-sol",
+				thinking: "high",
+				agentDir: f.globalDir,
+			});
+			const command = f.commands.at(-1);
+			assert.match(command, /--session/);
+			assert.match(command, /--no-extensions/);
+			assert.match(command, /openai-codex\/gpt-5\.6-sol/);
+			assert.match(command, /BTW question:/);
+			assert.match(command, /What does that API do\?/);
+			assert.match(command, /PI_CODING_AGENT_DIR=/);
+			assert.doesNotMatch(
+				command,
+				/subagent-done|PI_SUBAGENT_|subagent_result/,
+			);
+			assert.equal(f.registrations(), 0);
+			assert.equal(f.mock.sentMessages.length, 0);
+			assert.equal(await f.runtime.session.closeBtw(), true);
+			assert.equal(existsSync(btw.sessionFile), false);
+		}));
 
 	it("/iterate always emits a full-context fork tool call", () => {
 		const { api, registeredCommands, sentUserMessages } =
@@ -8084,6 +8983,274 @@ describe("subagent activity snapshots", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+});
+
+describe("Task13 demand-driven persistent I/O", () => {
+	function drain(
+		record: PiRunRecord,
+		api: Parameters<typeof hostModule.__test__.drainPersistentTaskEvents>[1],
+		io: PiPersistentIO,
+	) {
+		// SAFETY: index.ts owns this process-local extension slot; fixture swaps only its delivery binding.
+		const root = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+		const previous = root.pi;
+		root.pi = api;
+		try {
+			hostModule.__test__.drainPersistentTaskEvents(record, api, io);
+		} finally {
+			root.pi = previous;
+		}
+	}
+	for (const kind of [
+		"quiet",
+		"irrelevant",
+		"behind-cursor",
+		"ledger-duplicate",
+		"help",
+		"done",
+	] as const)
+		it(`${kind} uses only the required raw/ledger/transcript reads and no Git capture`, () =>
+			withTempDir((dir) => {
+				const record: PiRunRecord = {
+					id: "io-count",
+					name: "io-count",
+					task: "first",
+					surface: "pane",
+					startTime: 0,
+					sessionFile: join(dir, "session.jsonl"),
+					launchScriptFile: "",
+					activityFile: "",
+					interactive: false,
+					runtimePlan: undefined,
+					lifecycle: createLifecycle(0),
+					persistent: true,
+					logicalId: "logical",
+					generationId: "generation",
+					policyHash: "a".repeat(64),
+					tasksCompleted: 0,
+					taskId: "task",
+					worktree: {
+						path: dir,
+						branch: "fixture",
+						baseRef: "HEAD",
+						baseSha: "not-inspected",
+						manifestFile: join(dir, "manifest"),
+						workspaceId: "fixture-workspace",
+						paneId: "pane",
+					},
+				};
+				writeFileSync(
+					record.sessionFile,
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "last nonempty" }],
+						},
+					}) + "\n",
+				);
+				if (kind !== "quiet")
+					appendPersistentTaskEvent(record.sessionFile, {
+						type: kind === "help" ? "help-request" : "task-done",
+						task: "task",
+						generation: kind === "irrelevant" ? "other" : "generation",
+					});
+				if (kind === "behind-cursor") record.observedTaskEvents = 1;
+				if (kind === "ledger-duplicate")
+					appendPersistentDeliveryLedger(record.sessionFile, {
+						task: "task",
+						outcome: "delivered",
+						generation: "generation",
+						logicalId: "logical",
+						policyHash: record.policyHash!,
+					});
+				const counts = [0, 0, 0, 0];
+				let sends = 0;
+				const io: PiPersistentIO = {
+					...testIO,
+					readEvents: (r) => {
+						counts[0]++;
+						return testIO.readEvents(r);
+					},
+					readLedger: (r) => {
+						counts[1]++;
+						return testIO.readLedger(r);
+					},
+					readTaskSummary: (r) => {
+						counts[2]++;
+						return testIO.readTaskSummary(r);
+					},
+				};
+				const exec = childProcess.execFileSync;
+				// Preserve every overloaded call unchanged; count only during this drain.
+				Reflect.set(
+					childProcess,
+					"execFileSync",
+					(...args: Parameters<typeof exec>) => {
+						counts[3]++;
+						return exec(...args);
+					},
+				);
+				syncBuiltinESMExports();
+				try {
+					drain(
+						record,
+						{
+							sendMessage() {
+								sends++;
+							},
+						},
+						io,
+					);
+				} finally {
+					childProcess.execFileSync = exec;
+					syncBuiltinESMExports();
+				}
+				assert.deepEqual(counts, [
+					1,
+					["ledger-duplicate", "help", "done"].includes(kind) ? 1 : 0,
+					kind === "done" ? 1 : 0,
+					0,
+				]);
+				assert.equal(sends, kind === "help" || kind === "done" ? 1 : 0);
+				assert.equal(
+					record.taskId,
+					kind === "help" || kind === "done" ? undefined : "task",
+				);
+			}));
+	it("in-flight wakes skip lazy ledger and transcript reads", () =>
+		withTempDir((dir) => {
+			const record: PiRunRecord = {
+				id: "inflight",
+				name: "inflight",
+				task: "first",
+				surface: "pane",
+				startTime: 0,
+				sessionFile: join(dir, "session.jsonl"),
+				launchScriptFile: "",
+				activityFile: "",
+				interactive: false,
+				runtimePlan: undefined,
+				lifecycle: createLifecycle(0),
+				persistent: true,
+				logicalId: "logical",
+				generationId: "generation",
+				policyHash: "a".repeat(64),
+				tasksCompleted: 0,
+				taskId: "task",
+			};
+			appendPersistentTaskEvent(record.sessionFile, {
+				type: "task-done",
+				task: "task",
+				generation: "generation",
+			});
+			const counts = [0, 0, 0];
+			const io = {
+				...testIO,
+				readEvents: (r: PiRunRecord) => {
+					counts[0]++;
+					return testIO.readEvents(r);
+				},
+				readLedger: (r: PiRunRecord) => {
+					counts[1]++;
+					return testIO.readLedger(r);
+				},
+				readTaskSummary: (r: PiRunRecord) => {
+					counts[2]++;
+					return testIO.readTaskSummary(r);
+				},
+			};
+			drain(
+				record,
+				{
+					sendMessage() {
+						counts.fill(0);
+						hostModule.__test__.drainPersistentTaskEvents(
+							record,
+							{
+								sendMessage() {
+									assert.fail("duplicate in-flight send");
+								},
+							},
+							io,
+						);
+						assert.deepEqual(counts, [1, 0, 0]);
+					},
+				},
+				testIO,
+			);
+		}));
+	for (const fail of ["send", "append"] as const)
+		it(`multi-event ${fail} failure preserves earlier acknowledgements and retries only the failing event`, () =>
+			withTempDir((dir) => {
+				const record: PiRunRecord = {
+					id: "multi",
+					name: "multi",
+					task: "first",
+					surface: "pane",
+					startTime: 0,
+					sessionFile: join(dir, "session.jsonl"),
+					launchScriptFile: "",
+					activityFile: "",
+					interactive: false,
+					runtimePlan: undefined,
+					lifecycle: createLifecycle(0),
+					persistent: true,
+					logicalId: "logical",
+					generationId: "generation",
+					policyHash: "a".repeat(64),
+					tasksCompleted: 0,
+					taskId: "second",
+				};
+				appendPersistentTaskEvent(record.sessionFile, {
+					type: "task-done",
+					task: "first",
+					generation: "generation",
+				});
+				appendPersistentTaskEvent(record.sessionFile, {
+					type: "task-done",
+					task: "second",
+					generation: "generation",
+				});
+				let allow = false,
+					sends = 0,
+					reads = 0;
+				const io: PiPersistentIO = {
+					...testIO,
+					readLedger: (r) => {
+						reads++;
+						return testIO.readLedger(r);
+					},
+					acknowledge(r, event) {
+						if (event.task === "second" && !allow && fail === "append")
+							throw new Error("append failure");
+						return testIO.acknowledge(r, event);
+					},
+				};
+				const api = {
+					sendMessage() {
+						sends++;
+						if (sends === 2 && !allow && fail === "send")
+							throw new Error("send failure");
+					},
+				};
+				assert.throws(
+					() => drain(record, api, io),
+					new RegExp(`${fail} failure`),
+				);
+				assert.equal(record.observedTaskEvents, undefined);
+				assert.equal(record.taskId, "second");
+				assert.equal(record.tasksCompleted, 1);
+				assert.equal(testIO.readLedger(record).length, 1);
+				allow = true;
+				drain(record, api, io);
+				assert.equal(reads, 2);
+				assert.equal(sends, 3);
+				assert.equal(record.observedTaskEvents, 2);
+				assert.equal(record.taskId, undefined);
+				assert.equal(record.tasksCompleted, 2);
+				assert.equal(testIO.readLedger(record).length, 2);
+			}));
 });
 
 describe("persistent delivery batch ledger", () => {

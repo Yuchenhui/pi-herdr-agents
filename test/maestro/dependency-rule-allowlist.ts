@@ -55,22 +55,50 @@ export const ALLOWLIST: readonly DependencyRuleAllowlistEntry[] = [
 		importer: "maestro/adapters/pi/pi-harness-adapter.ts",
 		specifier: "../../../pi-extension/subagents/type-guards.ts",
 		reason:
-			"The Pi adapter reuses legacy session-header validation until type guards move into core.",
+			"The Pi adapter reuses legacy session-header validation until the pure guard leaf moves into core.",
+		removalTask: "Task 14",
+	},
+	{
+		importer: "maestro/runtime/pi-run-session.ts",
+		specifier: "../../pi-extension/subagents/lifecycle.ts",
+		reason:
+			"Pi composition hydrates lifecycle and gates delivery until the pure lifecycle move.",
+		removalTask: "Task 14",
+	},
+	{
+		importer: "maestro/runtime/pi-run-session.ts",
+		specifier: "../../pi-extension/subagents/wake.ts",
+		reason:
+			"Production composition supplies the coordinator's single explicit wake registry until supervision moves.",
+		removalTask: "Task 14",
+	},
+	{
+		importer: "maestro/runtime/pi-run-session.ts",
+		specifier: "../../pi-extension/subagents/supervision.ts",
+		reason:
+			"Production composition constructs the single legacy coordinator until supervision moves.",
+		removalTask: "Task 14",
+	},
+	{
+		importer: "maestro/runtime/pi-run-session.ts",
+		specifier: "../../pi-extension/subagents/activity.ts",
+		reason:
+			"Pi composition consumes cheap activity-file hydration until the activity split.",
+		removalTask: "Task 15",
+	},
+	{
+		importer: "maestro/runtime/pi-run-session.ts",
+		specifier: "../../pi-extension/subagents/runtime-routing.ts",
+		reason:
+			"Pi composition consumes full validated plans and the plain registry port until routing moves.",
+		removalTask: "Task 15",
+	},
+	{
+		importer: "maestro/runtime/pi-run-session.ts",
+		specifier: "../../pi-extension/subagents/pane-config.ts",
+		reason:
+			"Pi composition consumes durable pane configuration until config moves.",
 		removalTask: "Task 17",
-	},
-	{
-		importer: "pi-extension/subagents/index.ts",
-		specifier: "../../maestro/surfaces/herdr/herdr-surface-provider.ts",
-		reason:
-			"Runtime composition constructs the production Herdr surface provider until provider construction moves out of the Pi host.",
-		removalTask: "Task 13",
-	},
-	{
-		importer: "pi-extension/subagents/index.ts",
-		specifier: "../../maestro/adapters/pi/pi-harness-adapter.ts",
-		reason:
-			"The host constructs launch-snapshot adapters until Task 13 runtime composition owns adapter creation and handle/owner pairing.",
-		removalTask: "Task 13",
 	},
 	{
 		importer: "pi-extension/subagents/index.ts",
@@ -78,13 +106,6 @@ export const ALLOWLIST: readonly DependencyRuleAllowlistEntry[] = [
 		reason:
 			"The Pi host still owns the task-model init command until model config routing moves behind the core config boundary.",
 		removalTask: "Task 17",
-	},
-	{
-		importer: "pi-extension/subagents/index.ts",
-		specifier: "../../maestro/adapters/pi/session.ts",
-		reason:
-			"The Pi host still reads and writes session policy, persistent ledgers, and parent delivery evidence until those consumers move behind runtime/session seams.",
-		removalTask: "Task 13",
 	},
 	{
 		importer: "pi-extension/subagents/index.ts",
@@ -146,29 +167,29 @@ export const ALLOWLIST: readonly DependencyRuleAllowlistEntry[] = [
 		importer: "maestro/adapters/pi/launch.ts",
 		specifier: "../../../pi-extension/subagents/type-guards.ts",
 		reason:
-			"Moved Pi launch adapter temporarily reuses legacy type guards until config and type guards move behind the core boundary.",
-		removalTask: "Task 17",
+			"Moved Pi launch adapter temporarily reuses legacy type guards until the pure guard leaf moves into core.",
+		removalTask: "Task 14",
 	},
 	{
 		importer: "maestro/adapters/pi/launch.ts",
 		specifier: "../../surfaces/herdr/herdr-surface-provider.ts",
 		reason:
-			"Launch keeps provider-backed default operations for compatibility until runtime composition owns the production provider.",
-		removalTask: "Task 13",
+			"Launch keeps provider-backed compatibility defaults for the staged worktree handoff; watched runs use explicit factory operations.",
+		removalTask: "Task 16",
 	},
 	{
 		importer: "maestro/adapters/pi/completion.ts",
 		specifier: "../../../pi-extension/subagents/type-guards.ts",
 		reason:
-			"Moved Pi completion adapter temporarily reuses legacy type guards until config and type guards move behind the core boundary.",
-		removalTask: "Task 17",
+			"Moved Pi completion adapter temporarily reuses legacy type guards until the pure guard leaf moves into core.",
+		removalTask: "Task 14",
 	},
 	{
 		importer: "maestro/adapters/pi/session.ts",
 		specifier: "../../../pi-extension/subagents/type-guards.ts",
 		reason:
-			"Moved Pi session adapter temporarily reuses legacy type guards until config and type guards move behind the core boundary.",
-		removalTask: "Task 17",
+			"Moved Pi session adapter temporarily reuses legacy type guards until the pure guard leaf moves into core.",
+		removalTask: "Task 14",
 	},
 	{
 		importer: "maestro/adapters/pi/task-model-init.ts",
@@ -188,15 +209,15 @@ export const ALLOWLIST: readonly DependencyRuleAllowlistEntry[] = [
 		importer: "maestro/adapters/pi/child/subagent-done.ts",
 		specifier: "../../../../pi-extension/subagents/type-guards.ts",
 		reason:
-			"Moved child extension temporarily reuses legacy type guards until config and type guards move behind the core boundary.",
-		removalTask: "Task 17",
+			"Moved child extension temporarily reuses legacy type guards until the pure guard leaf moves into core.",
+		removalTask: "Task 14",
 	},
 	{
 		importer: "maestro/surfaces/herdr/herdr.ts",
 		specifier: "../../../pi-extension/subagents/type-guards.ts",
 		reason:
-			"Moved Herdr driver temporarily reuses legacy type guards until config and type guards move behind the core boundary.",
-		removalTask: "Task 17",
+			"Moved Herdr driver temporarily reuses legacy type guards until the pure guard leaf moves into core.",
+		removalTask: "Task 14",
 	},
 	{
 		importer: "maestro/surfaces/herdr/herdr-surface-provider.ts",
