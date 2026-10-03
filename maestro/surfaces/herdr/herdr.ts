@@ -2,7 +2,12 @@ import { execFile, execSync, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { realpathSync } from "node:fs";
 import { resolve, relative, isAbsolute, sep } from "node:path";
-import { isFiniteNumber, isPlainObject, isString } from "./type-guards.ts";
+import {
+	isFiniteNumber,
+	isPlainObject,
+	isString,
+} from "../../../pi-extension/subagents/type-guards.ts";
+import { WorktreeProvisioningError } from "../../core/surface-provider.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -106,7 +111,22 @@ function extractHerdrWorktree(output: string): HerdrWorktreeSurface {
 	};
 }
 
+type HerdrExecForTest = (
+	args: string[],
+	timeout?: number,
+	mode?: "sync" | "async",
+) => string | Promise<string>;
+
+let herdrExecForTest: HerdrExecForTest | undefined;
+
 function herdrExec(args: string[], timeout?: number): string {
+	if (herdrExecForTest) {
+		const result = herdrExecForTest(args, timeout, "sync");
+		if (!isString(result)) {
+			throw new Error("Synchronous Herdr test exec returned a Promise");
+		}
+		return result;
+	}
 	return execFileSync("herdr", args, {
 		stdio: "pipe",
 		encoding: "utf8",
@@ -119,6 +139,7 @@ async function herdrExecAsync(
 	args: string[],
 	timeout?: number,
 ): Promise<string> {
+	if (herdrExecForTest) return await herdrExecForTest(args, timeout, "async");
 	const { stdout } = await execFileAsync("herdr", args, {
 		encoding: "utf8",
 		timeout,
@@ -388,12 +409,7 @@ export interface HerdrWorktreeInfo {
 	isLinkedWorktree: boolean;
 }
 
-export class HerdrWorktreeCreateError extends Error {
-	readonly recoveredWorktree: Pick<
-		HerdrWorktreeInfo,
-		"path" | "branch" | "workspaceId"
-	>;
-
+export class HerdrWorktreeCreateError extends WorktreeProvisioningError {
 	constructor(
 		message: string,
 		recoveredWorktree: Pick<
@@ -401,9 +417,8 @@ export class HerdrWorktreeCreateError extends Error {
 			"path" | "branch" | "workspaceId"
 		>,
 	) {
-		super(message);
+		super(message, recoveredWorktree);
 		this.name = "HerdrWorktreeCreateError";
-		this.recoveredWorktree = recoveredWorktree;
 	}
 }
 
@@ -594,7 +609,10 @@ export async function readHerdrScreenAsync(
 	]);
 }
 
-export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
+export type {
+	PaneInspection,
+	SurfaceAgentStatus as HerdrAgentStatus,
+} from "../../core/types.ts";
 
 type PaneInspectionResult =
 	| {
@@ -671,6 +689,9 @@ function parsePaneGetError(error: any): PaneInspectionResult {
 export interface HerdrPaneListEntry {
 	paneId: string;
 	workspaceId: string;
+	tabId?: string;
+	name?: string;
+	cwd?: string;
 }
 
 /** Parse only complete snapshots; partial lists never establish pane absence. */
@@ -693,7 +714,17 @@ export function parseHerdrPaneSnapshot(
 		)
 			return null;
 		ids.add(pane.pane_id);
-		result.push({ paneId: pane.pane_id, workspaceId: pane.workspace_id });
+		const entry: HerdrPaneListEntry = {
+			paneId: pane.pane_id,
+			workspaceId: pane.workspace_id,
+		};
+		if (isString(pane.tab_id)) entry.tabId = pane.tab_id;
+		if (isString(pane.cwd)) entry.cwd = pane.cwd;
+		if (isString(pane.label)) entry.name = pane.label;
+		else if (isString(pane.terminal_title_stripped)) {
+			entry.name = pane.terminal_title_stripped;
+		}
+		result.push(entry);
 	}
 	return result;
 }
@@ -801,7 +832,7 @@ export function getHerdrPaneProcessInfo(
 	);
 }
 
-async function getHerdrPaneProcessInfoAsync(
+export async function getHerdrPaneProcessInfoAsync(
 	surface: string,
 ): Promise<HerdrPaneProcessInfo> {
 	return parsePaneProcessInfo(
@@ -955,8 +986,12 @@ export function sendHerdrCommand(surface: string, command: string): void {
 	herdrExec(["pane", "run", surface, command]);
 }
 
+export function sendHerdrKeys(surface: string, keys: string): void {
+	herdrExec(["pane", "send-keys", surface, keys]);
+}
+
 export function sendHerdrEscape(surface: string): void {
-	herdrExec(["pane", "send-keys", surface, "Escape"]);
+	sendHerdrKeys(surface, "Escape");
 }
 
 export function closeHerdrSurface(surface: string): void {
@@ -984,6 +1019,21 @@ export function focusHerdrWorkspace(workspaceId: string): void {
 	herdrExec(["workspace", "focus", workspaceId]);
 }
 
+async function withMockHerdrExec<T>(
+	mock: HerdrExecForTest,
+	run: () => Promise<T> | T,
+): Promise<T> {
+	const previous = herdrExecForTest;
+	herdrExecForTest = mock;
+	agentsTabs.clear();
+	try {
+		return await run();
+	} finally {
+		herdrExecForTest = previous;
+		agentsTabs.clear();
+	}
+}
+
 export const __herdrTest__ = {
 	buildCurrentPaneArgs,
 	buildTabCreateArgs,
@@ -1002,4 +1052,5 @@ export const __herdrTest__ = {
 	parsePaneProcessInfo,
 	isHerdrShellReady,
 	isExpectedPiProcess,
+	withMockHerdrExec,
 };

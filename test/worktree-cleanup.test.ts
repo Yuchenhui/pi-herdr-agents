@@ -18,7 +18,7 @@ import {
 	readWorktreeManifest,
 	writeWorktreeManifest,
 } from "../pi-extension/subagents/launch.ts";
-import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+import { __herdrTest__ } from "../maestro/surfaces/herdr/herdr.ts";
 import {
 	cleanupBlockers,
 	createWorktreeCleanupOperations,

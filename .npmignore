@@ -1,5 +1,7 @@
 .pi/
 openspec/
+docs/superpowers/
+.superpowers/
 test/
 docs/assets/
 .github/

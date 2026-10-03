@@ -12,9 +12,15 @@ import { fileURLToPath } from "node:url";
 import { getSubagentActivityFile } from "./activity.ts";
 import { createLifecycle, type SubagentLifecycle } from "./lifecycle.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
-import { createSubagentPaneFactory, loadPaneConfig } from "./pane-config.ts";
-import { HerdrWorktreeCreateError } from "./herdr.ts";
+import { loadPaneConfig, type PaneConfig } from "./pane-config.ts";
 import { isNonEmptyString, isRecord, type JsonObject } from "./type-guards.ts";
+import { shellQuote } from "../../maestro/core/shell.ts";
+import type {
+	SurfaceProvider,
+	WorktreeSurface,
+} from "../../maestro/core/surface-provider.ts";
+import { WorktreeProvisioningError } from "../../maestro/core/surface-provider.ts";
+import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
 import {
 	createWorktreeSessionFork,
 	getNewEntries,
@@ -22,19 +28,6 @@ import {
 	seedSubagentSessionFile,
 	writeSubagentSessionPolicy,
 } from "./session.ts";
-import {
-	closePane,
-	createSubagentPane,
-	createGroupedSubagentPane,
-	createSubagentWorktree,
-	splitCurrentPane,
-	runScriptInPane,
-	shellQuote,
-	waitForPiReady,
-	waitForShellReady,
-	focusWorkspace,
-	type HerdrWorktreeSurface,
-} from "./terminal.ts";
 
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -161,45 +154,151 @@ export interface PiRunningChild {
 	crashNotified?: boolean;
 }
 
+type MaybePromise<T> = T | Promise<T>;
+
+interface WorktreeSurfaceForLaunch {
+	path: string;
+	branch: string;
+	workspaceId: string;
+	paneId: string;
+}
+
 export interface PiLaunchOperations {
-	createPane(name: string, cwd?: string): string;
+	createPane(name: string, cwd?: string): MaybePromise<string>;
 	createWorktree(
 		name: string,
 		cwd: string,
 		branch: string,
 		base: string,
-	): HerdrWorktreeSurface;
+	): MaybePromise<WorktreeSurfaceForLaunch>;
 	waitForShellReady(surface: string): Promise<void>;
 	runScript(
 		surface: string,
 		command: string,
 		options: { scriptPath: string; scriptPreamble: string },
-	): string;
-	closePane(pane: string): void;
+	): MaybePromise<string>;
+	closePane(pane: string): MaybePromise<void>;
 	waitForPiReady?(
 		surface: string,
 		sessionFile: string,
 		cwd: string,
 	): Promise<void>;
-	focusWorkspace?(workspaceId: string): void;
+	focusWorkspace?(workspaceId: string): MaybePromise<void>;
+}
+
+function placementFromPaneConfig(config: PaneConfig) {
+	if (config.mode === "split") {
+		return { kind: "split" as const, direction: config.direction };
+	}
+	if (config.mode === "tab") return { kind: "tab" as const };
+	return { kind: "grouped" as const };
+}
+
+function worktreeSurfaceForLaunch(
+	worktree: WorktreeSurface,
+): WorktreeSurfaceForLaunch {
+	return {
+		path: worktree.path,
+		branch: worktree.branch,
+		workspaceId: worktree.workspaceId,
+		paneId: worktree.surfaceId,
+	};
+}
+
+function isExpectedPiProcess(
+	process: {
+		name?: string;
+		argv0?: string;
+		argv?: string[];
+		cwd?: string;
+	},
+	sessionFile: string,
+	cwd: string,
+): boolean {
+	const sessionIndex = process.argv?.indexOf("--session") ?? -1;
+	return (
+		(process.name === "pi" || process.argv0?.split("/").pop() === "pi") &&
+		sessionIndex >= 0 &&
+		process.argv?.[sessionIndex + 1] === sessionFile &&
+		process.cwd === cwd
+	);
+}
+
+async function waitForSurfacePiReady(
+	provider: SurfaceProvider,
+	surface: string,
+	sessionFile: string,
+	cwd: string,
+	options: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<void> {
+	const timeoutMs = options.timeoutMs ?? 10_000;
+	const intervalMs = options.intervalMs ?? 50;
+	const deadline = Date.now() + timeoutMs;
+	let lastError = "expected Pi process not observed";
+
+	while (Date.now() <= deadline) {
+		try {
+			const info = await Promise.resolve(provider.getProcessInfo(surface));
+			if (
+				info.foregroundProcesses.some((process) =>
+					isExpectedPiProcess(process, sessionFile, cwd),
+				)
+			) {
+				return;
+			}
+		} catch (error) {
+			lastError = error instanceof Error ? error.message : String(error);
+		}
+		if (Date.now() >= deadline) break;
+		await new Promise((resolve) => setTimeout(resolve, intervalMs));
+	}
+	throw new Error(
+		`Timed out waiting for Pi session ${sessionFile} in Herdr pane ${surface}: ${lastError}`,
+	);
+}
+
+export function launchOperationsFromSurface(
+	provider: SurfaceProvider,
+	config: PaneConfig,
+): PiLaunchOperations {
+	return {
+		createPane(name, cwd) {
+			return provider.createSurface({
+				name,
+				cwd: cwd ?? process.cwd(),
+				placement: placementFromPaneConfig(config),
+			});
+		},
+		async createWorktree(name, cwd, branch, base) {
+			const worktree = await Promise.resolve(
+				provider.createWorktreeSurface({ name, cwd, branch, base }),
+			);
+			return worktreeSurfaceForLaunch(worktree);
+		},
+		waitForShellReady(surface) {
+			return provider.waitForShellReady(surface);
+		},
+		runScript(surface, command, options) {
+			return provider.runScript(surface, command, options);
+		},
+		closePane(pane) {
+			return provider.closeSurface(pane);
+		},
+		waitForPiReady(surface, sessionFile, cwd) {
+			return waitForSurfacePiReady(provider, surface, sessionFile, cwd);
+		},
+		focusWorkspace(workspaceId) {
+			return provider.focusWorkspace(workspaceId);
+		},
+	};
 }
 
 const paneConfig = loadPaneConfig();
 
-const defaultOperations: PiLaunchOperations = {
-	createPane: createSubagentPaneFactory(
-		paneConfig,
-		createSubagentPane,
-		splitCurrentPane,
-		createGroupedSubagentPane,
-	),
-	createWorktree: createSubagentWorktree,
-	waitForShellReady,
-	runScript: runScriptInPane,
-	closePane,
-	waitForPiReady,
-	focusWorkspace,
-};
+const defaultOperations: PiLaunchOperations = launchOperationsFromSurface(
+	new HerdrSurfaceProvider({ paneConfig }),
+	paneConfig,
+);
 
 interface ResolvedLaunch {
 	request: FreshPiLaunchRequest;
@@ -256,7 +355,7 @@ export async function launchPiWorktreeHandoff(
 		throw new Error("Worktree handoff did not create a managed worktree");
 	}
 	try {
-		operations.focusWorkspace?.(running.worktree.workspaceId);
+		await operations.focusWorkspace?.(running.worktree.workspaceId);
 	} catch (error) {
 		const focusError = errorMessage(error);
 		writeWorktreeManifest(running.worktree.manifestFile, {
@@ -279,7 +378,7 @@ async function launchFreshPiSubagent(
 	let surface: PreparedSurface | undefined;
 
 	try {
-		surface = prepareLaunchSurface(resolved, operations);
+		surface = await prepareLaunchSurface(resolved, operations);
 		const session = prepareChildSession(resolved, surface);
 		const handoffArtifacts = request.handoff
 			? prepareTaskArtifacts(resolved, session)
@@ -288,7 +387,7 @@ async function launchFreshPiSubagent(
 		const artifacts =
 			handoffArtifacts ?? prepareTaskArtifacts(resolved, session);
 		const command = buildPiCommand(resolved, artifacts);
-		const launchScriptFile = startPiProcess(
+		const launchScriptFile = await startPiProcess(
 			resolved,
 			artifacts,
 			command,
@@ -313,7 +412,7 @@ async function launchFreshPiSubagent(
 		if (!surface.worktree) {
 			if (!request.surface) {
 				try {
-					operations.closePane(surface.surface);
+					await operations.closePane(surface.surface);
 				} catch {
 					// The launch error remains authoritative when cleanup also fails.
 				}
@@ -371,16 +470,16 @@ function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
 	};
 }
 
-function prepareLaunchSurface(
+async function prepareLaunchSurface(
 	resolved: ResolvedLaunch,
 	operations: PiLaunchOperations,
-): PreparedSurface {
+): Promise<PreparedSurface> {
 	const { request } = resolved;
 	if (!request.worktree) {
 		return {
 			surface:
 				request.surface ??
-				operations.createPane(request.name, resolved.sourceCwd),
+				(await operations.createPane(request.name, resolved.sourceCwd)),
 			targetCwd: resolved.sourceCwd,
 			effectiveAgentDir: resolved.localAgentDir ?? resolved.agentDir,
 			localAgentDir: resolved.localAgentDir,
@@ -411,9 +510,9 @@ function prepareLaunchSurface(
 		...ownership,
 	});
 
-	let created: HerdrWorktreeSurface;
+	let created: WorktreeSurfaceForLaunch;
 	try {
-		created = operations.createWorktree(
+		created = await operations.createWorktree(
 			request.name,
 			provisionCwd,
 			request.worktree.branch,
@@ -424,7 +523,7 @@ function prepareLaunchSurface(
 			state: "failed",
 			...ownership,
 		};
-		if (error instanceof HerdrWorktreeCreateError) {
+		if (error instanceof WorktreeProvisioningError) {
 			Object.assign(failedManifest, error.recoveredWorktree);
 		}
 		failedManifest.error = errorMessage(error);
@@ -686,12 +785,12 @@ function buildPiCommand(
 		: `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
 }
 
-function startPiProcess(
+async function startPiProcess(
 	resolved: ResolvedLaunch,
 	artifacts: PreparedArtifacts,
 	command: string,
 	operations: PiLaunchOperations,
-): string {
+): Promise<string> {
 	const launchScriptFile = join(
 		resolved.artifactDir,
 		"subagent-scripts",
@@ -700,7 +799,7 @@ function startPiProcess(
 	if (artifacts.worktree && !resolved.request.handoff) {
 		persistWorktreeResult(artifacts.worktree, "running");
 	}
-	return operations.runScript(artifacts.surface, command, {
+	return await operations.runScript(artifacts.surface, command, {
 		scriptPath: launchScriptFile,
 		scriptPreamble: [
 			shellComment(`Subagent launch script for ${resolved.request.name}`),
@@ -762,7 +861,7 @@ async function launchResumedPiSubagent(
 		(entry) => entry.type === "session",
 	);
 	const cwd = isNonEmptyString(header?.cwd) ? header.cwd : process.cwd();
-	const surface = operations.createPane(request.name, cwd);
+	const surface = await operations.createPane(request.name, cwd);
 	try {
 		await operations.waitForShellReady(surface);
 		const activityFile = getSubagentActivityFile(artifactDir, id);
@@ -806,7 +905,7 @@ async function launchResumedPiSubagent(
 			shellQuote(join(SUBAGENTS_DIR, "subagent-done.ts")),
 			...(messageFile ? [shellQuote(`@${messageFile}`)] : []),
 		].join(" ");
-		const launchScriptFile = operations.runScript(
+		const launchScriptFile = await operations.runScript(
 			surface,
 			`${command}; echo '__SUBAGENT_DONE_'$?'__'`,
 			{
@@ -841,7 +940,7 @@ async function launchResumedPiSubagent(
 		};
 	} catch (error) {
 		try {
-			operations.closePane(surface);
+			await operations.closePane(surface);
 		} catch {
 			// The launch error remains authoritative when cleanup also fails.
 		}
@@ -1090,12 +1189,23 @@ export function persistWorktreeResult(
 	});
 }
 
+type RunSubagentScriptOptions = {
+	scriptPath?: string;
+	scriptPreamble?: string;
+};
+
+type RunSubagentScriptRunner = (
+	surface: string,
+	command: string,
+	options?: RunSubagentScriptOptions,
+) => string;
+
 export function runSubagentScript(
 	surface: string,
 	command: string,
-	options: Parameters<typeof runScriptInPane>[2],
-	worktree?: WorktreeLaunch,
-	run: typeof runScriptInPane = runScriptInPane,
+	options: RunSubagentScriptOptions | undefined,
+	worktree: WorktreeLaunch | undefined,
+	run: RunSubagentScriptRunner,
 ): string {
 	if (worktree) persistWorktreeResult(worktree, "running");
 	try {

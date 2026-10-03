@@ -117,7 +117,13 @@ Extensions:
 export interface Task {
   // ...maestro fields unchanged...
   // pi-herdr-agents extension
-  runtime?: { model: string; thinking: ThinkingLevel };
+  runtime?: {
+    model: string;
+    thinking: ThinkingLevel;
+    /** Ordered candidates tried after a launch failure or a running child's
+     *  provider error; today's launchSubagentWithFallbacks (index.ts:2631). */
+    fallbacks?: { model: string; thinking: ThinkingLevel }[];
+  };
   session?: { mode: "standalone" | "lineage-only" | "fork"; parentSessionId?: string };
   behavior?: {
     persistent?: boolean;
@@ -163,6 +169,8 @@ export type RunOutcome = "completed" | "failed" | "timeout" | "killed" | "help";
 // pi-herdr-agents extension
 export interface CompletionEvidence {
   reason: "done" | "ping" | "sentinel" | "error";
+  /** Required harness exit status from CompletionResult. */
+  exitCode: number;
   ping?: { name: string; message: string };
   errorMessage?: string;
   finalMessage?: { text: string; stopReason?: string; errorMessage?: string };
@@ -184,10 +192,11 @@ the activity state types from `activity.ts:17-68` move into core as plain
 types. For the Pi adapter, `AgentHandle.sessionId` holds the session file
 path; no field is added to `AgentHandle`.
 
-`Worktree.owner` stays `"maestro"` in the declaration. Manifests this
-package writes keep their current `owner` value until stage 5, when the
-manifest writer moves into core and the value becomes `"maestro"` with a
-read-side alias for the old value so existing manifests stay recoverable.
+`Worktree.owner` stays as copied from maestro in the in-memory declaration.
+It is not the on-disk manifest owner. Manifests this package writes keep the
+stable persisted `owner` value `"pi-herdr-subagents"` throughout this
+behavior-preserving migration; no ownership-format migration is part of these
+stages.
 
 ### 4.2 `HarnessAdapter` (`maestro/core/harness-adapter.ts`)
 
@@ -200,6 +209,9 @@ Extensions:
 ```ts
 export interface SpawnOptions {
   // ...maestro fields unchanged...
+  // pi-herdr-agents extension
+  /** Unprovisioned request; launch writes the ownership manifest before acquisition. */
+  worktreeRequest?: WorktreeSpec;
   // pi-herdr-agents extension: carried from Task, see 4.1
   runtime?: Task["runtime"];
   session?: Task["session"];
@@ -241,12 +253,12 @@ export interface HarnessAdapter {
 | `spawn` | `launchPiSubagent()` with a `FreshPiLaunchRequest` (`launch.ts:80`) |
 | `resume` | `launchPiSubagent()` with a `ResumePiLaunchRequest` (`launch.ts:117`) |
 | `getState` | lifecycle projection of the activity file and surface inspection |
-| `interrupt` | `interruptPane` through the handle's surface |
+| `interrupt` | sends `Escape` through the handle's surface, preserving `interruptPane` |
 | `kill` | close the surface, then wait for process exit |
 | `sendInput` | persistent task inbox (`session.ts:500`) |
 | `readOutput` | `readScreen` on the handle's surface |
-| `exitCode` | last `CompletionEvidence` for the handle |
-| `awaitCompletion` | `waitForCompletion()` (`completion.ts:130`) plus `inspectFinalAssistantMessage()` and `captureWorktreeHandoff()` |
+| `exitCode` | last recorded `CompletionEvidence.exitCode` for the handle |
+| `awaitCompletion` | `waitForCompletion()` (`completion.ts:130`) plus `inspectFinalAssistantMessage()` and `captureWorktreeHandoff()`; returned evidence includes the required exit code |
 
 Adapter-private state (session file, sidecar paths, activity file, policy
 file, persistent generation) is a `Map<string, PiAgentState>` keyed by
@@ -272,7 +284,7 @@ Extensions:
 export type SurfacePlacement =
   | { kind: "grouped" }                       // extension-owned Agents tab, capped, overflow tab
   | { kind: "split"; direction: "right" | "down" }
-  | { kind: "workspace" };                    // dedicated workspace, maestro's default
+  | { kind: "tab" };                          // legacy tab creation in the caller workspace
 
 export interface CreateSurfaceOptions {
   name: string;
@@ -281,21 +293,53 @@ export interface CreateSurfaceOptions {
   placement?: SurfacePlacement;
 }
 
+export interface SurfaceForegroundProcess {
+  pid: number;
+  name?: string;
+  argv0?: string;
+  argv?: string[];
+  cwd?: string;
+}
+
 export interface SurfaceProcessInfo {
   shellPid?: number;
-  foreground?: { pid: number; command: string }[];
+  foregroundProcessGroupId?: number;
+  pids: number[];
+  foregroundProcesses: SurfaceForegroundProcess[];
+}
+
+export interface SurfaceInfo {
+  id: string;
+  name?: string;
+  cwd?: string;
+  // pi-herdr-agents extension: tab or window the surface belongs to
+  group?: string;
+  // pi-herdr-agents extension: provider-native workspace/container id when reported
+  workspaceId?: string;
+}
+
+export interface WorktreeSurfaceInfo {
+  /** Empty for detached HEAD. */
+  branch: string;
+  path: string;
+  label?: string;
+  workspaceId?: string;
+  isLinkedWorktree: boolean;
 }
 
 export interface SurfaceProvider {
   // ...maestro members unchanged...
   // pi-herdr-agents extension
+  /** Human-readable hint when isAvailable() is false; today's terminalSetupHint(). */
+  setupHint(): string;
+  /** Write a script file and run it in the surface; today's runScriptInPane (terminal.ts:115). */
+  runScript(surfaceId: string, command: string, options: { scriptPath: string; scriptPreamble: string }): string;
   inspectSurface(surfaceId: string): Promise<PaneInspection>;
   sendKeys(surfaceId: string, keys: string): void | Promise<void>;
   getProcessInfo(surfaceId: string): SurfaceProcessInfo;
   waitForShellReady(surfaceId: string, opts?: { timeoutMs?: number }): Promise<void>;
-  waitForAgentReady(surfaceId: string, opts?: { timeoutMs?: number }): Promise<void>;
   waitForSurfaceAbsence(surfaceId: string, opts?: { timeoutMs?: number }): Promise<void>;
-  listWorktreeSurfaces(): Promise<WorktreeSurface[]>;
+  listWorktreeSurfaces(opts?: { cwd?: string; timeoutMs?: number }): Promise<WorktreeSurfaceInfo[]>;
   focusWorkspace(workspaceId: string): void;
   setTitle(target: "tab" | "workspace", title: string): void;
 }
@@ -305,10 +349,16 @@ export interface SurfaceProvider {
 wraps `herdr.ts` and `terminal.ts`. Grouped placement keeps the ID-based
 Agents tab ownership, pane cap, and overflow-tab behavior from `herdr.ts:296`.
 `attachSurface(id)` returns a `SurfaceHandle` whose `sendKeys` and `close`
-are present.
+are present. Readiness for a Pi launch remains a Pi-adapter concern: the
+adapter polls `getProcessInfo()` and matches the expected `--session` value
+and cwd, preserving `waitForHerdrPiReady`'s identity check instead of accepting
+an arbitrary process on the surface.
 
 `FakeSurfaceProvider` (`maestro/surfaces/fake/fake-surface-provider.ts`)
-records commands and screens in memory and lets tests script inspections.
+records commands, screens, process info, and worktree-surface metadata in
+memory and lets tests script inspections. It does not run Git or create real
+checkouts; filesystem assertions belong to the real-provider integration
+fixture.
 
 ### 4.4 `RunSession` (`maestro/runtime/run-session.ts`)
 
@@ -333,7 +383,7 @@ export interface RunSessionOptions {
   wake: FileWakeRegistry;
   supervision: SupervisionCoordinator;
   /** Decide whether a finished agent's surface stays open. */
-  retainSurface?: (result: RunResult) => boolean;
+  retainSurface?: (result: RunResult, task: Task) => boolean;
 }
 
 export interface RunSession {
@@ -345,17 +395,31 @@ export interface RunSession {
 }
 ```
 
-`supervise()` registers the handle with the wake registry and supervision
-coordinator, awaits `adapter.awaitCompletion()`, maps evidence to
-`RunOutcome` (`done` with exit code 0 to `completed`, `ping` to `help`,
-`error` or nonzero exit to `failed`, abort to `killed`), applies
-`retainSurface` (default: retain for `help`, for worktree runs, and for
-persistent specialists; close otherwise, which is today's
-`shouldRetainSubagentSurface` at `index.ts:1036`), transitions the worktree
-state, and fires `onSettled`. Maestro's `Supervisor` poll loop and
-`timeoutMs` handling are not ported; `Task.timeoutMs` is accepted and
-ignored by this runtime, which matches today's behavior of no per-task
-timeout.
+`spawn()` tries `task.runtime` and then each entry of `task.runtime.fallbacks`
+in order when `adapter.spawn` throws, as `launchSubagentWithFallbacks` does
+today; persistent specialists and worktree runs use the first candidate
+only. `RunSession` does not acquire panes or worktrees before `adapter.spawn`.
+`Task.worktree` becomes `SpawnOptions.worktreeRequest`; the upstream
+`SpawnOptions.worktree?: Worktree` stays unchanged for provisioned handles.
+The Pi adapter's launch transaction remains responsible for surface and
+worktree manifest creation, resource acquisition, and failure cleanup in the
+existing order. `supervise()`
+registers the handle with the wake registry and supervision coordinator,
+awaits `adapter.awaitCompletion()`, and re-spawns with the next fallback when
+the existing fallback predicate is true: nonpersistent, completion result has
+an `errorMessage`, and another plan remains. Worktree runs cannot currently
+reach multiple running-child fallback candidates because launch validation
+prevents that shape. Evidence maps to `RunOutcome` (`done` or `sentinel` with
+exit code 0 to `completed`, `ping` to `help`, `error` or nonzero exit to
+`failed`, abort to `killed`), applies `retainSurface` (default: retain only
+for worktree runs, matching today's `shouldRetainSubagentSurface` at
+`index.ts:1036`), transitions worktree state through existing manifest
+helpers, and fires `onSettled`. Persistent inbox events, help requests, turn
+cancellation, and process exit remain distinct events; hooks carry the
+existing observations rather than inferring specialist completion solely from
+`getState()`. Maestro's `Supervisor` poll loop and `timeoutMs` handling are
+not ported; `Task.timeoutMs` is accepted and ignored by this runtime, which
+matches today's behavior of no per-task timeout.
 
 ## 5. Where existing modules go
 
@@ -367,7 +431,7 @@ timeout.
 | `runtime-routing.ts` | `ModelRegistryAdapter`, `resolveRuntimePlan(s)`, catalog helpers to `maestro/core/routing.ts`; `wrapPiModelRegistry` and `@earendil-works/pi-ai` imports to `maestro/adapters/pi/model-registry.ts` | 5 |
 | `activity.ts` | state types and `readSubagentActivityFile` projection to `maestro/core/activity.ts`; file paths, writer, and recorder to `maestro/adapters/pi/activity-file.ts` | 5 |
 | `lifecycle.ts`, `status.ts`, `wake.ts`, `supervision.ts` | `maestro/core/` | 5 |
-| `worktree-cleanup.ts` | `maestro/core/worktree-cleanup.ts`; its `WorktreeCleanupOperations` are built in `maestro/runtime/` from the surface provider | 5 |
+| `worktree-cleanup.ts` | eligibility and manifest-state rules to `maestro/core/worktree-cleanup.ts`; Git/process/Herdr operations stay behind injected runtime operations built in `maestro/runtime/` from the surface provider | 5 |
 | `index.ts:414-890` role discovery, role packs, agent definition parsing | `maestro/core/roles/` producing `Role` values; `pi.events.emit` for role-pack discovery stays in `index.ts` via a callback | 5 |
 | `role-config.ts`, `model-config.ts`, `persistent-config.ts`, `pane-config.ts`, `supervision-config.ts`, `type-guards.ts` | `maestro/core/config/`; loaders take the config directory as a parameter | 5 |
 | `config-path.ts` | stays; resolves `$PI_CODING_AGENT_DIR` and passes it in | 5 |
@@ -409,7 +473,9 @@ session, `ctx.modelRegistry` handed to the adapter, and `pi.sendMessage` and
 - A throw from `adapter.spawn` is reported by the tool handler exactly as
   today's launch failure path, including runtime-plan fallback retries,
   which stay in `index.ts` until stage 4 and move into `RunSession.spawn`
-  there with the same candidate order.
+  there with the same candidate order. The adapter preserves the single
+  launch transaction, including manifest-before-resource creation for
+  worktrees.
 - `awaitCompletion` rejecting with abort maps to `killed`; any other
   rejection maps to `failed` with `error` set to the message. Unknown Git
   state in `WorktreeHandoff` stays unknown; nothing guesses clean.
@@ -444,13 +510,14 @@ Location `test/maestro/`.
 ## 9. Stages and acceptance
 
 Each stage ends with `npm test`, `npm run lint`, `npm run format:check`,
-`npm pack --dry-run`, `git diff --check`, LSP diagnostics clean on changed
-TypeScript, and `npm run test:integration` green from inside Herdr, then
-one commit. Every stage is mergeable on its own.
+`npm pack --dry-run`, `git diff --check`, LSP diagnostics on changed
+TypeScript, and `npm run test:integration` green from inside Herdr when that
+suite is authorized. Commits are per task only when explicitly authorized;
+every stage is mergeable on its own.
 
 1. **Declarations.** `maestro/core/` types and interfaces, both fakes, both
-   conformance suites running against the fakes, `run-session.test.ts`
-   skeleton, dependency-rule test, package scripts updated. Nothing wired.
+   conformance suites running against the fakes, dependency-rule test,
+   package scripts updated. Nothing wired.
    Acceptance: fakes pass conformance; `npm pack --dry-run` lists `maestro/`;
    dependency-rule test passes with an empty allowlist.
 2. **Herdr surface.** `git mv` the Herdr driver, add `HerdrSurfaceProvider`,
@@ -493,7 +560,10 @@ one commit. Every stage is mergeable on its own.
 When `maestro/` moves to the maestro repository, `core` becomes
 `@ephemeralabs/maestro-core`, `adapters/pi` and `surfaces/herdr` join
 `maestro-adapters` and `maestro-surfaces`, and `runtime` becomes
-`maestro-runtime`. The interface files are identical by construction except
+`maestro-runtime`. `maestro/runtime/index.ts` also exports
+`createDefaultRunSession()` so the composition root never imports an adapter
+or surface directly. Runtime does not use shallow re-exports solely to hide
+forbidden dependencies. The interface files are identical by construction except
 for the marked extensions, which are upstreamed first. This package then
 lists those packages as `dependencies` (they are not Pi host-provided
 modules, so Pi's warning does not apply), keeps `pi-extension/subagents/`
@@ -506,6 +576,7 @@ and `agents/`, and `index.ts` does not change.
 - Objects at seams, functions inside: see section 1.
 - Layout: top-level `maestro/` directory, single package.
 - Default placement for `createSurface`: grouped, preserving current
-  behavior; maestro's dedicated-workspace default is reachable through
-  `placement: { kind: "workspace" }`.
+  behavior; legacy tab creation is reachable through
+  `placement: { kind: "tab" }`. Dedicated workspaces remain part of
+  worktree creation, not ordinary surface placement.
 - `timeoutMs`: accepted on `Task` for shape compatibility, not enforced.

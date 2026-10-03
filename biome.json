@@ -3,6 +3,7 @@
     "includes": [
       "pi-extension/**",
       "test/**",
+      "maestro/**",
       "skills/orchestrate/adversarial-review-example.js",
       "!**/*.md"
     ]

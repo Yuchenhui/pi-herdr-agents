@@ -39,7 +39,8 @@ import {
 	closePane,
 	interruptPane,
 	shellQuote,
-} from "../../pi-extension/subagents/terminal.ts";
+	waitForShellReady,
+} from "../../maestro/surfaces/herdr/terminal.ts";
 
 type MuxBackend = "herdr";
 
@@ -384,20 +385,7 @@ export async function waitForPaneReady(
 	surface: string,
 	timeout: number = PI_TIMEOUT,
 ): Promise<void> {
-	const marker = `__PI_INTEG_READY_${uniqueId()}__`;
-	const startedAt = Date.now();
-	while (Date.now() - startedAt < timeout) {
-		try {
-			runInPane(surface, `printf '${marker}\\n'`);
-			if ((await readPaneAsync(surface, 50)).includes(marker)) return;
-		} catch {
-			// Retry while the new shell initializes.
-		}
-		await sleep(200);
-	}
-	throw new Error(
-		`Timeout (${timeout}ms) waiting for shell in pane ${surface}`,
-	);
+	await waitForShellReady(surface, { timeoutMs: timeout, intervalMs: 50 });
 }
 
 /**

@@ -23,20 +23,9 @@ import {
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 
-import {
-	isTerminalAvailable,
-	terminalSetupHint,
-	createSubagentPane,
-	runScriptInPane,
-	closePane,
-	interruptPane,
-	shellQuote,
-	readPaneAsync,
-	inspectPane,
-	listPanes,
-	waitForShellReady,
-} from "./terminal.ts";
-import { listHerdrWorktrees } from "./herdr.ts";
+import { shellQuote } from "../../maestro/core/shell.ts";
+import type { SurfaceProvider } from "../../maestro/core/surface-provider.ts";
+import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
 	SupervisionCoordinator,
@@ -78,6 +67,7 @@ import {
 	loadPersistentConfig,
 	type PersistentConfig,
 } from "./persistent-config.ts";
+import { loadPaneConfig } from "./pane-config.ts";
 import {
 	appendPersistentDeliveryLedger,
 	findLastAssistantMessage,
@@ -133,12 +123,14 @@ import {
 } from "./worktree-cleanup.ts";
 import {
 	captureWorktreeHandoff,
+	launchOperationsFromSurface,
 	launchPiSubagent,
 	launchPiWorktreeHandoff,
 	persistWorktreeResult,
 	runSubagentScript,
 	writeWorktreeManifest,
 	buildSubagentToolAllowlist,
+	type PiLaunchOperations,
 	type WorktreeHandoff,
 	type WorktreeLaunch,
 } from "./launch.ts";
@@ -1016,7 +1008,7 @@ function muxUnavailableResult() {
 		content: [
 			{
 				type: "text" as const,
-				text: `Subagents require herdr. ${terminalSetupHint()}`,
+				text: `Subagents require herdr. ${surfaceProvider.setupHint()}`,
 			},
 		],
 		details: { error: "herdr not available" },
@@ -1097,7 +1089,9 @@ function finalizeSubagentWorktree(
 function closeCompletedPanes(panes: Iterable<string>): void {
 	for (const pane of panes) {
 		try {
-			closePane(pane);
+			void Promise.resolve(surfaceProvider.closeSurface(pane)).catch(() => {
+				/* Result delivery remains authoritative. */
+			});
 		} catch {
 			/* Result delivery remains authoritative. */
 		}
@@ -1435,25 +1429,42 @@ interface RunningSubagent {
 	supervisionRegistration?: SupervisionRegistration;
 }
 
+const paneConfig = loadPaneConfig();
+
 interface SubagentRuntime {
 	runningSubagents: Map<string, RunningSubagent>;
+	surfaceProvider: SurfaceProvider;
+	launchOperations: PiLaunchOperations;
 	supervision?: SupervisionCoordinator;
 	pi?: ExtensionAPI;
 	latestCtx?: ExtensionContext;
 	modelCatalog?: string;
 }
 
+function createSurfaceRuntime(
+	provider: SurfaceProvider = new HerdrSurfaceProvider({ paneConfig }),
+): Pick<SubagentRuntime, "surfaceProvider" | "launchOperations"> {
+	return {
+		surfaceProvider: provider,
+		launchOperations: launchOperationsFromSurface(provider, paneConfig),
+	};
+}
+
 function createSubagentRuntime(): SubagentRuntime {
 	return {
 		runningSubagents: new Map<string, RunningSubagent>(),
+		...createSurfaceRuntime(),
 	};
 }
 
 /** Runtime state preserved across /reload. */
 const runtime: SubagentRuntime =
 	readGlobalSlot<SubagentRuntime>(RUNTIME_KEY) ?? createSubagentRuntime();
+Object.assign(runtime, createSurfaceRuntime());
 writeGlobalSlot(RUNTIME_KEY, runtime);
 const runningSubagents = runtime.runningSubagents;
+const surfaceProvider = runtime.surfaceProvider;
+const launchOperations = runtime.launchOperations;
 
 export function shouldPreserveSubagentsOnShutdown(
 	reason: SessionShutdownEvent["reason"] | undefined,
@@ -2223,12 +2234,13 @@ function handleSubagentSend(params: {
 	};
 }
 
-function requestSubagentInterrupt(
+async function requestSubagentInterrupt(
 	running: RunningSubagent,
-	interruptPaneKey: (surface: string) => void = interruptPane,
-): { ok: true } | { error: string } {
+	interruptPaneKey: (surface: string) => void | Promise<void> = (surface) =>
+		surfaceProvider.sendKeys(surface, "Escape"),
+): Promise<{ ok: true } | { error: string }> {
 	try {
-		interruptPaneKey(running.surface);
+		await interruptPaneKey(running.surface);
 		return { ok: true };
 	} catch (error: any) {
 		return {
@@ -2246,10 +2258,11 @@ interface SubagentInterruptDetails {
 	status?: "interrupt_requested";
 }
 
-function handleSubagentInterrupt(
+async function handleSubagentInterrupt(
 	params: { id?: string; name?: string },
-	interruptPaneKey: (surface: string) => void = interruptPane,
-): AgentToolResult<SubagentInterruptDetails> {
+	interruptPaneKey: (surface: string) => void | Promise<void> = (surface) =>
+		surfaceProvider.sendKeys(surface, "Escape"),
+): Promise<AgentToolResult<SubagentInterruptDetails>> {
 	const resolved = resolveInterruptTarget(params);
 	if ("error" in resolved) {
 		return {
@@ -2262,7 +2275,10 @@ function handleSubagentInterrupt(
 	const now = Date.now();
 	observeRunningSubagent(running, now);
 
-	const interruption = requestSubagentInterrupt(running, interruptPaneKey);
+	const interruption = await requestSubagentInterrupt(
+		running,
+		interruptPaneKey,
+	);
 	if ("error" in interruption) {
 		return {
 			content: [{ type: "text" as const, text: interruption.error }],
@@ -2439,6 +2455,7 @@ export const __test__ = {
 	captureWorktreeHandoff,
 	runSubagentScript,
 	writeWorktreeManifest,
+	launchOperations,
 	runningSubagents,
 	formatElapsed,
 };
@@ -2521,41 +2538,44 @@ async function launchSubagent(
 	const parentSessionFile = ctx.sessionManager.getSessionFile();
 	if (!parentSessionFile) throw new Error("No session file");
 
-	const running = await launchPiSubagent({
-		kind: "fresh",
-		id: logicalId,
-		name: params.name,
-		task: params.task,
-		agent: params.agent,
-		cwd: params.cwd,
-		worktree: params.worktree,
-		fork: params.fork,
-		surface: options?.surface,
-		parent: {
-			cwd: ctx.cwd,
-			invocationCwd: process.cwd(),
-			sessionFile: parentSessionFile,
-			sessionId: ctx.sessionManager.getSessionId(),
-			sessionDir: ctx.sessionManager.getSessionDir(),
-			agentDir: getAgentConfigDir(),
+	const running = await launchPiSubagent(
+		{
+			kind: "fresh",
+			id: logicalId,
+			name: params.name,
+			task: params.task,
+			agent: params.agent,
+			cwd: params.cwd,
+			worktree: params.worktree,
+			fork: params.fork,
+			surface: options?.surface,
+			parent: {
+				cwd: ctx.cwd,
+				invocationCwd: process.cwd(),
+				sessionFile: parentSessionFile,
+				sessionId: ctx.sessionManager.getSessionId(),
+				sessionDir: ctx.sessionManager.getSessionDir(),
+				agentDir: getAgentConfigDir(),
+			},
+			runtimePlan,
+			behavior: {
+				tools: effectiveTools,
+				skills: effectiveSkills,
+				deniedTools: [...resolveDenyTools(agentDefs)],
+				autoExit: effectiveAutoExit,
+				interactive: effectiveInteractive,
+				persistent,
+				logicalId,
+				generationId,
+				taskId,
+				identity: agentDefs?.body ?? params.systemPrompt,
+				systemPromptMode: agentDefs?.systemPromptMode,
+				sessionMode: resolveEffectiveSessionMode(params, agentDefs),
+				cwd: agentDefs?.cwd,
+			},
 		},
-		runtimePlan,
-		behavior: {
-			tools: effectiveTools,
-			skills: effectiveSkills,
-			deniedTools: [...resolveDenyTools(agentDefs)],
-			autoExit: effectiveAutoExit,
-			interactive: effectiveInteractive,
-			persistent,
-			logicalId,
-			generationId,
-			taskId,
-			identity: agentDefs?.body ?? params.systemPrompt,
-			systemPromptMode: agentDefs?.systemPromptMode,
-			sessionMode: resolveEffectiveSessionMode(params, agentDefs),
-			cwd: agentDefs?.cwd,
-		},
-	});
+		launchOperations,
+	);
 	if (persistent) {
 		const policy = readSubagentSessionPolicy(running.sessionFile);
 		if (policy.version !== 2)
@@ -2805,11 +2825,20 @@ function getSupervisionCoordinator(): SupervisionCoordinator {
 	if (runtime.supervision) return runtime.supervision;
 	runtime.supervision = new SupervisionCoordinator(
 		async () => {
-			const panes = await listPanes();
-			if (!panes) return { complete: false, panes: [] };
-			return { complete: true, panes };
+			try {
+				const surfaces = await surfaceProvider.listSurfaces();
+				return {
+					complete: true,
+					panes: surfaces.map((surface) => ({
+						paneId: surface.id,
+						workspaceId: surface.workspaceId ?? "",
+					})),
+				};
+			} catch {
+				return { complete: false, panes: [] };
+			}
 		},
-		inspectPane,
+		(surface) => surfaceProvider.inspectSurface(surface),
 		supervisionConfig.forcePolling,
 	);
 	return runtime.supervision;
@@ -2840,7 +2869,7 @@ async function watchSubagent(
 			intervalMs: 1000,
 			sessionFile,
 			waitForNextCheck: supervision.wait,
-			readTerminalTail: () => readPaneAsync(surface, 5),
+			readTerminalTail: async () => surfaceProvider.readScreen(surface, 5),
 			inspectPane: supervision.inspectPane,
 			onLocalEvidence: () => drainPersistentEventsSafely(running),
 			onPaneInspection: (inspection: PaneInspection, observedAt: number) => {
@@ -3105,18 +3134,20 @@ export default function subagentsExtension(
 
 		let paneMissing = false;
 		try {
-			paneMissing = (await inspectPane(child.surface)).kind === "missing";
+			paneMissing =
+				(await surfaceProvider.inspectSurface(child.surface)).kind ===
+				"missing";
 		} catch {
 			// Best effort: try closing the pane directly when inspection is unavailable.
 		}
 
 		if (!paneMissing) {
 			try {
-				interruptPane(child.surface);
+				await surfaceProvider.sendKeys(child.surface, "Escape");
 			} catch {
 				// Escape is best effort; pane close is authoritative for this MVP.
 			}
-			closePane(child.surface);
+			await surfaceProvider.closeSurface(child.surface);
 		}
 
 		btwChild = undefined;
@@ -3381,7 +3412,7 @@ export default function subagentsExtension(
 				}
 
 				// Validate prerequisites
-				if (!isTerminalAvailable()) {
+				if (!surfaceProvider.isAvailable()) {
 					return muxUnavailableResult();
 				}
 
@@ -3994,7 +4025,7 @@ export default function subagentsExtension(
 				const name = params.name ?? "Resume";
 				const id = Math.random().toString(16).slice(2, 10);
 
-				if (!isTerminalAvailable()) {
+				if (!surfaceProvider.isAvailable()) {
 					return muxUnavailableResult();
 				}
 
@@ -4013,18 +4044,21 @@ export default function subagentsExtension(
 				// Record entry count before resuming so we can extract new messages
 				const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-				const running: RunningSubagent = await launchPiSubagent({
-					kind: "resume",
-					id,
-					name,
-					sessionFile: params.sessionPath,
-					message: params.message,
-					parent: {
-						sessionId: ctx.sessionManager.getSessionId(),
-						sessionDir: ctx.sessionManager.getSessionDir(),
+				const running: RunningSubagent = await launchPiSubagent(
+					{
+						kind: "resume",
+						id,
+						name,
+						sessionFile: params.sessionPath,
+						message: params.message,
+						parent: {
+							sessionId: ctx.sessionManager.getSessionId(),
+							sessionDir: ctx.sessionManager.getSessionDir(),
+						},
+						behavior: { autoExit: params.autoExit },
 					},
-					behavior: { autoExit: params.autoExit },
-				});
+					launchOperations,
+				);
 				runningSubagents.set(id, running);
 				startWidgetRefresh();
 				startStatusRefresh(pi);
@@ -4161,8 +4195,8 @@ export default function subagentsExtension(
 				ctx.ui.notify("Usage: /btw <question>", "warning");
 				return;
 			}
-			if (!isTerminalAvailable()) {
-				ctx.ui.notify(terminalSetupHint(), "error");
+			if (!surfaceProvider.isAvailable()) {
+				ctx.ui.notify(surfaceProvider.setupHint(), "error");
 				return;
 			}
 
@@ -4181,8 +4215,12 @@ export default function subagentsExtension(
 				if (!ctx.model) throw new Error("No parent model is selected");
 
 				sessionFile = createBtwSessionSnapshot(parentSessionFile, leafId);
-				surface = createSubagentPane("BTW");
-				await waitForShellReady(surface);
+				surface = await surfaceProvider.createSurface({
+					name: "BTW",
+					cwd: process.cwd(),
+					placement: { kind: "tab" },
+				});
+				await surfaceProvider.waitForShellReady(surface);
 
 				const artifactDir = getArtifactDir(
 					ctx.sessionManager.getSessionDir(),
@@ -4201,7 +4239,7 @@ export default function subagentsExtension(
 					thinking: pi.getThinkingLevel(),
 					agentDir: process.env.PI_CODING_AGENT_DIR,
 				});
-				runScriptInPane(surface, command, {
+				await surfaceProvider.runScript(surface, command, {
 					scriptPath: launchScriptFile,
 					scriptPreamble: [
 						"# BTW side-question session",
@@ -4214,7 +4252,7 @@ export default function subagentsExtension(
 			} catch (error) {
 				if (surface) {
 					try {
-						closePane(surface);
+						await surfaceProvider.closeSurface(surface);
 					} catch {
 						// Leave the pane for manual recovery if launch cleanup fails.
 					}
@@ -4261,8 +4299,8 @@ export default function subagentsExtension(
 			const trimmed = args.trim();
 			const parts = trimmed.split(/\s+/).filter(Boolean);
 			if (trimmed === "list") {
-				if (!isTerminalAvailable()) {
-					ctx.ui.notify(terminalSetupHint(), "error");
+				if (!surfaceProvider.isAvailable()) {
+					ctx.ui.notify(surfaceProvider.setupHint(), "error");
 					return;
 				}
 				try {
@@ -4271,7 +4309,7 @@ export default function subagentsExtension(
 							? formatWorktreeInventory(
 									await listContainedWorktrees(cleanupInput(ctx)),
 								)
-							: listHerdrWorktrees(ctx.cwd)
+							: (await surfaceProvider.listWorktreeSurfaces({ cwd: ctx.cwd }))
 									.map(
 										(worktree) =>
 											`${worktree.branch || "(detached HEAD)"} — ${worktree.path}${worktree.workspaceId ? ` (${worktree.workspaceId})` : ""}`,
@@ -4328,8 +4366,8 @@ export default function subagentsExtension(
 				);
 				return;
 			}
-			if (!isTerminalAvailable()) {
-				ctx.ui.notify(terminalSetupHint(), "error");
+			if (!surfaceProvider.isAvailable()) {
+				ctx.ui.notify(surfaceProvider.setupHint(), "error");
 				return;
 			}
 
@@ -4359,29 +4397,32 @@ export default function subagentsExtension(
 					},
 					wrapPiModelRegistry(ctx.modelRegistry),
 				);
-				const result = await launchPiWorktreeHandoff({
-					kind: "fresh",
-					name: `wt: ${branch}`,
-					task,
-					cwd: ctx.cwd,
-					worktree: { branch },
-					handoff: { leafId },
-					parent: {
+				const result = await launchPiWorktreeHandoff(
+					{
+						kind: "fresh",
+						name: `wt: ${branch}`,
+						task,
 						cwd: ctx.cwd,
-						invocationCwd: process.cwd(),
-						sessionFile,
-						sessionId: ctx.sessionManager.getSessionId(),
-						sessionDir: ctx.sessionManager.getSessionDir(),
-						agentDir: getAgentConfigDir(),
+						worktree: { branch },
+						handoff: { leafId },
+						parent: {
+							cwd: ctx.cwd,
+							invocationCwd: process.cwd(),
+							sessionFile,
+							sessionId: ctx.sessionManager.getSessionId(),
+							sessionDir: ctx.sessionManager.getSessionDir(),
+							agentDir: getAgentConfigDir(),
+						},
+						runtimePlan,
+						behavior: {
+							deniedTools: [],
+							autoExit: false,
+							interactive: true,
+							sessionMode: "standalone",
+						},
 					},
-					runtimePlan,
-					behavior: {
-						deniedTools: [],
-						autoExit: false,
-						interactive: true,
-						sessionMode: "standalone",
-					},
-				});
+					launchOperations,
+				);
 				const worktree = result.running.worktree;
 				if (!worktree) {
 					throw new Error("Worktree handoff did not return worktree metadata");

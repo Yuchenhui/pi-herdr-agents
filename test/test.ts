@@ -73,7 +73,7 @@ import {
 	isHerdrAvailable,
 	waitForProcessesExit,
 	__herdrTest__,
-} from "../pi-extension/subagents/herdr.ts";
+} from "../maestro/surfaces/herdr/herdr.ts";
 import {
 	loadModelConfig,
 	parseModelConfig,
@@ -247,11 +247,14 @@ function restoreEnvVar(name: string, value: string | undefined) {
 	process.env[name] = value;
 }
 
-function withMockedNow<T>(now: number, fn: () => T): T {
+async function withMockedNowAsync<T>(
+	now: number,
+	fn: () => Promise<T>,
+): Promise<T> {
 	const originalNow = Date.now;
 	Date.now = () => now;
 	try {
-		return fn();
+		return await fn();
 	} finally {
 		Date.now = originalNow;
 	}
@@ -2013,6 +2016,168 @@ describe("shared subagent configuration path", () => {
 				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
 			}
 		});
+	});
+});
+
+describe("runtime reload configuration", () => {
+	const runtimeKey = Symbol.for("pi-subagents/runtime");
+	type ReloadRuntime = {
+		runningSubagents?: Map<string, object>;
+		surfaceProvider?: object;
+		launchOperations?: {
+			createPane?: (name: string, cwd?: string) => string | Promise<string>;
+		};
+	};
+	type RuntimeSlot = typeof globalThis &
+		Record<symbol, ReloadRuntime | undefined>;
+
+	async function importReloadedSubagents() {
+		return import(
+			`../pi-extension/subagents/index.ts?reload-test-${Date.now()}-${Math.random()}`
+		);
+	}
+
+	it("refreshes pane-backed launch operations from the reloaded module config while preserving running children", async () => {
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		// SAFETY: pi-herdr-agents owns this process-local runtime symbol.
+		const runtimeSlot = globalThis as RuntimeSlot;
+		const beforeRuntime = runtimeSlot[runtimeKey];
+		const beforeSurfaceProvider = beforeRuntime?.surfaceProvider;
+		const beforeHadSurfaceProvider =
+			beforeRuntime !== undefined && "surfaceProvider" in beforeRuntime;
+		const beforeLaunchOperations = beforeRuntime?.launchOperations;
+		const beforeHadLaunchOperations =
+			beforeRuntime !== undefined && "launchOperations" in beforeRuntime;
+		const existingRunning = subagentsModule.__test__.runningSubagents;
+		existingRunning.set("reload-live", {
+			id: "reload-live",
+			name: "Reload live",
+			task: "still running",
+			surface: "pane-live",
+			startTime: 0,
+			sessionFile: "live.jsonl",
+			interactive: false,
+			runtimePlan: undefined,
+			lifecycle: createLifecycle(0),
+		});
+		const dir = createTestDir();
+		try {
+			process.env.PI_CODING_AGENT_DIR = dir;
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					status: { enabled: true },
+					models: { agents: {} },
+					roles: { bundled: true },
+					persistent: { maxAgents: 3 },
+					supervision: { forcePolling: false, hangWarningMinutes: 15 },
+					panes: { mode: "tab" },
+				}),
+			);
+			const reloaded = await importReloadedSubagents();
+			assert.equal(reloaded.__test__.runningSubagents, existingRunning);
+			assert.equal(reloaded.__test__.runningSubagents.has("reload-live"), true);
+
+			const calls: string[][] = [];
+			await __herdrTest__.withMockHerdrExec(
+				(args) => {
+					calls.push(args);
+					if (args[0] === "pane" && args[1] === "current") {
+						return JSON.stringify({
+							result: {
+								pane: {
+									pane_id: "parent-pane",
+									tab_id: "parent-tab",
+									workspace_id: "workspace-1",
+								},
+							},
+						});
+					}
+					if (args[0] === "tab" && args[1] === "create") {
+						return JSON.stringify({
+							result: {
+								tab: { tab_id: "tab-new" },
+								root_pane: { pane_id: "pane-new" },
+							},
+						});
+					}
+					return JSON.stringify({ result: { ok: true } });
+				},
+				async () => {
+					assert.equal(
+						await reloaded.__test__.launchOperations.createPane(
+							"reload-config",
+							"/repo",
+						),
+						"pane-new",
+					);
+				},
+			);
+			assert.deepEqual(
+				calls.find((args) => args[0] === "tab" && args[1] === "create"),
+				[
+					"tab",
+					"create",
+					"--workspace",
+					"workspace-1",
+					"--label",
+					"reload-config",
+					"--cwd",
+					"/repo",
+					"--no-focus",
+				],
+			);
+			assert.equal(
+				calls.some((args) => args[0] === "workspace" && args[1] === "list"),
+				false,
+			);
+		} finally {
+			existingRunning.delete("reload-live");
+			if (beforeRuntime) {
+				if (beforeHadSurfaceProvider) {
+					beforeRuntime.surfaceProvider = beforeSurfaceProvider;
+				} else {
+					delete beforeRuntime.surfaceProvider;
+				}
+				if (beforeHadLaunchOperations) {
+					beforeRuntime.launchOperations = beforeLaunchOperations;
+				} else {
+					delete beforeRuntime.launchOperations;
+				}
+			}
+			runtimeSlot[runtimeKey] = beforeRuntime;
+			try {
+				assert.equal(
+					runtimeSlot[runtimeKey]?.surfaceProvider,
+					beforeSurfaceProvider,
+				);
+				assert.equal(
+					runtimeSlot[runtimeKey]?.launchOperations,
+					beforeLaunchOperations,
+				);
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+				rmSync(dir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("upgrades a pre-refresh runtime slot that lacks provider fields", async () => {
+		// SAFETY: pi-herdr-agents owns this process-local runtime symbol.
+		const runtimeSlot = globalThis as RuntimeSlot;
+		const beforeRuntime = runtimeSlot[runtimeKey];
+		const runningSubagents = new Map<string, object>();
+		runningSubagents.set("legacy-live", { id: "legacy-live" });
+		try {
+			runtimeSlot[runtimeKey] = { runningSubagents };
+			const reloaded = await importReloadedSubagents();
+			assert.equal(reloaded.__test__.runningSubagents, runningSubagents);
+			assert.ok(reloaded.__test__.launchOperations.createPane);
+		} finally {
+			runtimeSlot[runtimeKey] = beforeRuntime;
+		}
 	});
 });
 
@@ -8327,6 +8492,7 @@ describe("subagent interruption", () => {
 			startTime: 0,
 			sessionFile: "worker.jsonl",
 			interactive: false,
+			runtimePlan: undefined,
 			lifecycle: createLifecycle(0),
 			...overrides,
 		};
@@ -8387,7 +8553,7 @@ describe("subagent interruption", () => {
 		}
 	});
 
-	it("returns an explicit error when Escape delivery fails", () => {
+	it("returns an explicit error when Escape delivery fails", async () => {
 		const testApi = subagentsModule.__test__;
 		let aborted = false;
 		const running = makeRunning({
@@ -8398,7 +8564,7 @@ describe("subagent interruption", () => {
 			},
 		});
 
-		const result = testApi.requestSubagentInterrupt(running, () => {
+		const result = await testApi.requestSubagentInterrupt(running, () => {
 			throw new Error("mux write failed");
 		});
 
@@ -8407,7 +8573,7 @@ describe("subagent interruption", () => {
 		assert.equal("interruptRequested" in running, false);
 	});
 
-	it("leaves status unchanged when Escape delivery fails in the tool path", () => {
+	it("leaves status unchanged when Escape delivery fails in the tool path", async () => {
 		const testApi = subagentsModule.__test__;
 		const runningMap = testApi.runningSubagents;
 		runningMap.clear();
@@ -8439,7 +8605,7 @@ describe("subagent interruption", () => {
 		try {
 			runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-			const result = withMockedNow(20_000, () =>
+			const result = await withMockedNowAsync(20_000, () =>
 				testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
 					throw new Error("mux write failed");
 				}),
@@ -8455,7 +8621,23 @@ describe("subagent interruption", () => {
 		}
 	});
 
-	it("sends Escape without aborting or mutating running state", () => {
+	it("returns an explicit error when async Escape delivery rejects", async () => {
+		const testApi = subagentsModule.__test__;
+		const abortController = new AbortController();
+		const running = { ...makeRunning(), abortController };
+
+		const result = await testApi.requestSubagentInterrupt(running, async () => {
+			throw new Error("async mux write failed");
+		});
+
+		assert.ok("error" in result);
+		assert.match(result.error, /Failed to send Escape/);
+		assert.match(result.error, /async mux write failed/);
+		assert.equal(abortController.signal.aborted, false);
+		assert.equal("interruptRequested" in running, false);
+	});
+
+	it("sends Escape without aborting or mutating running state", async () => {
 		const testApi = subagentsModule.__test__;
 		let aborted = false;
 		let sentSurface = "";
@@ -8467,9 +8649,10 @@ describe("subagent interruption", () => {
 			},
 		});
 
-		const result = testApi.requestSubagentInterrupt(
+		const result = await testApi.requestSubagentInterrupt(
 			running,
-			(surface: string) => {
+			async (surface: string) => {
+				await Promise.resolve();
 				sentSurface = surface;
 			},
 		);
@@ -8480,13 +8663,14 @@ describe("subagent interruption", () => {
 		assert.equal("interruptRequested" in running, false);
 	});
 
-	it("refreshes the latest activity snapshot before forcing local interrupt waiting", () => {
+	it("refreshes the latest activity snapshot before forcing local interrupt waiting", async () => {
 		const testApi = subagentsModule.__test__;
 		const runningMap = testApi.runningSubagents;
 		let sentSurface = "";
 		runningMap.clear();
 
-		withTempDir((dir) => {
+		const dir = createTestDir();
+		try {
 			mkdirSync(join(dir, "subagent-activity"), { recursive: true });
 			const activityFile = getSubagentActivityFile(dir, "a1");
 			const activity = {
@@ -8507,32 +8691,31 @@ describe("subagent interruption", () => {
 			};
 			writeFileSync(activityFile, `${JSON.stringify(activity)}\n`);
 
-			try {
-				runningMap.set("a1", makeRunning({ activityFile }));
+			runningMap.set("a1", makeRunning({ activityFile }));
 
-				withMockedNow(20_000, () =>
-					testApi.handleSubagentInterrupt(
-						{ name: "Worker" },
-						(surface: string) => {
-							sentSurface = surface;
-						},
-					),
-				);
+			await withMockedNowAsync(20_000, () =>
+				testApi.handleSubagentInterrupt(
+					{ name: "Worker" },
+					(surface: string) => {
+						sentSurface = surface;
+					},
+				),
+			);
 
-				assert.equal(sentSurface, "pane-1");
-				const lifecycle = runningMap.get("a1").lifecycle;
-				const projection = projectLifecycle(lifecycle, 20_000);
-				assert.equal(projection.kind, "interrupted");
-				assert.equal(lifecycle.turn.kind, "interrupted");
-				assert.equal(lifecycle.lastActivitySequence, 7);
-				assert.equal(lifecycle.turn.previousActivitySequence, 7);
-			} finally {
-				runningMap.clear();
-			}
-		});
+			assert.equal(sentSurface, "pane-1");
+			const lifecycle = runningMap.get("a1").lifecycle;
+			const projection = projectLifecycle(lifecycle, 20_000);
+			assert.equal(projection.kind, "interrupted");
+			assert.equal(lifecycle.turn.kind, "interrupted");
+			assert.equal(lifecycle.lastActivitySequence, 7);
+			assert.equal(lifecycle.turn.previousActivitySequence, 7);
+		} finally {
+			runningMap.clear();
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
-	it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
+	it("acknowledges Pi-backed interrupt requests and forces local status waiting", async () => {
 		const testApi = subagentsModule.__test__;
 		const runningMap = testApi.runningSubagents;
 		let sentSurface = "";
@@ -8565,7 +8748,7 @@ describe("subagent interruption", () => {
 		try {
 			runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-			const result = withMockedNow(20_000, () =>
+			const result = await withMockedNowAsync(20_000, () =>
 				testApi.handleSubagentInterrupt(
 					{ name: "Worker" },
 					(surface: string) => {
@@ -8595,7 +8778,7 @@ describe("subagent interruption", () => {
 		}
 	});
 
-	it("sends Escape again for repeated interrupt requests", () => {
+	it("sends Escape again for repeated interrupt requests", async () => {
 		const testApi = subagentsModule.__test__;
 		const runningMap = testApi.runningSubagents;
 		const surfaces: string[] = [];
@@ -8604,12 +8787,18 @@ describe("subagent interruption", () => {
 		try {
 			runningMap.set("a1", makeRunning());
 
-			testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-				surfaces.push(surface);
-			});
-			testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-				surfaces.push(surface);
-			});
+			await testApi.handleSubagentInterrupt(
+				{ name: "Worker" },
+				(surface: string) => {
+					surfaces.push(surface);
+				},
+			);
+			await testApi.handleSubagentInterrupt(
+				{ name: "Worker" },
+				(surface: string) => {
+					surfaces.push(surface);
+				},
+			);
 
 			assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
 			assert.equal(runningMap.has("a1"), true);
@@ -9633,7 +9822,7 @@ describe("herdr.ts", () => {
 				{ mode: 0o755 },
 			);
 			const moduleUrl = new URL(
-				"../pi-extension/subagents/herdr.ts",
+				"../maestro/surfaces/herdr/herdr.ts",
 				import.meta.url,
 			).href;
 			const result = spawnSync(

@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { shellQuote } from "../../core/shell.ts";
 import {
 	closeHerdrSurface,
 	createHerdrSurface,
@@ -45,9 +46,7 @@ function assertTerminalAvailable(): void {
 		throw new Error(`herdr is not available. ${SETUP_HINT}`);
 }
 
-export function shellQuote(value: string): string {
-	return "'" + value.replace(/'/g, "'\\''") + "'";
-}
+export { shellQuote };
 
 /** Create a new herdr tab and return its root pane ID. */
 export function createSubagentPane(name: string, cwd?: string): PaneId {
@@ -149,7 +148,10 @@ export async function readPaneAsync(
 	return readHerdrScreenAsync(paneId, lines);
 }
 
-export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
+export type {
+	PaneInspection,
+	SurfaceAgentStatus as HerdrAgentStatus,
+} from "../../core/types.ts";
 
 export async function listPanes(): Promise<
 	import("./herdr.ts").HerdrPaneListEntry[] | null
@@ -160,7 +162,7 @@ export async function listPanes(): Promise<
 
 export async function inspectPane(
 	paneId: PaneId,
-): Promise<import("./lifecycle.ts").PaneInspection> {
+): Promise<import("../../core/types.ts").PaneInspection> {
 	assertTerminalAvailable();
 	const result = await inspectHerdrPane(paneId);
 	if (result.kind === "present") {

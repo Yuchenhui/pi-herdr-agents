@@ -15,7 +15,7 @@ import {
 	listHerdrWorktrees,
 	removeHerdrWorktree,
 	type HerdrWorktreeInfo,
-} from "./herdr.ts";
+} from "../../maestro/surfaces/herdr/herdr.ts";
 import { readWorktreeManifest, writeWorktreeManifest } from "./launch.ts";
 import { isString, type JsonObject } from "./type-guards.ts";
 

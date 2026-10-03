@@ -24,7 +24,7 @@ import {
 	waitForShellReady,
 	runScriptInPane,
 	shellQuote,
-} from "../../pi-extension/subagents/terminal.ts";
+} from "../../maestro/surfaces/herdr/terminal.ts";
 import {
 	createSubagentPaneFactory,
 	loadPaneConfig,
@@ -44,6 +44,7 @@ import {
 	sleep,
 	uniqueId,
 	waitForFile,
+	PI_TIMEOUT,
 	TEST_MODEL,
 	type TestEnv,
 } from "./harness.ts";
@@ -58,8 +59,13 @@ function panes(
 	).result.panes;
 }
 
+const PLACEMENT_TEST_COUNT = 14;
+const PLACEMENT_SUITE_TIMEOUT = PLACEMENT_TEST_COUNT * 30_000;
+
 for (const backend of getAvailableBackends()) {
-	describe("grouped public launch placement", { timeout: 120_000 }, () => {
+	describe("grouped public launch placement", {
+		timeout: Math.max(PI_TIMEOUT, PLACEMENT_SUITE_TIMEOUT),
+	}, () => {
 		let env: TestEnv;
 		beforeEach(() => {
 			env = createTestEnv(backend);
