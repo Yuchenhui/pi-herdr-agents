@@ -15,6 +15,7 @@ registerHarnessAdapterConformance(
 		const adapter = new FakeHarnessAdapter();
 		return {
 			adapter,
+			managedSessionResume: { kind: "detached" },
 			spawnOptions,
 			async finish(handle: AgentHandle, kind: "done" | "ping" | "error") {
 				if (kind === "done") {

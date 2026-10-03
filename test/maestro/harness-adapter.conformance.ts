@@ -17,6 +17,14 @@ interface TestRunner {
 
 export interface HarnessAdapterFixture {
 	adapter: HarnessAdapter;
+	/** Fake fixtures retain the tight default; real process fixtures choose a bounded budget. */
+	waitTimeoutMs?: number;
+	/** Raw provider errors need not contain the literal word "error". */
+	errorMessagePattern?: RegExp;
+	/** Explicit saved-session policy expectation, not an arbitrary rejection allowance. */
+	managedSessionResume?:
+		| { kind: "refused"; message: RegExp }
+		| { kind: "detached" };
 	spawnOptions(): SpawnOptions;
 	finish(handle: AgentHandle, kind: "done" | "ping" | "error"): Promise<void>;
 	/** Optional implementation-specific simulation of delayed sidecar evidence after pane absence. */
@@ -69,18 +77,21 @@ export function registerHarnessAdapterConformance(
 		);
 
 		runner.it("awaitCompletion resolves done evidence", async () => {
-			await usingFixture(factory, async ({ adapter, spawnOptions, finish }) => {
-				const handle = await adapter.spawn(spawnOptions());
-				const wait = adapter.awaitCompletion(
-					handle,
-					new AbortController().signal,
-				);
-				await finish(handle, "done");
-				const evidence = await withTimeout(wait);
+			await usingFixture(
+				factory,
+				async ({ adapter, spawnOptions, finish, waitTimeoutMs }) => {
+					const handle = await adapter.spawn(spawnOptions());
+					const wait = adapter.awaitCompletion(
+						handle,
+						new AbortController().signal,
+					);
+					await finish(handle, "done");
+					const evidence = await withTimeout(wait, waitTimeoutMs);
 
-				assert.equal(evidence.reason, "done");
-				assert.equal(evidence.exitCode, 0);
-			});
+					assert.equal(evidence.reason, "done");
+					assert.equal(evidence.exitCode, 0);
+				},
+			);
 		});
 
 		runner.it(
@@ -88,14 +99,14 @@ export function registerHarnessAdapterConformance(
 			async () => {
 				await usingFixture(
 					factory,
-					async ({ adapter, spawnOptions, finish }) => {
+					async ({ adapter, spawnOptions, finish, waitTimeoutMs }) => {
 						const handle = await adapter.spawn(spawnOptions());
 						const wait = adapter.awaitCompletion(
 							handle,
 							new AbortController().signal,
 						);
 						await finish(handle, "ping");
-						const evidence = await withTimeout(wait);
+						const evidence = await withTimeout(wait, waitTimeoutMs);
 
 						assert.equal(evidence.reason, "ping");
 						assert.equal(evidence.exitCode, 0);
@@ -111,31 +122,43 @@ export function registerHarnessAdapterConformance(
 			async () => {
 				await usingFixture(
 					factory,
-					async ({ adapter, spawnOptions, finish }) => {
+					async ({
+						adapter,
+						spawnOptions,
+						finish,
+						waitTimeoutMs,
+						errorMessagePattern,
+					}) => {
 						const handle = await adapter.spawn(spawnOptions());
 						const wait = adapter.awaitCompletion(
 							handle,
 							new AbortController().signal,
 						);
 						await finish(handle, "error");
-						const evidence = await withTimeout(wait);
+						const evidence = await withTimeout(wait, waitTimeoutMs);
 
 						assert.equal(evidence.reason, "error");
 						assert.equal(evidence.exitCode, 1);
-						assert.match(evidence.errorMessage ?? "", /error/i);
+						assert.match(
+							evidence.errorMessage ?? "",
+							errorMessagePattern ?? /error/i,
+						);
 					},
 				);
 			},
 		);
 
 		runner.it("awaitCompletion rejects when the signal aborts", async () => {
-			await usingFixture(factory, async ({ adapter, spawnOptions }) => {
-				const handle = await adapter.spawn(spawnOptions());
-				const controller = new AbortController();
-				const wait = adapter.awaitCompletion(handle, controller.signal);
-				setTimeout(() => controller.abort(), 50);
-				await assert.rejects(withTimeout(wait), /abort/i);
-			});
+			await usingFixture(
+				factory,
+				async ({ adapter, spawnOptions, waitTimeoutMs }) => {
+					const handle = await adapter.spawn(spawnOptions());
+					const controller = new AbortController();
+					const wait = adapter.awaitCompletion(handle, controller.signal);
+					setTimeout(() => controller.abort(), 50);
+					await assert.rejects(withTimeout(wait, waitTimeoutMs), /abort/i);
+				},
+			);
 		});
 
 		runner.it("interrupt leaves getState not done", async () => {
@@ -157,18 +180,26 @@ export function registerHarnessAdapterConformance(
 		runner.it(
 			"resume of a known session returns a new handle with the same sessionId",
 			async () => {
-				await usingFixture(factory, async ({ adapter, spawnOptions }) => {
-					const original = await adapter.spawn(spawnOptions());
-					const resumed = await adapter.resume({
-						name: `${original.name}-resumed`,
-						sessionId: original.sessionId,
-						message: "continue",
-					});
+				await usingFixture(
+					factory,
+					async ({ adapter, spawnOptions, finish, waitTimeoutMs }) => {
+						const original = await adapter.spawn(spawnOptions());
+						await finish(original, "done");
+						await withTimeout(
+							adapter.awaitCompletion(original, new AbortController().signal),
+							waitTimeoutMs,
+						);
+						const resumed = await adapter.resume({
+							name: `${original.name}-resumed`,
+							sessionId: original.sessionId,
+							message: "continue",
+						});
 
-					assert.notEqual(resumed.id, original.id);
-					assert.equal(resumed.sessionId, original.sessionId);
-					assert.equal(resumed.name, `${original.name}-resumed`);
-				});
+						assert.notEqual(resumed.id, original.id);
+						assert.equal(resumed.sessionId, original.sessionId);
+						assert.equal(resumed.name, `${original.name}-resumed`);
+					},
+				);
 			},
 		);
 
@@ -188,7 +219,7 @@ export function registerHarnessAdapterConformance(
 						new AbortController().signal,
 					);
 					await fixture.lateSidecar(handle);
-					const evidence = await withTimeout(wait);
+					const evidence = await withTimeout(wait, fixture.waitTimeoutMs);
 
 					assert.equal(evidence.reason, "done");
 					assert.equal(evidence.exitCode, 0);
@@ -196,25 +227,43 @@ export function registerHarnessAdapterConformance(
 			},
 		);
 
-		runner.it("resume ignores worktree ownership", async () => {
-			await usingFixture(factory, async (fixture) => {
-				const baseOptions = fixture.spawnOptions();
-				const options = fixture.worktreeSpawnOptions
-					? await fixture.worktreeSpawnOptions(baseOptions)
-					: withProvisionedWorktree(baseOptions);
-				const original = await fixture.adapter.spawn(options);
-				assert.ok(original.worktree, "original handle must own a worktree");
+		runner.it(
+			"resume honors the fixture's explicit managed-session policy",
+			async () => {
+				await usingFixture(factory, async (fixture) => {
+					const baseOptions = fixture.spawnOptions();
+					const options = fixture.worktreeSpawnOptions
+						? await fixture.worktreeSpawnOptions(baseOptions)
+						: withProvisionedWorktree(baseOptions);
+					const original = await fixture.adapter.spawn(options);
+					assert.ok(original.worktree, "original handle must own a worktree");
 
-				await fixture.finish(original, "done");
-				const resumed = await fixture.adapter.resume({
-					name: `${original.name}-resume-no-worktree`,
-					sessionId: original.sessionId,
+					await fixture.finish(original, "done");
+					await withTimeout(
+						fixture.adapter.awaitCompletion(
+							original,
+							new AbortController().signal,
+						),
+						fixture.waitTimeoutMs,
+					);
+					const request = {
+						name: `${original.name}-resume-no-worktree`,
+						sessionId: original.sessionId,
+					};
+					if (fixture.managedSessionResume?.kind === "refused") {
+						await assert.rejects(
+							fixture.adapter.resume(request),
+							fixture.managedSessionResume.message,
+						);
+						return;
+					}
+					const resumed = await fixture.adapter.resume(request);
+
+					assert.equal(resumed.sessionId, original.sessionId);
+					assert.equal(resumed.worktree, undefined);
 				});
-
-				assert.equal(resumed.sessionId, original.sessionId);
-				assert.equal(resumed.worktree, undefined);
-			});
-		});
+			},
+		);
 	});
 }
 

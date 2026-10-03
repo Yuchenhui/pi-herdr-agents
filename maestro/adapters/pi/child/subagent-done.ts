@@ -12,9 +12,9 @@ import {
 	consumePersistentTaskInbox,
 	readPersistentDeliveryLedger,
 	readPersistentTaskEvents,
-} from "./session.ts";
-import { createSubagentActivityRecorder } from "./activity.ts";
-import { isString } from "./type-guards.ts";
+} from "../session.ts";
+import { createSubagentActivityRecorder } from "../../../../pi-extension/subagents/activity.ts";
+import { isString } from "../../../../pi-extension/subagents/type-guards.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
 	return agentStarted;

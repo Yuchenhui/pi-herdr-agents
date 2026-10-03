@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { SupervisionCoordinator } from "../../pi-extension/subagents/supervision.ts";
-import { waitForCompletion } from "../../pi-extension/subagents/completion.ts";
+import { waitForCompletion } from "../../maestro/adapters/pi/completion.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "../..");

@@ -17,7 +17,7 @@ import { join } from "node:path";
 import {
 	readWorktreeManifest,
 	writeWorktreeManifest,
-} from "../pi-extension/subagents/launch.ts";
+} from "../maestro/adapters/pi/launch.ts";
 import { __herdrTest__ } from "../maestro/surfaces/herdr/herdr.ts";
 import {
 	cleanupBlockers,

@@ -1,6 +1,9 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 
-import { isNonEmptyString, isString } from "./type-guards.ts";
+import {
+	isNonEmptyString,
+	isString,
+} from "../../../pi-extension/subagents/type-guards.ts";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
 const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
@@ -15,11 +18,11 @@ export interface CompletionResult {
 export interface CompletionOptions {
 	intervalMs: number;
 	readTerminalTail: () => Promise<string>;
-	inspectPane?: () => Promise<import("./lifecycle.ts").PaneInspection>;
+	inspectPane?: () => Promise<import("../../core/types.ts").PaneInspection>;
 	/** Bounded artifact grace after explicit pane disappearance. Default: 500ms. */
 	paneDisappearanceGraceMs?: number;
 	onPaneInspection?: (
-		inspection: import("./lifecycle.ts").PaneInspection,
+		inspection: import("../../core/types.ts").PaneInspection,
 		observedAt: number,
 	) => void;
 	sessionFile?: string;
@@ -168,7 +171,7 @@ export async function waitForCompletion(
 			}
 
 		if (reconcile && options.inspectPane) {
-			let inspection: import("./lifecycle.ts").PaneInspection;
+			let inspection: import("../../core/types.ts").PaneInspection;
 			try {
 				inspection = await options.inspectPane();
 			} catch {

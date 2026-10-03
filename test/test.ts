@@ -67,7 +67,7 @@ import {
 	writePersistentTaskInbox,
 	consumePersistentTaskInbox,
 	type SessionEntry,
-} from "../pi-extension/subagents/session.ts";
+} from "../maestro/adapters/pi/session.ts";
 
 import {
 	isHerdrAvailable,
@@ -128,11 +128,11 @@ import subagentDoneExtension, {
 	buildCompletionSidecar,
 	buildPersistentTaskEvent,
 	isPersistentStopDirective,
-} from "../pi-extension/subagents/subagent-done.ts";
+} from "../maestro/adapters/pi/child/subagent-done.ts";
 import {
 	interpretExitSidecar,
 	waitForCompletion,
-} from "../pi-extension/subagents/completion.ts";
+} from "../maestro/adapters/pi/completion.ts";
 import {
 	createLifecycle,
 	lifecycleTransition,
@@ -145,11 +145,12 @@ import {
 	projectLifecycle,
 	type SubagentLifecycle,
 } from "../pi-extension/subagents/lifecycle.ts";
-import { launchPiSubagent } from "../pi-extension/subagents/launch.ts";
+import { launchPiSubagent } from "../maestro/adapters/pi/launch.ts";
 import {
 	buildAuthenticatedModelCatalog,
 	wrapPiModelRegistry,
 } from "../pi-extension/subagents/runtime-routing.ts";
+import { FakeSurfaceProvider } from "../maestro/surfaces/fake/fake-surface-provider.ts";
 
 // Tool-registration behavior is environment-sensitive for child subagents.
 // Isolate the unit suite from inherited parent/child capability variables.
@@ -355,6 +356,555 @@ const TOOL_RESULT: SessionEntry = {
 };
 
 // --- Tests ---
+
+// Keep the real host/adapter/launch/sidecar path; fake only Herdr and starting Pi.
+async function withAdapterHost(run: (f: any) => Promise<void>) {
+	await withIsolatedAgentEnv(async (paths) => {
+		// SAFETY: this process-local extension runtime is owned by index.ts.
+		const runtime = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+		const previous = {
+			pi: runtime.pi,
+			latestCtx: runtime.latestCtx,
+			supervision: runtime.supervision,
+			surfaceProvider: runtime.surfaceProvider,
+			launchOperations: runtime.launchOperations,
+		};
+		const surface = new FakeSurfaceProvider();
+		const restorers: Array<() => void> = [];
+		const commands: string[] = [];
+		const closed: string[] = [];
+		let registrations = 0;
+		const wake = new FileWakeRegistry();
+		const supervision = new SupervisionCoordinator(
+			async () => ({
+				complete: true,
+				panes: surface
+					.listSurfaces()
+					.map((s) => ({ paneId: s.id, workspaceId: "fixture" })),
+			}),
+			(id) => surface.inspectSurface(id),
+			false,
+			wake,
+		);
+		const register = supervision.register.bind(supervision);
+		supervision.register = (...args) => {
+			registrations++;
+			return register(...args);
+		};
+		runtime.supervision = supervision;
+		function patch(target: any, name: string, value: any) {
+			const original = target[name];
+			target[name] = value;
+			restorers.push(() => {
+				target[name] = original;
+			});
+		}
+		function patchTransport() {
+			patch(runtime.surfaceProvider, "isAvailable", () => true);
+			patch(runtime.surfaceProvider, "listSurfaces", () =>
+				surface.listSurfaces(),
+			);
+			patch(runtime.surfaceProvider, "inspectSurface", (id: string) =>
+				surface.inspectSurface(id),
+			);
+			patch(
+				runtime.surfaceProvider,
+				"readScreen",
+				(id: string, lines?: number) => surface.readScreen(id, lines),
+			);
+			patch(runtime.surfaceProvider, "closeSurface", async (id: string) => {
+				closed.push(id);
+				await surface.closeSurface(id);
+			});
+			patch(
+				runtime.launchOperations,
+				"createPane",
+				(name: string, cwd?: string) =>
+					surface.createSurface({
+						name,
+						cwd: cwd ?? paths.projectDir,
+						placement: { kind: "tab" },
+					}),
+			);
+			patch(runtime.launchOperations, "waitForShellReady", async () => {});
+			patch(
+				runtime.launchOperations,
+				"runScript",
+				(_id: string, command: string, opts: any) => {
+					commands.push(command);
+					return opts.scriptPath;
+				},
+			);
+		}
+		patchTransport();
+		const mock = createMockExtensionApi();
+		const apis = [mock];
+		mock.api.getThinkingLevel = () => "high";
+		subagentsModule.default(mock.api);
+		const sessionDir = join(paths.projectDir, "parent-sessions");
+		mkdirSync(sessionDir);
+		const sessionFile = createSessionFile(sessionDir, [
+			{ type: "session", version: 3, id: "parent", cwd: paths.projectDir },
+		]);
+		const ctx = {
+			cwd: paths.projectDir,
+			model: { provider: "fake", id: "parent" },
+			modelRegistry: {
+				find: (provider: string, id: string) => ({
+					provider,
+					id,
+					reasoning: id !== "plain",
+				}),
+				hasConfiguredAuth: () => true,
+			},
+			sessionManager: {
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "parent",
+				getSessionDir: () => sessionDir,
+			},
+		};
+		const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
+		async function launch(params: any, api = mock) {
+			const signal = new AbortController();
+			const result = await api.registeredTools
+				.find((t: any) => t.name === "subagent")
+				.execute("call", params, signal.signal, undefined, ctx);
+			signal.abort(); // Tool cancellation must not cancel the independent watcher.
+			return runtime.runningSubagents.get(result.details.id);
+		}
+		async function finish(
+			child: any,
+			result: {
+				type: "done" | "error" | "ping";
+				errorMessage?: string;
+				name?: string;
+				message?: string;
+			} = { type: "done" },
+		) {
+			writeFileSync(`${child.sessionFile}.exit`, JSON.stringify(result));
+			await child.adapter.awaitCompletion(
+				child.handle,
+				new AbortController().signal,
+			);
+			await turn();
+		}
+		try {
+			await run({
+				...paths,
+				runtime,
+				mock,
+				ctx,
+				surface,
+				commands,
+				closed,
+				launch,
+				finish,
+				turn,
+				patchTransport,
+				patch,
+				apis,
+				registrations: () => registrations,
+			});
+		} finally {
+			for (const child of runtime.runningSubagents.values()) {
+				child.lifecycle = { ...child.lifecycle, delivery: "suppressed" };
+				child.abortController?.abort();
+				if (child.stopTimeout) clearTimeout(child.stopTimeout);
+			}
+			await turn();
+			for (const api of apis)
+				for (const handler of api.eventHandlers.get("session_shutdown") ?? [])
+					await handler({ reason: "quit" }, { ui: { setWidget() {} } });
+			supervision.close();
+			wake.close();
+			runtime.runningSubagents.clear();
+			for (const restore of restorers.reverse()) restore();
+			Object.assign(runtime, previous);
+		}
+	});
+}
+
+describe("host adapter migration", () => {
+	it("preserves clamped runtime provenance, bare identity and omitted cwd configuration", async () =>
+		withAdapterHost(async (f) => {
+			mkdirSync(join(f.projectDir, ".pi", "agent"), { recursive: true });
+			const child = await f.launch({
+				name: "bare",
+				task: "bounded",
+				model: "fake/plain",
+				systemPrompt: "Bare identity",
+			});
+			assert.ok(
+				child.handle,
+				"host launch must retain the adapter handle for completion and reload",
+			);
+			assert.equal(child.adapter.getRunningChild(child.handle), child);
+			assert.equal(child.handle.sessionId, child.sessionFile);
+			assert.equal(child.agent, undefined);
+			assert.equal(child.interactive, false);
+			assert.deepEqual(child.runtimePlan, {
+				provider: "fake",
+				modelId: "plain",
+				model: "fake/plain",
+				thinking: "off",
+				modelSource: "request",
+				thinkingSource: "parent",
+				requestedModel: "fake/plain",
+				thinkingAdjustment: {
+					from: "high",
+					to: "off",
+					reason: "non-reasoning",
+				},
+			});
+			assert.ok(child.sessionFile.startsWith(join(f.globalDir, "sessions")));
+			assert.deepEqual(
+				readSubagentSessionPolicy(child.sessionFile).tools,
+				null,
+			);
+			assert.ok(f.commands[0].includes("PI_SUBAGENT_AUTO_EXIT=1"));
+			assert.ok(
+				!f.commands[0].includes(
+					`PI_CODING_AGENT_DIR='${join(f.projectDir, ".pi", "agent")}'`,
+				),
+			);
+			await f.finish(child);
+			assert.equal(f.registrations(), 1);
+			assert.equal(f.closed.length, 1);
+			assert.deepEqual(
+				f.mock.sentMessages.at(-1).message.details.runtimePlan,
+				child.runtimePlan,
+			);
+		}));
+	it("normalizes named identity, full spawning denial, role cwd, tools and skills before spawn", async () =>
+		withAdapterHost(async (f) => {
+			const roleCwd = join(f.globalDir, "role-folder");
+			mkdirSync(join(roleCwd, ".pi", "agent"), { recursive: true });
+			writeAgentFile(
+				f.projectAgentsDir,
+				"host-role",
+				"cwd: role-folder\nspawning: false\nskills: role-skill\ntools: read, bash\nsession-mode: lineage-only\nsystem-prompt: replace",
+				"Named identity",
+			);
+			const child = await f.launch({
+				name: "named",
+				agent: "host-role",
+				task: "bounded",
+				systemPrompt: "Ignored bare identity",
+				skills: "one, two",
+				tools: "read",
+			});
+			assert.ok(child.handle);
+			assert.equal(child.agent, "host-role");
+			assert.equal(child.interactive, true);
+			assert.equal(child.handle.cwd, roleCwd);
+			const policy = readSubagentSessionPolicy(child.sessionFile);
+			assert.deepEqual(policy.tools, ["read"]);
+			assert.ok(policy.deniedTools.includes("subagents_write_task_models"));
+			assert.ok(
+				f.commands[0].includes(
+					`PI_CODING_AGENT_DIR='${join(roleCwd, ".pi", "agent")}'`,
+				),
+			);
+			assert.match(f.commands[0], /\/skill:one.*\/skill:two/);
+			assert.ok(!f.commands[0].includes("PI_SUBAGENT_AUTO_EXIT=1"));
+			const identityPath = f.commands[0].match(
+				/--system-prompt '([^']+)'/,
+			)?.[1];
+			assert.ok(identityPath);
+			assert.equal(readFileSync(identityPath, "utf8").trim(), "Named identity");
+			assert.equal(
+				getNewEntries(child.sessionFile, 0)[0].parentSession,
+				f.ctx.sessionManager.getSessionFile(),
+			);
+			await f.finish(child);
+			mkdirSync(join(f.projectDir, ".pi", "agent"), { recursive: true });
+			const explicit = await f.launch({
+				name: "explicit",
+				task: "bounded",
+				cwd: ".",
+			});
+			assert.equal(explicit.handle.cwd, f.projectDir);
+			assert.ok(
+				f.commands[1].includes(
+					`PI_CODING_AGENT_DIR='${join(f.projectDir, ".pi", "agent")}'`,
+				),
+			);
+			await f.finish(explicit);
+		}));
+	it("shares persistent task state and the raw generation cursor with one watcher and one initial ledger row", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "specialist",
+				task: "first",
+				persistent: true,
+			});
+			assert.ok(child.handle);
+			assert.equal(child.adapter.getRunningChild(child.handle), child);
+			assert.equal(readPersistentDeliveryLedger(child.sessionFile).length, 1);
+			assert.equal(f.registrations(), 1);
+			appendPersistentTaskEvent(child.sessionFile, {
+				type: "task-done",
+				task: "stale",
+				generation: "other-generation",
+			});
+			appendPersistentTaskEvent(child.sessionFile, {
+				type: "task-done",
+				task: child.taskId,
+				generation: child.generationId,
+			});
+			let rejected!: () => void;
+			let delivered!: () => void;
+			const rejection = new Promise<void>((resolve) => {
+				rejected = resolve;
+			});
+			const delivery = new Promise<void>((resolve) => {
+				delivered = resolve;
+			});
+			const send = f.mock.api.sendMessage;
+			let attempts = 0;
+			let allowDelivery = false;
+			f.mock.api.sendMessage = (...args: any[]) => {
+				attempts++;
+				if (!allowDelivery) {
+					rejected();
+					throw new Error("transient parent delivery failure");
+				}
+				send(...args);
+				delivered();
+			};
+			await rejection;
+			await f.turn();
+			assert.ok(
+				child.taskId,
+				"failed delivery must keep the assigned task for retry",
+			);
+			assert.equal(child.observedTaskEvents, 0);
+			allowDelivery = true;
+			appendPersistentTaskEvent(child.sessionFile, {
+				type: "task-done",
+				task: "wake-again",
+				generation: "other-generation",
+			});
+			await delivery;
+			await f.turn();
+			assert.equal(child.taskId, undefined);
+			assert.equal(child.tasksCompleted, 1);
+			assert.equal(child.observedTaskEvents, 3);
+			assert.ok(attempts >= 2);
+			assert.equal(f.mock.sentMessages.length, 1);
+			assert.equal(readPersistentDeliveryLedger(child.sessionFile).length, 2);
+			assert.deepEqual(child.activityRead, {
+				ok: false,
+				reason: "missing",
+				error: undefined,
+			});
+			assert.equal(
+				child.adapter.getRunningChild(child.handle).tasksCompleted,
+				1,
+			);
+			child.stopState = "requested";
+			await f.finish(child);
+			assert.equal(f.registrations(), 1);
+			assert.equal(f.closed.length, 1);
+		}));
+	it("retains each owning adapter and watcher through reload while new launches use the new parent snapshot", async () =>
+		withAdapterHost(async (f) => {
+			const old = await f.launch({ name: "old", task: "bounded" });
+			assert.ok(old.handle);
+			const owner = old.adapter;
+			const reloaded = await import(
+				`../pi-extension/subagents/index.ts?task11-${Date.now()}`
+			);
+			f.patchTransport();
+			const replacement = createMockExtensionApi();
+			f.apis.push(replacement);
+			replacement.api.getThinkingLevel = () => "low";
+			reloaded.default(replacement.api);
+			f.ctx.model = { provider: "fake", id: "replacement" };
+			const next = await f.launch(
+				{ name: "new", task: "bounded" },
+				replacement,
+			);
+			assert.equal(old.adapter, owner);
+			assert.notEqual(next.adapter, owner);
+			assert.deepEqual(next.runtimePlan, {
+				provider: "fake",
+				modelId: "replacement",
+				model: "fake/replacement",
+				thinking: "low",
+				modelSource: "parent",
+				thinkingSource: "parent",
+			});
+			assert.equal(f.registrations(), 2);
+			await f.finish(old);
+			await f.finish(next);
+			assert.equal(replacement.sentMessages.length, 2);
+			assert.equal(f.mock.sentMessages.length, 0);
+			assert.equal(f.registrations(), 2);
+			assert.equal(f.closed.length, 2);
+		}));
+	it("retains all ordinary retry panes until accepted final delivery with distinct owning adapters", async () =>
+		withAdapterHost(async (f) => {
+			const first = await f.launch({
+				name: "fallback",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			assert.ok(first.handle);
+			let launched!: () => void;
+			const secondLaunch = new Promise<void>((resolve) => {
+				launched = resolve;
+			});
+			const runScript = f.runtime.launchOperations.runScript;
+			f.patch(f.runtime.launchOperations, "runScript", (...args: any[]) => {
+				const script = runScript(...args);
+				launched();
+				return script;
+			});
+			await f.finish(first, {
+				type: "error",
+				errorMessage: "first account rejected",
+			});
+			await secondLaunch;
+			await f.turn();
+			const second = f.runtime.runningSubagents.get(first.id);
+			assert.equal(second.id, first.id);
+			assert.notEqual(second.sessionFile, first.sessionFile);
+			assert.notEqual(second.adapter, first.adapter);
+			assert.equal(second.abortController, first.abortController);
+			assert.equal(f.closed.length, 0);
+			assert.equal(f.surface.listSurfaces().length, 2);
+			await f.finish(second);
+			const details = f.mock.sentMessages.at(-1).message.details;
+			assert.deepEqual(details.fallbackAttempts, ["fake/first", "fake/second"]);
+			assert.deepEqual(details.fallbackFailures, [
+				{ model: "fake/first", error: "first account rejected" },
+			]);
+			assert.equal(f.closed.length, 2);
+			assert.equal(f.registrations(), 2);
+		}));
+	for (const accepted of [true, false])
+		it(`ordinary completion ${accepted ? "closes only after accepted delivery" : "retains the pane after rejected delivery"}`, async () =>
+			withAdapterHost(async (f) => {
+				const child = await f.launch({ name: "delivery", task: "bounded" });
+				assert.ok(child.handle);
+				let closesAtDelivery = -1;
+				const send = f.mock.api.sendMessage;
+				f.mock.api.sendMessage = (...args: any[]) => {
+					closesAtDelivery = f.closed.length;
+					if (!accepted) throw new Error("parent rejected delivery");
+					send(...args);
+				};
+				await f.finish(child);
+				assert.equal(closesAtDelivery, 0);
+				assert.equal(f.closed.length, accepted ? 1 : 0);
+				assert.equal(f.surface.listSurfaces().length, accepted ? 0 : 1);
+			}));
+	it("finalizes the retained worktree manifest before delivery without closing its root pane", async () =>
+		withAdapterHost(async (f) => {
+			execFileSync("git", ["init", "-q"], { cwd: f.projectDir });
+			writeFileSync(join(f.projectDir, "tracked"), "base");
+			execFileSync("git", ["add", "tracked"], { cwd: f.projectDir });
+			execFileSync(
+				"git",
+				[
+					"-c",
+					"user.name=Test",
+					"-c",
+					"user.email=test@example.com",
+					"-c",
+					"commit.gpgsign=false",
+					"commit",
+					"-qm",
+					"fixture",
+				],
+				{ cwd: f.projectDir },
+			);
+			const retained = join(f.globalDir, "retained");
+			execFileSync("git", ["clone", "-q", f.projectDir, retained]);
+			f.patch(f.runtime.launchOperations, "createWorktree", () => ({
+				path: retained,
+				workspaceId: "owned-workspace",
+				paneId: f.surface.createSurface({
+					name: "worktree-root",
+					cwd: retained,
+				}),
+				branch: "bounded-worktree",
+			}));
+			const child = await f.launch({
+				name: "worktree",
+				task: "bounded",
+				worktree: { branch: "bounded-worktree" },
+			});
+			assert.ok(child.handle.worktree);
+			const deliveredStates: string[] = [];
+			const send = f.mock.api.sendMessage;
+			f.mock.api.sendMessage = (...args: any[]) => {
+				deliveredStates.push(
+					JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state,
+				);
+				send(...args);
+			};
+			await f.finish(child);
+			assert.deepEqual(deliveredStates, ["ready_for_review"]);
+			assert.equal(f.closed.length, 0);
+			assert.equal(f.surface.listSurfaces().length, 1);
+			assert.equal(
+				f.mock.sentMessages.at(-1).message.details.worktree.clean,
+				true,
+			);
+		}));
+	it("public resume retains its actual adapter ID and delivers only post-resume output", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "before",
+				task: "bounded",
+				tools: "read",
+			});
+			assert.ok(child.handle);
+			writeFileSync(
+				child.sessionFile,
+				JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "saved",
+					cwd: f.projectDir,
+				}) +
+					"\n" +
+					JSON.stringify(ASSISTANT_MSG) +
+					"\n",
+			);
+			await f.finish(child);
+			rmSync(`${child.sessionFile}.exit`, { force: true });
+			const tool = f.mock.registeredTools.find(
+				(t: any) => t.name === "subagent_resume",
+			);
+			const result = await tool.execute(
+				"resume",
+				{ sessionPath: child.sessionFile, name: "after" },
+				new AbortController().signal,
+				undefined,
+				f.ctx,
+			);
+			const resumed = f.runtime.runningSubagents.get(result.details.id);
+			assert.ok(resumed.handle);
+			assert.equal(result.details.id, resumed.handle.id);
+			assert.equal(resumed.adapter.getRunningChild(resumed.handle), resumed);
+			assert.deepEqual(readSubagentSessionPolicy(resumed.sessionFile).tools, [
+				"read",
+			]);
+			await f.finish(resumed);
+			assert.match(
+				f.mock.sentMessages.at(-1).message.content,
+				/without new output/,
+			);
+			assert.doesNotMatch(
+				f.mock.sentMessages.at(-1).message.content,
+				/Here is my plan/,
+			);
+			assert.equal(f.closed.length, 2);
+		}));
+});
 
 describe("session.ts", () => {
 	let dir: string;

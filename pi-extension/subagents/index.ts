@@ -26,7 +26,8 @@ import { randomUUID } from "node:crypto";
 import { shellQuote } from "../../maestro/core/shell.ts";
 import type { SurfaceProvider } from "../../maestro/core/surface-provider.ts";
 import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
-import { waitForCompletion } from "./completion.ts";
+import { PiHarnessAdapter } from "../../maestro/adapters/pi/pi-harness-adapter.ts";
+import type { AgentHandle } from "../../maestro/core/types.ts";
 import {
 	SupervisionCoordinator,
 	type SupervisionRegistration,
@@ -62,7 +63,7 @@ import { loadRoleConfig, type RoleConfig } from "./role-config.ts";
 import {
 	buildTaskModelBrief,
 	buildTaskModelInitPrompt,
-} from "./task-model-init.ts";
+} from "../../maestro/adapters/pi/task-model-init.ts";
 import {
 	loadPersistentConfig,
 	type PersistentConfig,
@@ -79,9 +80,8 @@ import {
 	createBtwSessionSnapshot,
 	readPersistentDeliveryLedger,
 	readPersistentTaskEvents,
-	readSubagentSessionPolicy,
 	writePersistentTaskInbox,
-} from "./session.ts";
+} from "../../maestro/adapters/pi/session.ts";
 import {
 	type SubagentStatusState,
 	capStatusLines,
@@ -112,7 +112,6 @@ import {
 	projectLifecycle,
 	type LifecycleProjection,
 	type SubagentLifecycle,
-	type PaneInspection,
 } from "./lifecycle.ts";
 import {
 	createWorktreeCleanupOperations,
@@ -124,7 +123,6 @@ import {
 import {
 	captureWorktreeHandoff,
 	launchOperationsFromSurface,
-	launchPiSubagent,
 	launchPiWorktreeHandoff,
 	persistWorktreeResult,
 	runSubagentScript,
@@ -133,7 +131,7 @@ import {
 	type PiLaunchOperations,
 	type WorktreeHandoff,
 	type WorktreeLaunch,
-} from "./launch.ts";
+} from "../../maestro/adapters/pi/launch.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1426,6 +1424,9 @@ interface RunningSubagent {
 	stopTimeout?: ReturnType<typeof setTimeout>;
 	stopTimeoutMs?: number;
 	crashNotified?: boolean;
+	/** Pre-adapter records keep their existing watcher; new handles retain their owner across reload. */
+	adapter?: PiHarnessAdapter;
+	handle?: AgentHandle;
 	supervisionRegistration?: SupervisionRegistration;
 }
 
@@ -2538,66 +2539,48 @@ async function launchSubagent(
 	const parentSessionFile = ctx.sessionManager.getSessionFile();
 	if (!parentSessionFile) throw new Error("No session file");
 
-	const running = await launchPiSubagent(
-		{
-			kind: "fresh",
-			id: logicalId,
-			name: params.name,
-			task: params.task,
+	const adapter = createPiHarnessAdapter(ctx, parentThinking);
+	const handle = await adapter.spawn({
+		name: params.name,
+		task: params.task,
+		cwd: ctx.cwd,
+		sessionId: ctx.sessionManager.getSessionId(),
+		role: {
+			name: params.agent ?? "",
+			version: "1",
+			description: "Pi host-resolved role",
+			systemPrompt: agentDefs?.body ?? params.systemPrompt ?? "",
+			allowedTools: [],
+		},
+		resolvedLaunch: {
+			runtimePlan,
 			agent: params.agent,
 			cwd: params.cwd,
-			worktree: params.worktree,
-			fork: params.fork,
-			surface: options?.surface,
-			parent: {
-				cwd: ctx.cwd,
-				invocationCwd: process.cwd(),
-				sessionFile: parentSessionFile,
-				sessionId: ctx.sessionManager.getSessionId(),
-				sessionDir: ctx.sessionManager.getSessionDir(),
-				agentDir: getAgentConfigDir(),
-			},
-			runtimePlan,
-			behavior: {
-				tools: effectiveTools,
-				skills: effectiveSkills,
-				deniedTools: [...resolveDenyTools(agentDefs)],
-				autoExit: effectiveAutoExit,
-				interactive: effectiveInteractive,
-				persistent,
-				logicalId,
-				generationId,
-				taskId,
-				identity: agentDefs?.body ?? params.systemPrompt,
-				systemPromptMode: agentDefs?.systemPromptMode,
-				sessionMode: resolveEffectiveSessionMode(params, agentDefs),
-				cwd: agentDefs?.cwd,
-			},
+			roleCwd: agentDefs?.cwd,
+			tools: effectiveTools,
 		},
-		launchOperations,
-	);
-	if (persistent) {
-		const policy = readSubagentSessionPolicy(running.sessionFile);
-		if (policy.version !== 2)
-			throw new Error("Persistent launch policy was not written as v2.");
-		running.persistent = true;
-		running.logicalId = policy.logicalId;
-		running.generationId = policy.generationId;
-		running.policyHash = policy.policyHash;
-		running.policyTools = policy.tools;
-		running.policyDeniedTools = policy.deniedTools;
-		running.tasksCompleted = 0;
-		running.taskId = taskId;
-		running.inboxSequence = 0;
-		running.observedTaskEvents = 0;
-		appendPersistentDeliveryLedger(running.sessionFile, {
-			task: taskId,
-			outcome: "dispatched",
-			generation: policy.generationId,
-			logicalId: policy.logicalId,
-			policyHash: policy.policyHash,
-		});
-	}
+		launchIdentity: { id: logicalId, logicalId, generationId, taskId },
+		worktreeRequest: params.worktree ?? undefined,
+		surface: options?.surface
+			? surfaceProvider.attachSurface(options.surface)
+			: undefined,
+		session: { mode: resolveEffectiveSessionMode(params, agentDefs) },
+		behavior: {
+			skills: effectiveSkills
+				?.split(",")
+				.map((skill) => skill.trim())
+				.filter(Boolean),
+			denyTools: [...resolveDenyTools(agentDefs)],
+			autoExit: effectiveAutoExit,
+			interactive: effectiveInteractive,
+			persistent,
+			systemPromptMode: agentDefs?.systemPromptMode,
+		},
+	});
+	// Share the adapter's actual mutable record, including its one initial persistent ledger row.
+	const running: RunningSubagent = adapter.getRunningChild(handle);
+	running.adapter = adapter;
+	running.handle = handle;
 	runningSubagents.set(logicalId, running);
 	return running;
 }
@@ -2844,6 +2827,42 @@ function getSupervisionCoordinator(): SupervisionCoordinator {
 	return runtime.supervision;
 }
 
+/** One adapter per launch snapshot; existing watchers retain their owning instance on reload. */
+function createPiHarnessAdapter(
+	ctx: Parameters<typeof launchSubagent>[1],
+	parentThinking?: ThinkingLevel,
+): PiHarnessAdapter {
+	return new PiHarnessAdapter({
+		surface: surfaceProvider,
+		paneConfig,
+		operations: launchOperations,
+		supervision: getSupervisionCoordinator(),
+		modelRegistry: wrapPiModelRegistry(ctx.modelRegistry),
+		parent: {
+			cwd: ctx.cwd,
+			invocationCwd: process.cwd(),
+			sessionFile: ctx.sessionManager.getSessionFile() ?? "",
+			sessionId: ctx.sessionManager.getSessionId(),
+			sessionDir: ctx.sessionManager.getSessionDir(),
+			agentDir: getAgentConfigDir(),
+		},
+		parentRuntime:
+			ctx.model && parentThinking
+				? {
+						provider: ctx.model.provider,
+						modelId: ctx.model.id,
+						thinking: parentThinking,
+					}
+				: undefined,
+		onObservation(child, kind) {
+			// These are cheap local reads only. Never recursively inspect through getState.
+			if (kind === "local-evidence") drainPersistentEventsSafely(child);
+			else if (kind === "tick") observeRunningSubagent(child);
+			else updateWidget();
+		},
+	});
+}
+
 function drainPersistentEventsSafely(running: RunningSubagent): void {
 	if (!running.persistent || !runtime.pi) return;
 	try {
@@ -2857,34 +2876,18 @@ async function watchSubagent(
 	running: RunningSubagent,
 	signal: AbortSignal,
 ): Promise<SubagentResult> {
-	const { name, task, surface, startTime, sessionFile } = running;
-	const supervision = getSupervisionCoordinator().register(
-		sessionFile,
-		surface,
-	);
-	running.supervisionRegistration = supervision;
+	const { name, task, startTime, sessionFile } = running;
 
 	try {
-		const result = await waitForCompletion(signal, {
-			intervalMs: 1000,
-			sessionFile,
-			waitForNextCheck: supervision.wait,
-			readTerminalTail: async () => surfaceProvider.readScreen(surface, 5),
-			inspectPane: supervision.inspectPane,
-			onLocalEvidence: () => drainPersistentEventsSafely(running),
-			onPaneInspection: (inspection: PaneInspection, observedAt: number) => {
-				ensureLifecycle(running);
-				running.lifecycle = observePaneInspection(
-					running.lifecycle,
-					inspection,
-					observedAt,
-				);
-				updateWidget();
-			},
-			onTick() {
-				observeRunningSubagent(running);
-			},
-		});
+		if (!running.adapter || !running.handle)
+			throw new Error(
+				"Pre-adapter child completion remains owned by its existing watcher.",
+			);
+		ensureLifecycle(running);
+		const result = await running.adapter.awaitCompletion(
+			running.handle,
+			signal,
+		);
 
 		const detectedAt = Date.now();
 		running.lifecycle = markCompletionDetected(
@@ -3001,11 +3004,6 @@ async function watchSubagent(
 		};
 		if (worktreeHandoff) errorResult.worktree = worktreeHandoff;
 		return errorResult;
-	} finally {
-		supervision.unregister();
-		if (running.supervisionRegistration === supervision) {
-			running.supervisionRegistration = undefined;
-		}
 	}
 }
 
@@ -4023,7 +4021,6 @@ export default function subagentsExtension(
 
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				const name = params.name ?? "Resume";
-				const id = Math.random().toString(16).slice(2, 10);
 
 				if (!surfaceProvider.isAvailable()) {
 					return muxUnavailableResult();
@@ -4044,21 +4041,17 @@ export default function subagentsExtension(
 				// Record entry count before resuming so we can extract new messages
 				const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-				const running: RunningSubagent = await launchPiSubagent(
-					{
-						kind: "resume",
-						id,
-						name,
-						sessionFile: params.sessionPath,
-						message: params.message,
-						parent: {
-							sessionId: ctx.sessionManager.getSessionId(),
-							sessionDir: ctx.sessionManager.getSessionDir(),
-						},
-						behavior: { autoExit: params.autoExit },
-					},
-					launchOperations,
-				);
+				const adapter = createPiHarnessAdapter(ctx);
+				const handle = await adapter.resume({
+					name,
+					sessionId: params.sessionPath,
+					message: params.message,
+					autoExit: params.autoExit,
+				});
+				const running: RunningSubagent = adapter.getRunningChild(handle);
+				running.adapter = adapter;
+				running.handle = handle;
+				const id = handle.id;
 				runningSubagents.set(id, running);
 				startWidgetRefresh();
 				startStatusRefresh(pi);

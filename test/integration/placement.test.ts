@@ -14,7 +14,7 @@ import {
 	launchPiSubagent,
 	readWorktreeManifest,
 	type FreshPiLaunchRequest,
-} from "../../pi-extension/subagents/launch.ts";
+} from "../../maestro/adapters/pi/launch.ts";
 import {
 	closePane,
 	createSubagentPane,
@@ -145,7 +145,7 @@ for (const backend of getAvailableBackends()) {
 				const script = join(env.dir, "moved-parent.mjs");
 				const report = join(env.dir, "moved-parent.json");
 				const launchUrl = new URL(
-					"../../pi-extension/subagents/launch.ts",
+					"../../maestro/adapters/pi/launch.ts",
 					import.meta.url,
 				).href;
 				// Execute inside the original terminal: do not manufacture inherited

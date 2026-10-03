@@ -23,7 +23,7 @@ import {
 	isString,
 	type JsonObject,
 	type JsonValue,
-} from "./type-guards.ts";
+} from "../../../pi-extension/subagents/type-guards.ts";
 
 export interface SessionEntry {
 	type: string;

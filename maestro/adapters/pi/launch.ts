@@ -9,18 +9,28 @@ import {
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { getSubagentActivityFile } from "./activity.ts";
-import { createLifecycle, type SubagentLifecycle } from "./lifecycle.ts";
-import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
-import { loadPaneConfig, type PaneConfig } from "./pane-config.ts";
-import { isNonEmptyString, isRecord, type JsonObject } from "./type-guards.ts";
-import { shellQuote } from "../../maestro/core/shell.ts";
+import { getSubagentActivityFile } from "../../../pi-extension/subagents/activity.ts";
+import {
+	createLifecycle,
+	type SubagentLifecycle,
+} from "../../../pi-extension/subagents/lifecycle.ts";
+import type { ResolvedRuntimePlan } from "../../../pi-extension/subagents/runtime-routing.ts";
+import {
+	loadPaneConfig,
+	type PaneConfig,
+} from "../../../pi-extension/subagents/pane-config.ts";
+import {
+	isNonEmptyString,
+	isRecord,
+	type JsonObject,
+} from "../../../pi-extension/subagents/type-guards.ts";
+import { shellQuote } from "../../core/shell.ts";
 import type {
 	SurfaceProvider,
 	WorktreeSurface,
-} from "../../maestro/core/surface-provider.ts";
-import { WorktreeProvisioningError } from "../../maestro/core/surface-provider.ts";
-import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
+} from "../../core/surface-provider.ts";
+import { WorktreeProvisioningError } from "../../core/surface-provider.ts";
+import { HerdrSurfaceProvider } from "../../surfaces/herdr/herdr-surface-provider.ts";
 import {
 	createWorktreeSessionFork,
 	getNewEntries,
@@ -715,7 +725,7 @@ function buildPiCommand(
 		shellQuote(artifacts.sessionFile),
 		...(request.handoff
 			? []
-			: ["-e", shellQuote(join(SUBAGENTS_DIR, "subagent-done.ts"))]),
+			: ["-e", shellQuote(join(SUBAGENTS_DIR, "child", "subagent-done.ts"))]),
 		"--model",
 		shellQuote(request.runtimePlan.model),
 		"--thinking",
@@ -902,7 +912,7 @@ async function launchResumedPiSubagent(
 			shellQuote(request.sessionFile),
 			...(toolAllowlist ? ["--tools", shellQuote(toolAllowlist)] : []),
 			"-e",
-			shellQuote(join(SUBAGENTS_DIR, "subagent-done.ts")),
+			shellQuote(join(SUBAGENTS_DIR, "child", "subagent-done.ts")),
 			...(messageFile ? [shellQuote(`@${messageFile}`)] : []),
 		].join(" ");
 		const launchScriptFile = await operations.runScript(

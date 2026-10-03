@@ -1,5 +1,5 @@
 import type { ActivityReadResult, SubagentActivityScope } from "./activity.ts";
-import type { CompletionResult } from "./completion.ts";
+import type { CompletionResult } from "../../maestro/adapters/pi/completion.ts";
 
 export type HerdrAgentStatus =
 	| "idle"

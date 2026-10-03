@@ -18,7 +18,7 @@ import {
 	type FreshPiLaunchRequest,
 	type PiLaunchOperations,
 	type ResumePiLaunchRequest,
-} from "../pi-extension/subagents/launch.ts";
+} from "../maestro/adapters/pi/launch.ts";
 import { createSubagentPaneFactory } from "../pi-extension/subagents/pane-config.ts";
 import { FakeSurfaceProvider } from "../maestro/surfaces/fake/fake-surface-provider.ts";
 import type { SurfaceProvider } from "../maestro/core/surface-provider.ts";
@@ -26,7 +26,7 @@ import { WorktreeProvisioningError } from "../maestro/core/surface-provider.ts";
 import {
 	readSubagentSessionPolicy,
 	writeSubagentSessionPolicy,
-} from "../pi-extension/subagents/session.ts";
+} from "../maestro/adapters/pi/session.ts";
 
 function expectedShellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;

@@ -3,7 +3,7 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import {
 	TASK_CATEGORY_DESCRIPTIONS,
 	type ModelConfig,
-} from "./model-config.ts";
+} from "../../../pi-extension/subagents/model-config.ts";
 
 const AUTH_SOURCES = new Set([
 	"stored",

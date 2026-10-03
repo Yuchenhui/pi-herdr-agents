@@ -16,7 +16,10 @@ import {
 	removeHerdrWorktree,
 	type HerdrWorktreeInfo,
 } from "../../maestro/surfaces/herdr/herdr.ts";
-import { readWorktreeManifest, writeWorktreeManifest } from "./launch.ts";
+import {
+	readWorktreeManifest,
+	writeWorktreeManifest,
+} from "../../maestro/adapters/pi/launch.ts";
 import { isString, type JsonObject } from "./type-guards.ts";
 
 export interface CleanupGitState {
