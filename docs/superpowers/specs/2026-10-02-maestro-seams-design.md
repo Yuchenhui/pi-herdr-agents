@@ -1,7 +1,8 @@
 # Maestro seams in pi-herdr-agents: design
 
-**Status:** Approved design with proposed Stage 4 contract corrections awaiting parent adjudication. Not shipped behavior.
-**Stage 4 baseline:** `891a533` (committed Stage 3); this document does not assert new runtime verification.
+**Status:** Maestro seams are implemented in `feat/maestro-seams`; local unit and deterministic integration gates passed. Not merged or released.
+**Stage 5 checkpoint:** `2ae8ba57b07d2f77b01363fe175f3b9084ebf6eb`; signed implementation checkpoint.
+**Stage 4 checkpoint:** `e9f803992894d304c4eb5b7608ab6cce4464ee16`; earlier signed checkpoint.
 **Branch:** `feat/maestro-seams`, from `main` at `a32e02f`.
 **Date:** 2026-10-02
 
@@ -64,6 +65,7 @@ maestro/
 pi-extension/subagents/
   index.ts         composition root: Pi registration, widget, delivery
   config-path.ts   host convention for $PI_CODING_AGENT_DIR
+  model-registry.ts host-local typed SDK capability glue over core routing
   plan-skill.md    unchanged
 agents/, skills/   unchanged
 ```
@@ -79,7 +81,7 @@ specifiers:
 | `maestro/surfaces/herdr` | `core`, `node:*` | `adapters`, `runtime`, `pi-extension`, `@earendil-works/*` |
 | `maestro/runtime` | `core`, `adapters`, `surfaces`, `node:*` | `pi-extension`, `@earendil-works/*` |
 | `maestro/adapters/fake`, `maestro/surfaces/fake` | `core`, `node:*` | everything else; no non-test file may import a `fake` directory |
-| `pi-extension/subagents` | `runtime`, `core` types, `@earendil-works/*`, `@sinclair/typebox` | `adapters`, `surfaces` directly |
+| `pi-extension/subagents` | `runtime`, `core` values and types, `@earendil-works/*`, `@sinclair/typebox` | `adapters`, `surfaces` directly |
 
 The test fails with the offending file and specifier. Relative imports are
 resolved to one of the directories above before the rule is applied. The
@@ -143,7 +145,7 @@ export interface Task {
 }
 
 // Role: maestro's five fields plus the defaults the Pi adapter honors today
-// (parsed by parseAgentDefinition in index.ts:521).
+// (parsed by parseAgentDefinition in maestro/core/roles/discovery.ts).
 export interface Role {
   name: string;
   version: string;
@@ -161,6 +163,8 @@ export interface Role {
     persistent?: boolean;
     systemPromptMode?: "replace" | "append";
     denyTools?: string[];
+    skills?: string[];
+    cwd?: string;
   };
   /** Where the definition came from: bundled, project, global, or role pack. */
   source?: string;
@@ -191,9 +195,43 @@ export interface RunResult {
 
 `ThinkingLevel`, `WorktreeHandoff` (today `launch.ts:70`), `PaneInspection`,
 `HerdrAgentStatus` (renamed `SurfaceAgentStatus`), `LifecycleProjection`, and
-the activity state types from `activity.ts:17-68` move into core as plain
-types. For the Pi adapter, `AgentHandle.sessionId` holds the session file
+the activity state types originally from `activity.ts:17-68` live in
+`maestro/core/types.ts` as plain types. Do not redeclare them in activity
+modules. For the Pi adapter, `AgentHandle.sessionId` holds the session file
 path; no field is added to `AgentHandle`.
+
+Task 15's `maestro/core/activity.ts` owns only validated-state/absence
+projection and the existing pure scope predicate/set:
+
+```ts
+export function projectActivity(state: SubagentActivityState | undefined): ActivityReadResult;
+export function isSubagentActivityScope(value: any): value is SubagentActivityScope;
+```
+
+Projection is exactly `state === undefined ? { ok: false, reason: "missing" } :
+{ ok: true, activity: state }`, preserving the supplied state's identity. It
+is not unknown-JSON, expected-ID or error validation, sanitization, copying,
+age policy or lifecycle classification. The predicate moves unchanged using
+Task 14's core guards; no second scope vocabulary or baseline diagnostic fix.
+
+`maestro/adapters/pi/activity-file.ts` retains the existing path helper,
+reader, atomic writer and recorder signatures/bodies except the named split.
+Its private `validateActivity(value: any, expectedRunningChildId: string):
+ActivityReadResult` preserves object, version, child-ID string, ID equality,
+event, phase, scope, then scalar/string validation in that order, including
+first-error selection and accepted optional nulls. Wrong ID stays
+`{ ok: false, reason: "wrong-id" }` without invented error text. Unknown parsed
+JSON goes through this validator, never a cast directly into projectActivity.
+`existsSync` stays outside the try/catch: false calls projectActivity(undefined),
+while an existence-probe exception still propagates. Only readFileSync/JSON.parse
+are caught, returning invalid with `error instanceof Error ? error.message :
+String(error)`. Only validated success calls projectActivity(object); invalid
+and wrong-ID results pass through unchanged. Known phases/events and other
+validators remain private; SubagentActivityRecorder/SubagentShutdownReason
+remain adapter-local. Filename/env, temp naming, newline JSON, rename/unlink/
+rethrow, throttle/failure disabling and shutdown behavior do not change.
+Later file regressions use real directory/EISDIR and malformed-JSON failures,
+not a patched throwing existsSync, while preserving source catch ordering.
 
 `Worktree.owner` stays as copied from maestro in the in-memory declaration.
 It is not the on-disk manifest owner. Manifests this package writes keep the
@@ -364,7 +402,7 @@ memory and lets tests script inspections. It does not run Git or create real
 checkouts; filesystem assertions belong to the real-provider integration
 fixture.
 
-### 4.4 `RunSession`: proposed Stage 4 contract
+### 4.4 `RunSession`: accepted Stage 4 contract and Task 15 correction
 
 These complete declarations replace the incomplete runtime sketch. Core
 `Task`, `Role`, `AgentHandle`, `RunResult`, `HarnessAdapter`, and
@@ -642,7 +680,9 @@ runtime hooks on local-evidence, pane, tick, completion, state and interrupt.
 `observe(taskId, at)` explicitly performs only supplied activity-file hydration
 and projection, including health/detail and durable interrupt precedence; the
 existing host widget/status presentation timer can request a `refresh`.
-Without an attempt's observe source it returns undefined. The host consumes
+Without an attempt's observe source it returns undefined. Unowned legacy/seeded
+presentation records use the separate module-level Pi-local activity operation below; it confers no Task ownership and requires
+no initialized session. The host consumes
 onObserved for presentation/status and local-evidence persistent drain, not a
 new completion/busy/deadline loop. No recursive `getState` call or runtime
 refresh timer. Each non-aborted supervise caller requests an initial cheap
@@ -914,6 +954,7 @@ export interface DefaultRunSessionOptions {
   /** Test injection consumes the actual Stage 3 seams, not replacement launch logic. */
   infrastructure?: PiRunSessionInfrastructure;
   configDir: string;
+  configExamplePath: string;
   /** Synchronous fresh snapshot, captured once at each launch/resume call. */
   getLaunchSnapshot(): PiLaunchSnapshot;
   roles: Role[];
@@ -952,14 +993,201 @@ and composes `createRunSession`. With injected infrastructure it uses that
 coordinator and its existing registry, creating neither a second coordinator
 nor a second registry. Injection is for host-through-adapter fixtures.
 It never imports Pi SDK packages: host passes the active wrapped
-`ModelRegistryAdapter`, not a new registry. Task 15 relocates the wrapper's Pi
-SDK implementation into the adapter for SDK-facing adapter consumers. The
-factory continues to consume the plain port; host may assemble it from the
-active registry with its permitted SDK imports, not import an adapter wrapper
-or obtain one through a shallow runtime export. `configDir` is the durable agent config
-directory, not package-root state. `forcePolling` is sampled at coordinator
-creation; existing coordinators retain their settings across replacement just
+`ModelRegistryAdapter`, not a new registry. Task 15's shared neutral constructor
+and separate host/adapter SDK glue are specified below; the factory continues
+to consume only the plain port. No host adapter import, runtime SDK import or
+shallow runtime wrapper/reader compatibility export is permitted. `configDir`
+is the durable agent config directory, not package-root state. `forcePolling`
+is sampled at coordinator creation; existing coordinators retain their settings across replacement just
 as Stage 3 does.
+
+**Task 15 Pi-local activity observation**
+
+This module-level export in `maestro/runtime/pi-run-session.ts`, re-exported
+as an implemented operation by `maestro/runtime/index.ts`, is **outside**
+PiRunSession and the generic ports:
+
+```ts
+// pi-herdr-agents extension; no owning session required
+export function observePiActivity(
+  input: { id: string; activityFile?: string; lifecycle: SubagentLifecycle },
+  observedAt: number,
+): RunObservation & { activityRead: ActivityReadResult };
+```
+
+Truthy supplied path reads the adapter activity file with input.id; absent or
+empty path uses projectActivity(undefined). Compute lifecycle with
+`observeActivity(input.lifecycle, read, observedAt)` and return exactly
+`{ kind: "refresh", observedAt, lifecycle, projection: projectLifecycle(lifecycle,
+observedAt), activity: read.ok ? read.activity : undefined, activityRead: read }`.
+The operation does not mutate/store input. It performs real read/lifecycle/
+projection, not raw-reader laundering. Existing core suppression, terminal,
+interrupt and stale-sequence rules remain authoritative.
+
+It is callable immediately after module import, before factory, extension or
+session_start initialization and after owner retirement. It requires no
+runtime.session, latestCtx or launch snapshot and acquires no Task, control
+owner, adapter, watcher, registry history or resources. It inspects no pane,
+transcript, ledger or Git, infers no completion and invokes no hooks/messages.
+Do not initialize a factory/provider/coordinator or adopt a seeded row to use it.
+The required activityRead intersection does not widen generic RunObservation.
+
+Host's owned control-ID branch stays unchanged, including session.observe,
+onObserved and the actual mutable record. Only its unowned fallback calls the
+operation, after host-local ensureLifecycle has preserved legacy active-tool,
+done-as-waiting and interrupt hydration. Host applies
+`read.ok ? { ok: true } : { ok: false, reason: read.reason, error: read.error }`
+to running.activityRead, including error:undefined when absent. Assign activity
+only on success, retaining prior successful activity on invalid/missing reads;
+assign returned lifecycle. Status/advisory/interrupt policy and timer cadence
+stay host-local. Owned composition hydrate, adapter getState and local-evidence
+paths are unchanged beyond imports: no shared hydration rewrite, changed
+observation kind/callback order, extra read/hook/watcher or local-evidence read.
+
+**Task 15 neutral registry construction and SDK boundaries**
+
+`maestro/core/routing.ts` keeps RoutingModel and routing declarations. It uses
+core/types.ts's seven-member ThinkingLevel union (off through max), with no SDK
+type-only edge. The complete neutral model/source/port/constructor shapes are:
+
+```ts
+export interface RoutingModel {
+  provider: string;
+  id: string;
+  reasoning: boolean;
+  thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
+  input?: string[];
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+}
+export interface RoutingRegistrySource {
+  find(provider: string, modelId: string): any;
+  getAvailable?: () => any[];
+  getAll?: () => any[];
+  hasConfiguredAuth?: (model: any) => boolean;
+}
+export interface ModelRegistryAdapter {
+  find(provider: string, modelId: string): RoutingModel | undefined;
+  available(): RoutingModel[];
+  hasConfiguredAuth(model: { provider: string; id: string }): boolean;
+  supportedThinkingLevels(model: RoutingModel): ThinkingLevel[];
+  clampThinkingLevel(model: RoutingModel, level: ThinkingLevel): ThinkingLevel;
+}
+export function createModelRegistryAdapter(
+  registry: RoutingRegistrySource,
+  capabilities: Pick<ModelRegistryAdapter, "supportedThinkingLevels" | "clampThinkingLevel">,
+): ModelRegistryAdapter;
+```
+
+Keep private toRoutingModel and the existing three query method bodies in this
+one core owner, retaining receivers. Raw any is the existing boundary shape,
+not a new parser/schema or permission to harden guards. Construction makes zero
+registry queries; attach supplied capabilities without invoking/memoizing them.
+Core's four former SDK sites call the supplied port: explicit validation,
+`formatSupported(model, registry)` (its caller passes the same registry),
+inherited clamp and catalog. Routing selection/auth order, fallback/worktree
+restrictions, provenance, requested/observed fields and exact error/catalog
+prose remain unchanged.
+
+`maestro/adapters/pi/model-registry.ts` and the permanent host-local
+`pi-extension/subagents/model-registry.ts` each export the same wrapper with
+typed conversion closures:
+
+```ts
+export function wrapPiModelRegistry(registry: RoutingRegistrySource): ModelRegistryAdapter {
+  return createModelRegistryAdapter(registry, {
+    supportedThinkingLevels: (model) => getSupportedThinkingLevels(asPiModel(model)),
+    clampThinkingLevel: (model, level) => clampThinkingLevel(asPiModel(model), level),
+  });
+}
+// Private in each SDK-permitted owner:
+function asPiModel(model: RoutingModel): Model<any>;
+```
+
+Only the pinned original 23-line asPiModel SDK conversion and this thin glue
+are duplicated identically. Each owner imports SDK and core, never the other;
+neutral normalization/query/auth/dedup and routing remain shared. Retain the
+planned adapter wrapper and its existing test consumers even without a current
+production adapter caller; do not manufacture one or create a shared SDK layer.
+SDK capability functions require full Model<TApi>, not RoutingModel; direct
+assignment or casts hide a real type mismatch. SDK ModelThinkingLevel includes
+off; SDK ThinkingLevel alone does not.
+
+Required behavior and later regression controls:
+
+- **Normalization:** current string provider/id guards accept empty strings;
+  no trimming/nonempty/exact-ref hardening (parseExactModelRef is separate).
+  reasoning defaults only via `?? false`; map/cost are preserved by reference;
+  input is undefined only if not an array; context/maxTokens are finite-number
+  filtered. No SDK name/baseUrl/credentials or deep copies in core.
+- **Availability:** one optional getAvailable per available(); nonempty direct
+  source wins even if all entries fail normalization. Only empty direct source
+  triggers optional getAll. Preserve order, skip invalid before fallback auth,
+  call raw auth on valid fallback entries before dedup (including duplicates).
+  Nonempty direct source bypasses auth here. First-seen `${provider}/${id}`
+  dedup, no extra raw lookups.
+- **Auth:** with raw predicate, one raw find per auth call and pass its exact
+  original object to the predicate; missing original is false without predicate.
+  Without predicate, use the existing optional getAvailable exact provider/id
+  scan; no getAll rescue, cache or projected-object substitution.
+- **SDK conversion:** preserve provider/id/name=id, api="openai-completions",
+  baseUrl="", reasoning/map; filter present input to text/image, default
+  `["text"]` only when absent (present empty/unsupported input stays empty).
+  context/maxTokens and each absent cost component default via `?? 0`. This
+  synthetic model is for capabilities, not launch or unknown catalog/init costs.
+  Capability calls perform zero raw find/getAll/getAvailable/auth queries.
+  Preserve real SDK off-for-nonreasoners, null-map exclusions, defined mappings
+  for xhigh/max and upward-before-downward clamp; no hand-written replacement.
+- **Active source:** each of the five host calls closes over that invocation's
+  ctx.modelRegistry: candidate prevalidation, launchSnapshot, session_start
+  preferences/catalog, task-model writer auth predicate and /worktree plan.
+  Change only wrapper owner imports; do not consolidate calls, snapshot/cache,
+  create a registry or re-query a raw model for capabilities. PiHarnessAdapter
+  and PiLaunchSnapshot propagate the supplied port, not wrap/re-resolve it.
+  Adapter task-model-init's independent raw SDK capability call stays local.
+
+| Routing path | Port supported calls | Port clamp calls |
+| --- | ---: | ---: |
+| Explicit supported thinking | 1 | 0 |
+| Explicit unsupported thinking, including error formatting | 2 | 0 |
+| Inherited thinking with selected model | 0 | 1 |
+| Inherited thinking, parent model absent | 0 | 0 |
+| Catalog, including nonreasoners | 1 per visible model | 0 |
+
+SDK clamp internally computes levels as before; do not call the supported port
+first or memoize the second error-format call. Later core tests inject answers
+unlike SDK defaults (explicit max, inherited medium -> low, exact catalog levels)
+and assert selected-model identity/level/counts. Adding members to a fake alone
+is not a runtime red test under strip-types.
+
+Four directly assembled ports need both required methods, explicit synchronous
+fixtures without casts: `test/maestro/pi-harness-adapter.test.ts`,
+`test/maestro/pi-run-session.test.ts`, `test/test.ts`'s capturePersistentIO,
+and `test/integration/harness-conformance.test.ts`. Keep the adapter fixture's
+throwing find proving prevalidated-plan bypass; raw SDK registry suppliers stay raw.
+Shared task-model declarations (TASK_CATEGORIES, TaskCategory,
+TASK_CATEGORY_DESCRIPTIONS, mutable TaskPreferences and TaskPreferencesMeta)
+move to `maestro/core/config/task-model-types.ts`; routing and legacy model-config
+consume that leaf. Host and task-model-init split shared declarations from still-legacy
+loader/writer/ModelConfig imports until Task 17. No loader/I/O/SDK in the leaf.
+
+Query-spy controls cover constructor zero calls, direct nonempty with throwing
+getAll, direct all-invalid without fallback, empty-direct fallback with invalid/
+unauthenticated/duplicate entries, absent optional methods, missing/changing
+find and auth-without-predicate; assert raw receiver/order/count/object identity,
+empty-string IDs and first-seen dedup. Compare fresh core/adapter/host sources
+without extra capability-model queries or production-normalized expectations;
+active source changes stay visible. Real SDK sparse/null-map/upward-clamp/off
+cases and source/AST comparison of both private conversions against the pinned
+original guard drift, including SDK-unused defaults/filter fields. Later
+changed-seam diagnostics cover full Model return and typed closures; no new ESM
+mocking/loader framework. Detached real-file observation tests cover no-factory,
+missing/invalid/wrong-ID health, nonmutation and durable interrupt/sequence;
+host controls cover no session, no matching owner and retired rows without
+adoption, prior activity retention, sequence7 pre-interrupt, unchanged owned
+hooks/reads and demand-driven local-evidence I/O. Task 15 code waits for accepted
+Task 14 with refreshed import/body/type evidence, not this snapshot's acceptance.
 
 `spawnPi` consumes the role/body, complete validated plans, normalized behavior
 on Task, raw `resolved` values and opaque identities. Named role body wins over
@@ -1178,8 +1406,8 @@ an impossible earlier gate rather than advancing all of Tasks 14–17 into 12.
 | `herdr.ts`, `terminal.ts` | `maestro/surfaces/herdr/` | 2 |
 | `launch.ts`, `completion.ts`, `session.ts`, `task-model-init.ts` | `maestro/adapters/pi/` | 3 |
 | `subagent-done.ts` (child-side extension) | `maestro/adapters/pi/child/subagent-done.ts`; `launch.ts` builds the `-e` path from its own location | 3 |
-| `runtime-routing.ts` | `ModelRegistryAdapter`, `resolveRuntimePlan(s)`, catalog helpers to `maestro/core/routing.ts`; `wrapPiModelRegistry` and `@earendil-works/pi-ai` imports to `maestro/adapters/pi/model-registry.ts` | 5 |
-| `activity.ts` | state types and `readSubagentActivityFile` projection to `maestro/core/activity.ts`; file paths, writer, and recorder to `maestro/adapters/pi/activity-file.ts` | 5 |
+| `runtime-routing.ts` | Routing and neutral normalization/registry construction to `maestro/core/routing.ts`; typed SDK conversion/glue in `maestro/adapters/pi/model-registry.ts` and host-local `pi-extension/subagents/model-registry.ts` | 5 |
+| `activity.ts` | Canonical types already in `core/types.ts`; validated-state projection/scope predicate in `core/activity.ts`; private validators, reader, paths/writer/recorder in adapter `activity-file.ts`; detached lifecycle observation in runtime `pi-run-session.ts` | 5 |
 | `lifecycle.ts`, `status.ts`, `wake.ts`, `supervision.ts` | `maestro/core/` | 5 |
 | `worktree-cleanup.ts` | eligibility and manifest-state rules to `maestro/core/worktree-cleanup.ts`; Git/process/Herdr operations stay behind injected runtime operations built in `maestro/runtime/` from the surface provider | 5 |
 | `index.ts:414-890` role discovery, role packs, agent definition parsing | `maestro/core/roles/` producing `Role` values; `pi.events.emit` for role-pack discovery stays in `index.ts` via a callback | 5 |
@@ -1191,8 +1419,11 @@ an impossible earlier gate rather than advancing all of Tasks 14–17 into 12.
 | `index.ts` widget rendering, status refresh, `sendSubagentResult`, result presentation | stays in `index.ts` (Pi UI and delivery) | 4 |
 
 Moves are `git mv` with import updates only. Function bodies do not change
-in a move commit; behavior changes, if any, are separate commits with their
-own tests.
+in a move commit. Task 15 is the bounded split exception: named validated-state
+projection, detached-observation and capability-injection adaptations preserve
+validation/query/capability contracts; it is not pure byte relocation or a
+behavior improvement. Behavior changes, if any, require a separate decision
+and their own tests.
 
 ## 6. Composition root
 
@@ -1206,7 +1437,11 @@ The host registers tools/commands, selects roles and normalized launch inputs
 and owns persistent target/cap/deduplication/stop-timer policy through section
 4.4's injected operations. Its hooks consume rich typed metadata; successful
 send, explicit suppression and failed send have distinct cleanup consequences.
-It requests cheap observations for presentation, never completion polling.
+It requests owned cheap observations and the module-level observePiActivity
+for unowned legacy/seeded presentation refresh, never completion polling or
+ownership acquisition. Permitted host-local model-registry SDK glue supplies
+core's neutral constructor, not a direct adapter import or runtime wrapper/
+raw-reader compatibility re-export.
 `session_shutdown` delegates the reason-aware suppression/cancellation contract.
 
 Direct worktree handoff/cleanup and task-model init consumers remain staged to

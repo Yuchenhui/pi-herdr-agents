@@ -3,10 +3,47 @@
 ## Language
 
 **Pi subagent runtime**:
-The single execution path for fresh and resumed children. `launchPiSubagent()`
-owns the complete Pi and Herdr launch transaction; completion uses Pi sidecar
-evidence first and the terminal exit marker as fallback.
+The single real execution path for fresh and resumed children, coordinated by a
+run session through the Pi harness adapter. `launchPiSubagent()` still owns each
+complete launch transaction; completion uses Pi sidecar evidence first and the
+terminal exit marker as fallback.
 _Avoid_: Runtime dispatch, adapter registry, split launch ownership
+
+**Harness adapter**:
+An object implementing the core interface for child launch, observation,
+completion evidence, and controls. Pi is the only real implementation; the fake
+is for conformance tests.
+_Avoid_: Runtime selector, adapter registry, external CLI compatibility
+
+**Surface provider**:
+An object implementing the core interface for panes, commands, inspection, and
+worktree surfaces. Herdr is the only real implementation; the fake is for
+conformance tests.
+_Avoid_: Supported multiplexer catalog, harness adapter, security sandbox
+
+**Run session**:
+The runtime owner coordinating launched attempts, retries, observations,
+settlement, and delivery-gated surface cleanup. Pi composition supplies the
+real adapter, provider, and session I/O.
+_Avoid_: Pi session file, persistent specialist identity, historical run registry
+
+**Composition root**:
+The Pi host entry point that registers tools and commands, supplies current
+launch inputs and host policy, renders status, and delivers parent results.
+Runtime composition constructs adapters and providers behind its operations.
+_Avoid_: Direct adapter dispatch, duplicated launch owner, workflow engine
+
+**Dependency rule**:
+The test-enforced import boundaries between core, adapters, surfaces, runtime,
+and the Pi host. Core stays harness-neutral; the host consumes core and runtime
+without direct adapter or surface imports.
+_Avoid_: Runtime authorization, package split, hidden compatibility re-export
+
+**Conformance suite**:
+Shared seam-contract tests applied to an in-memory fake and the real
+implementation. Fake coverage is local; real Pi and Herdr coverage uses the
+deterministic integration suite.
+_Avoid_: Second supported harness, fake-only behavior proof, release certification
 
 **Child wake-up signal**:
 An internal indication that prompts fresh inspection of an owned child. It does
