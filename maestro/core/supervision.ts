@@ -1,4 +1,4 @@
-import type { PaneInspection } from "./lifecycle.ts";
+import type { PaneInspection } from "./types.ts";
 import {
 	FileWakeRegistry,
 	type WakeRegistration,

@@ -104,6 +104,8 @@ export interface Role {
 		persistent?: boolean;
 		systemPromptMode?: "replace" | "append";
 		denyTools?: string[];
+		skills?: string[];
+		cwd?: string;
 	};
 	/** Where the definition came from: bundled, project, global, or role pack. */
 	// pi-herdr-agents extension

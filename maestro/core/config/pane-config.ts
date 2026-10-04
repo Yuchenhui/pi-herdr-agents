@@ -1,8 +1,5 @@
 import { readFileSync } from "node:fs";
-import {
-	getSubagentsConfigExamplePath,
-	getSubagentsConfigPath,
-} from "./config-path.ts";
+import { join } from "node:path";
 import { isPlainObject, isString } from "./type-guards.ts";
 
 export type PaneMode = "grouped" | "tab" | "split";
@@ -133,9 +130,10 @@ function readPaneConfigFile(
 }
 
 export function loadPaneConfig(
-	configPath = getSubagentsConfigPath(),
-	examplePath = getSubagentsConfigExamplePath(),
+	configDir: string,
+	examplePath: string,
 ): PaneConfig {
+	const configPath = join(configDir, "config.json");
 	const { sourcePath, rawConfig } = readPaneConfigFile(configPath, examplePath);
 	let parsed;
 	try {

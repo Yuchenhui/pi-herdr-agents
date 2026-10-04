@@ -1,3 +1,9 @@
+import {
+	captureWorktreeHandoff,
+	writeWorktreeManifest,
+	createWorktreeOperations,
+} from "../maestro/runtime/worktree-operations.ts";
+import { buildSubagentToolAllowlist } from "../maestro/adapters/pi/launch.ts";
 import "./isolated-agent-dir.ts";
 import { describe, it, before, after } from "node:test";
 import { cleanupFixture } from "./worktree-cleanup-fixture.ts";
@@ -34,7 +40,7 @@ import {
 	isPlainObject,
 	isRecord,
 	isString,
-} from "../pi-extension/subagents/type-guards.ts";
+} from "../maestro/core/config/type-guards.ts";
 import rolePackExample from "../examples/role-pack/extension.ts";
 import {
 	cleanupSubagentsForShutdown,
@@ -79,29 +85,29 @@ import {
 	parseModelConfig,
 	resolveModelDefault,
 	writeTaskModelConfig,
-} from "../pi-extension/subagents/model-config.ts";
+} from "../maestro/core/config/model-config.ts";
 import {
 	loadRoleConfig,
 	parseRoleConfig,
-} from "../pi-extension/subagents/role-config.ts";
+} from "../maestro/core/config/role-config.ts";
 import {
 	createSubagentPaneFactory,
 	loadPaneConfig,
 	parsePaneConfig,
-} from "../pi-extension/subagents/pane-config.ts";
+} from "../maestro/core/config/pane-config.ts";
 import {
 	loadPersistentConfig,
 	parsePersistentConfig,
-} from "../pi-extension/subagents/persistent-config.ts";
+} from "../maestro/core/config/persistent-config.ts";
 import {
 	loadSupervisionConfig,
 	parseSupervisionConfig,
-} from "../pi-extension/subagents/supervision-config.ts";
-import { FileWakeRegistry } from "../pi-extension/subagents/wake.ts";
+} from "../maestro/core/config/supervision-config.ts";
+import { FileWakeRegistry } from "../maestro/core/wake.ts";
 import {
 	POLLING_INTERVAL_MS,
 	SupervisionCoordinator,
-} from "../pi-extension/subagents/supervision.ts";
+} from "../maestro/core/supervision.ts";
 import {
 	advanceStatusState,
 	capStatusLines,
@@ -114,13 +120,14 @@ import {
 	observeStatus,
 	loadStatusConfig,
 	parseStatusConfig,
-} from "../pi-extension/subagents/status.ts";
+} from "../maestro/core/status.ts";
 import {
 	createSubagentActivityRecorder,
 	getSubagentActivityFile,
 	readSubagentActivityFile,
-	type SubagentActivityState,
-} from "../pi-extension/subagents/activity.ts";
+} from "../maestro/adapters/pi/activity-file.ts";
+import type { SubagentActivityState } from "../maestro/core/types.ts";
+import { projectActivity } from "../maestro/core/activity.ts";
 import subagentDoneExtension, {
 	shouldMarkUserTookOver,
 	shouldAutoExitOnAgentEnd,
@@ -144,7 +151,7 @@ import {
 	observePaneInspection,
 	projectLifecycle,
 	type SubagentLifecycle,
-} from "../pi-extension/subagents/lifecycle.ts";
+} from "../maestro/core/lifecycle.ts";
 import {
 	launchPiSubagent,
 	launchOperationsFromSurface,
@@ -156,10 +163,8 @@ import {
 	type PiRunSession,
 	type PiRunRecord,
 } from "../maestro/runtime/index.ts";
-import {
-	buildAuthenticatedModelCatalog,
-	wrapPiModelRegistry,
-} from "../pi-extension/subagents/runtime-routing.ts";
+import { buildAuthenticatedModelCatalog } from "../maestro/core/routing.ts";
+import { wrapPiModelRegistry } from "../maestro/adapters/pi/model-registry.ts";
 import { FakeSurfaceProvider } from "../maestro/surfaces/fake/fake-surface-provider.ts";
 
 // Tool-registration behavior is environment-sensitive for child subagents.
@@ -385,6 +390,7 @@ async function persistentFixtureIO(): Promise<PiPersistentIO> {
 	let captured!: PiPersistentIO;
 	const session = createDefaultRunSession({
 		configDir: dir,
+		configExamplePath: getSubagentsConfigExamplePath(),
 		roles: [],
 		forcePolling: false,
 		infrastructure: {
@@ -404,6 +410,14 @@ async function persistentFixtureIO(): Promise<PiPersistentIO> {
 				find: (provider, id) => ({ provider, id, reasoning: true }),
 				available: () => [],
 				hasConfiguredAuth: () => true,
+				supportedThinkingLevels: () => [
+					"off",
+					"minimal",
+					"low",
+					"medium",
+					"high",
+				],
+				clampThinkingLevel: (_model, level) => level,
 			},
 			paneConfig: { mode: "tab", direction: "right", maxPerTab: 4 },
 		}),
@@ -1132,6 +1146,64 @@ describe("host adapter migration", () => {
 				),
 			);
 			await f.finish(explicit);
+		}));
+	for (const mode of [undefined, "append", "replace"]) {
+		it(`passes caller systemPrompt through a frontmatter-only named role (${mode ?? "task wrapper"})`, async () =>
+			withAdapterHost(async (f) => {
+				writeAgentFile(
+					f.projectAgentsDir,
+					"frontmatter-only",
+					`auto-exit: true${mode ? `\nsystem-prompt: ${mode}` : ""}`,
+					"",
+				);
+				const child = await f.launch({
+					name: "fallback",
+					agent: "frontmatter-only",
+					task: "bounded",
+					systemPrompt: "Caller fallback identity",
+				});
+				assert.ok(child);
+				assert.equal(child.agent, "frontmatter-only");
+				const command = f.commands[0];
+				const promptPath = mode
+					? command.match(
+							mode === "replace"
+								? /--system-prompt '([^']+)'/
+								: /--append-system-prompt '([^']+)'/,
+						)?.[1]
+					: command.match(/'@([^']+)'/)?.[1];
+				assert.ok(
+					promptPath,
+					"child command must reference the prompt artifact",
+				);
+				const prompt = readFileSync(promptPath, "utf8");
+				if (mode) assert.equal(prompt, "Caller fallback identity");
+				else assert.ok(prompt.startsWith("\n\nCaller fallback identity\n\n"));
+				await f.finish(child);
+			}));
+	}
+	it("launches a frontmatter-only named role without a caller systemPrompt", async () =>
+		withAdapterHost(async (f) => {
+			writeAgentFile(
+				f.projectAgentsDir,
+				"no-identity",
+				"auto-exit: true\nsystem-prompt: replace",
+				"",
+			);
+			const child = await f.launch({
+				name: "no-fallback",
+				agent: "no-identity",
+				task: "bounded",
+			});
+			assert.ok(child);
+			assert.doesNotMatch(f.commands[0], /--(?:append-)?system-prompt/);
+			const promptPath = f.commands[0].match(/'@([^']+)'/)?.[1];
+			assert.ok(promptPath);
+			assert.equal(
+				readFileSync(promptPath, "utf8"),
+				"\n\nComplete your task autonomously.\n\nbounded\n\nYour FINAL assistant message should summarize what you accomplished.",
+			);
+			await f.finish(child);
 		}));
 	it("shares persistent task state and the raw generation cursor with one watcher and one initial ledger row", async () =>
 		withAdapterHost(async (f) => {
@@ -2881,7 +2953,7 @@ describe("status.ts", () => {
 		const examplePath = fileURLToPath(
 			new URL("../config.json.example", import.meta.url),
 		);
-		const config = loadStatusConfig(examplePath);
+		const config = loadStatusConfig(examplePath, examplePath);
 
 		assert.deepEqual(config, {
 			enabled: true,
@@ -3387,12 +3459,44 @@ describe("shared subagent configuration path", () => {
 						persistent: { maxAgents: 1 },
 					}),
 				);
-				assert.deepEqual(loadModelConfig(), { agents: {} });
-				assert.equal(loadRoleConfig().bundled, true);
-				assert.equal(loadPaneConfig().mode, "grouped");
-				assert.equal(loadSupervisionConfig().forcePolling, false);
-				assert.equal(loadPersistentConfig().maxAgents, 3);
-				assert.equal(loadStatusConfig().enabled, true);
+				assert.deepEqual(loadModelConfig(dirname(getSubagentsConfigPath())), {
+					agents: {},
+				});
+				assert.equal(
+					loadRoleConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).bundled,
+					true,
+				);
+				assert.equal(
+					loadPaneConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).mode,
+					"grouped",
+				);
+				assert.equal(
+					loadSupervisionConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).forcePolling,
+					false,
+				);
+				assert.equal(
+					loadPersistentConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).maxAgents,
+					3,
+				);
+				assert.equal(
+					loadStatusConfig(
+						getSubagentsConfigPath(),
+						getSubagentsConfigExamplePath(),
+					).enabled,
+					true,
+				);
 			} finally {
 				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
 				if (previousDecoy == null) rmSync(decoyPath, { force: true });
@@ -3419,12 +3523,45 @@ describe("shared subagent configuration path", () => {
 						persistent: { maxAgents: 2 },
 					}),
 				);
-				assert.equal(loadModelConfig().default, "fake/default");
-				assert.equal(loadRoleConfig().bundled, false);
-				assert.equal(loadPaneConfig().mode, "tab");
-				assert.equal(loadSupervisionConfig().forcePolling, true);
-				assert.equal(loadPersistentConfig().maxAgents, 2);
-				assert.equal(loadStatusConfig().enabled, false);
+				assert.equal(
+					loadModelConfig(dirname(getSubagentsConfigPath())).default,
+					"fake/default",
+				);
+				assert.equal(
+					loadRoleConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).bundled,
+					false,
+				);
+				assert.equal(
+					loadPaneConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).mode,
+					"tab",
+				);
+				assert.equal(
+					loadSupervisionConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).forcePolling,
+					true,
+				);
+				assert.equal(
+					loadPersistentConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).maxAgents,
+					2,
+				);
+				assert.equal(
+					loadStatusConfig(
+						getSubagentsConfigPath(),
+						getSubagentsConfigExamplePath(),
+					).enabled,
+					false,
+				);
 			} finally {
 				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
 			}
@@ -3522,8 +3659,16 @@ describe("runtime reload configuration", () => {
 				async () => {
 					assert.equal(
 						await launchOperationsFromSurface(
-							new HerdrSurfaceProvider({ paneConfig: loadPaneConfig() }),
-							loadPaneConfig(),
+							new HerdrSurfaceProvider({
+								paneConfig: loadPaneConfig(
+									dirname(getSubagentsConfigPath()),
+									getSubagentsConfigExamplePath(),
+								),
+							}),
+							loadPaneConfig(
+								dirname(getSubagentsConfigPath()),
+								getSubagentsConfigExamplePath(),
+							),
 						).createPane("reload-config", "/repo"),
 						"pane-new",
 					);
@@ -3623,11 +3768,14 @@ describe("pane configuration", () => {
 					persistent: { maxAgents: 9 },
 				}),
 			);
-			assert.deepEqual(loadPaneConfig(config), {
-				mode: "grouped",
-				direction: "right",
-				maxPerTab: 2,
-			});
+			assert.deepEqual(
+				loadPaneConfig(dirname(config), getSubagentsConfigExamplePath()),
+				{
+					mode: "grouped",
+					direction: "right",
+					maxPerTab: 2,
+				},
+			);
 			for (const maxPerTab of [
 				0,
 				-1,
@@ -3639,7 +3787,8 @@ describe("pane configuration", () => {
 			]) {
 				writeFileSync(config, JSON.stringify({ panes: { maxPerTab } }));
 				assert.throws(
-					() => loadPaneConfig(config),
+					() =>
+						loadPaneConfig(dirname(config), getSubagentsConfigExamplePath()),
 					/panes.maxPerTab must be a positive safe integer/,
 				);
 			}
@@ -3675,7 +3824,7 @@ describe("pane configuration", () => {
 				JSON.stringify({ panes: { mode: "split", direction: "down" } }),
 			);
 
-			assert.deepEqual(loadPaneConfig(join(dir, "config.json"), examplePath), {
+			assert.deepEqual(loadPaneConfig(dir, examplePath), {
 				mode: "split",
 				maxPerTab: 4,
 				direction: "down",
@@ -3731,9 +3880,7 @@ describe("model configuration", () => {
 	});
 
 	it("loads no model overrides when config.json is absent", () => {
-		const config = loadModelConfig(
-			join(createTestDir(), "missing-config.json"),
-		);
+		const config = loadModelConfig(createTestDir());
 		assert.deepEqual(config, { agents: {} });
 	});
 
@@ -3894,16 +4041,25 @@ describe("model configuration", () => {
 				(candidate) => candidate === "fake/worker",
 			);
 			assert.equal(
-				loadModelConfig(configPath).tasks?.coding?.[0],
+				loadModelConfig(dirname(configPath)).tasks?.coding?.[0],
 				"fake/worker",
 			);
-			assert.equal(loadRoleConfig(configPath, examplePath).bundled, true);
-			assert.equal(loadPaneConfig(configPath, examplePath).mode, "grouped");
 			assert.equal(
-				loadSupervisionConfig(configPath, examplePath).forcePolling,
+				loadRoleConfig(dirname(configPath), examplePath).bundled,
+				true,
+			);
+			assert.equal(
+				loadPaneConfig(dirname(configPath), examplePath).mode,
+				"grouped",
+			);
+			assert.equal(
+				loadSupervisionConfig(dirname(configPath), examplePath).forcePolling,
 				false,
 			);
-			assert.equal(loadPersistentConfig(configPath, examplePath).maxAgents, 3);
+			assert.equal(
+				loadPersistentConfig(dirname(configPath), examplePath).maxAgents,
+				3,
+			);
 			assert.equal(loadStatusConfig(configPath, examplePath).enabled, true);
 		});
 	});
@@ -4095,10 +4251,9 @@ describe("persistent specialist configuration", () => {
 				examplePath,
 				JSON.stringify({ persistent: { maxAgents: 2 } }),
 			);
-			assert.deepEqual(
-				loadPersistentConfig(join(dir, "config.json"), examplePath),
-				{ maxAgents: 2 },
-			);
+			assert.deepEqual(loadPersistentConfig(dir, examplePath), {
+				maxAgents: 2,
+			});
 		});
 	});
 });
@@ -4138,10 +4293,10 @@ describe("supervision", () => {
 				example,
 				JSON.stringify({ supervision: { hangWarningMinutes: 20 } }),
 			);
-			assert.deepEqual(
-				loadSupervisionConfig(join(dir, "config.json"), example),
-				{ forcePolling: false, hangWarningMinutes: 20 },
-			);
+			assert.deepEqual(loadSupervisionConfig(dir, example), {
+				forcePolling: false,
+				hangWarningMinutes: 20,
+			});
 		});
 	});
 
@@ -4457,7 +4612,7 @@ describe("role configuration", () => {
 			const examplePath = join(dir, "config.json.example");
 			writeFileSync(examplePath, JSON.stringify({ roles: { bundled: false } }));
 
-			assert.deepEqual(loadRoleConfig(join(dir, "config.json"), examplePath), {
+			assert.deepEqual(loadRoleConfig(dir, examplePath), {
 				bundled: false,
 			});
 		});
@@ -4478,7 +4633,7 @@ describe("role configuration", () => {
 			writeFileSync(examplePath, JSON.stringify({ roles: { bundled: false } }));
 
 			assert.throws(
-				() => loadRoleConfig(configPath, examplePath),
+				() => loadRoleConfig(dirname(configPath), examplePath),
 				/roles\.bundled must be a boolean/,
 			);
 		});
@@ -5053,24 +5208,21 @@ describe("subagent discovery", () => {
 
 	it("buildSubagentToolAllowlist keeps explicit completion for interactive children", () => {
 		assert.equal(
-			testApi.buildSubagentToolAllowlist("read,bash,web_search"),
+			buildSubagentToolAllowlist("read,bash,web_search"),
 			"read,bash,web_search,caller_ping,subagent_done",
 		);
 	});
 
 	it("buildSubagentToolAllowlist omits explicit completion for auto-exit children", () => {
 		assert.equal(
-			testApi.buildSubagentToolAllowlist(
-				"read,bash,web_search,subagent_done",
-				true,
-			),
+			buildSubagentToolAllowlist("read,bash,web_search,subagent_done", true),
 			"read,bash,web_search,caller_ping",
 		);
 	});
 
 	it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-		assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-		assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+		assert.equal(buildSubagentToolAllowlist(undefined), null);
+		assert.equal(buildSubagentToolAllowlist(""), null);
 	});
 
 	it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
@@ -8810,6 +8962,132 @@ describe("subagent parent lifecycle", () => {
 	});
 });
 
+describe("Task15 unowned host activity", () => {
+	it("refreshes without a session/context, hydrates legacy rows and retains successful activity", () => {
+		// SAFETY: this fixture saves/restores the extension-owned runtime slot to exercise pre-initialization.
+		const root = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+		const previous = { session: root.session, latestCtx: root.latestCtx };
+		root.session = undefined;
+		root.latestCtx = undefined;
+		try {
+			withTempDir((dir) => {
+				const file = join(dir, "activity.json");
+				const recorder = createSubagentActivityRecorder({
+					runningChildId: "unowned",
+					activityFile: file,
+					now: () => 100,
+				});
+				recorder.sessionStart();
+				recorder.toolExecutionStart("tool", "bash");
+				// SAFETY: a seeded legacy presentation row intentionally has no lifecycle before ensureLifecycle.
+				const row: any = {
+					id: "unowned",
+					name: "legacy",
+					task: "",
+					surface: "none",
+					startTime: 1,
+					sessionFile: "must-not-read",
+					interactive: false,
+					runtimePlan: undefined,
+					activityFile: file,
+				};
+				hostModule.__test__.observeRunningSubagent(row, 200);
+				assert.equal(projectLifecycle(row.lifecycle, 200).kind, "active");
+				assert.equal(row.lifecycle.activityDetail.label, "bash");
+				assert.deepEqual(row.activityRead, { ok: true });
+				const successful = row.activity;
+				writeFileSync(file, "{");
+				hostModule.__test__.observeRunningSubagent(row, 300);
+				assert.equal(row.activity, successful);
+				assert.equal(row.activityRead.reason, "invalid");
+				assert.ok(row.activityRead.error);
+				row.activityFile = join(dir, "missing");
+				hostModule.__test__.observeRunningSubagent(row, 400);
+				assert.equal(row.activity, successful);
+				assert.deepEqual(row.activityRead, {
+					ok: false,
+					reason: "missing",
+					error: undefined,
+				});
+				assert.ok(Object.hasOwn(row.activityRead, "error"));
+				for (const [statusState, kind] of [
+					[
+						{
+							phase: "active",
+							activeScope: "tool",
+							activityLabel: "read",
+							lastActivityAtMs: 50,
+							lastActivitySequence: 7,
+						},
+						"active",
+					],
+					[{ phase: "done", lastActivityAtMs: 50 }, "waiting"],
+					[
+						{
+							phase: "active",
+							activityLabel: "interrupted",
+							localOverrideAtMs: 50,
+						},
+						"interrupted",
+					],
+				] as const) {
+					delete row.lifecycle;
+					row.statusState = statusState;
+					hostModule.__test__.observeRunningSubagent(row, 500);
+					assert.equal(projectLifecycle(row.lifecycle, 500).kind, kind);
+				}
+			});
+		} finally {
+			Object.assign(root, previous);
+		}
+	});
+
+	it("does not acquire unowned or retired rows in a real initialized session", () =>
+		withAdapterHost(async (f) => {
+			const file = join(f.projectDir, "unowned.json");
+			const recorder = createSubagentActivityRecorder({
+				runningChildId: "unowned",
+				activityFile: file,
+				now: () => 100,
+			});
+			recorder.sessionStart();
+			recorder.toolExecutionStart("tool", "bash");
+			const row = {
+				id: "unowned",
+				name: "unowned",
+				task: "",
+				surface: "none",
+				startTime: 1,
+				sessionFile: "must-not-read",
+				interactive: false,
+				runtimePlan: undefined,
+				lifecycle: createLifecycle(1),
+				activityFile: file,
+			};
+			const commands = f.commands.length;
+			const registrations = f.registrations();
+			hostModule.__test__.observeRunningSubagent(row, 200);
+			assert.equal(projectLifecycle(row.lifecycle, 200).kind, "active");
+			assert.equal(f.runtime.session.getControlTaskId(row.id), undefined);
+			assert.equal(f.runtime.session.getTask(row.id), undefined);
+			assert.equal(f.runtime.session.getHandle(row.id), undefined);
+			assert.equal(f.commands.length, commands);
+			assert.equal(f.registrations(), registrations);
+			const child = await f.launch({ name: "retired", task: "bounded" });
+			const control = f.runtime.session.getControlTaskId(child.id);
+			await f.finish(child);
+			assert.equal(f.runtime.session.getControlTaskId(child.id), undefined);
+			assert.equal(f.runtime.session.getRecord(control), undefined);
+			const afterCommands = f.commands.length;
+			const afterRegistrations = f.registrations();
+			hostModule.__test__.observeRunningSubagent(child, 500);
+			assert.equal(f.runtime.session.getControlTaskId(child.id), undefined);
+			assert.equal(f.runtime.session.getRecord(control), undefined);
+			assert.equal(f.commands.length, afterCommands);
+			assert.equal(f.registrations(), afterRegistrations);
+		}));
+});
+
 describe("subagent activity snapshots", () => {
 	function validActivity(overrides: any = {}) {
 		return {
@@ -8827,6 +9105,115 @@ describe("subagent activity snapshots", () => {
 			...overrides,
 		};
 	}
+
+	it("Task15 projects validated activity by reference, not as a parser", () => {
+		assert.deepEqual(projectActivity(undefined), {
+			ok: false,
+			reason: "missing",
+		});
+		const state = validActivity();
+		const read = projectActivity(state);
+		assert.ok(read.ok);
+		assert.equal(read.activity, state);
+	});
+
+	it("Task15 preserves exact file validation order and real read errors", () => {
+		withTempDir((dir) => {
+			const file = join(dir, "activity.json");
+			assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+				ok: false,
+				reason: "missing",
+			});
+			for (const [value, error] of [
+				[42, "activity must be an object"],
+				[
+					{ version: 2, runningChildId: "other" },
+					"unsupported activity version",
+				],
+				[
+					validActivity({ runningChildId: 42 }),
+					"runningChildId must be a string",
+				],
+				[
+					validActivity({ latestEvent: "invalid", phase: "invalid" }),
+					"unknown latestEvent",
+				],
+				[
+					validActivity({ phase: "invalid", activeScope: "invalid" }),
+					"unknown activity phase",
+				],
+				[
+					validActivity({ activeScope: "invalid", createdAt: "invalid" }),
+					"unknown activeScope",
+				],
+				[
+					validActivity({ createdAt: "invalid", updatedAt: "invalid" }),
+					"createdAt must be finite",
+				],
+				[
+					validActivity({ toolName: "bad\nname" }),
+					"toolName must not contain newlines",
+				],
+			] as const) {
+				writeFileSync(file, JSON.stringify(value));
+				assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+					ok: false,
+					reason: "invalid",
+					error,
+				});
+			}
+			writeFileSync(
+				file,
+				JSON.stringify(
+					validActivity({ runningChildId: "other", latestEvent: "invalid" }),
+				),
+			);
+			assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+				ok: false,
+				reason: "wrong-id",
+			});
+			const nullable = validActivity({
+				activeScope: null,
+				activeSince: null,
+				waitingSince: null,
+				turnIndex: null,
+				toolName: null,
+				toolCallId: null,
+				messageEventType: null,
+				toolStartedAt: null,
+				toolEndedAt: null,
+			});
+			writeFileSync(file, JSON.stringify(nullable));
+			assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+				ok: true,
+				activity: nullable,
+			});
+			writeFileSync(file, "{");
+			let parseError = "";
+			try {
+				JSON.parse("{");
+			} catch (error) {
+				parseError = error instanceof Error ? error.message : String(error);
+			}
+			assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+				ok: false,
+				reason: "invalid",
+				error: parseError,
+			});
+			let directoryError = "";
+			try {
+				readFileSync(dir, "utf8");
+			} catch (error) {
+				directoryError = error instanceof Error ? error.message : String(error);
+			}
+			assert.ok(directoryError);
+			assert.deepEqual(readSubagentActivityFile(dir, "child-1"), {
+				ok: false,
+				reason: "invalid",
+				error: directoryError,
+			});
+		});
+	});
 
 	it("writes and validates activity files by running child id", () => {
 		withTempDir((dir) => {
@@ -10794,7 +11181,7 @@ describe("subagent interruption", () => {
 			writeFileSync(join(dir, "tracked.txt"), "dirty\n");
 			writeFileSync(join(dir, "untracked.txt"), "new\n");
 
-			const handoff = subagentsModule.__test__.captureWorktreeHandoff({
+			const handoff = captureWorktreeHandoff({
 				path: dir,
 				workspaceId: "w9",
 				paneId: "w9:p1",
@@ -10830,7 +11217,7 @@ describe("subagent interruption", () => {
 				manifestFile: join(dir, "manifest.json"),
 			};
 			const testApi = subagentsModule.__test__;
-			const handoff = testApi.captureWorktreeHandoff(worktree);
+			const handoff = captureWorktreeHandoff(worktree);
 
 			assert.equal(handoff.headSha, null);
 			assert.equal(handoff.commitsAhead, null);
@@ -10857,10 +11244,16 @@ describe("subagent interruption", () => {
 		});
 	});
 
-	it("marks launch failures as failed while retaining explicit ownership", () => {
-		withTempDir((dir) => {
-			const testApi = subagentsModule.__test__;
-			const manifestFile = join(dir, "worktree-run.json");
+	it("marks launch failures as failed while retaining explicit ownership", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "worktree-launch-failure-"));
+		try {
+			const manifestFile = join(
+				dir,
+				"artifacts",
+				"parent",
+				"worktree-runs",
+				"run-1.json",
+			);
 			const worktree = {
 				path: join(dir, "retained-worktree"),
 				workspaceId: "w9",
@@ -10870,22 +11263,59 @@ describe("subagent interruption", () => {
 				baseSha: "1111111",
 				manifestFile,
 			};
-			testApi.writeWorktreeManifest(manifestFile, {
+			writeWorktreeManifest(manifestFile, {
 				state: "provisioning",
 				id: "run-1",
 			});
 
-			assert.throws(
-				() =>
-					testApi.runSubagentScript(
-						worktree.paneId,
-						"pi",
-						undefined,
-						worktree,
-						() => {
+			const effects = createWorktreeOperations();
+			effects.resolveGitCommit = () => worktree.baseSha;
+			effects.resolveWorktreeProvisionCwd = (cwd) => cwd;
+			await assert.rejects(
+				launchPiSubagent(
+					{
+						kind: "fresh",
+						id: "run-1",
+						name: "Worker",
+						task: "bounded",
+						worktree: { branch: worktree.branch },
+						parent: {
+							cwd: dir,
+							sessionFile: join(dir, "parent.jsonl"),
+							sessionId: "parent",
+							sessionDir: dir,
+							agentDir: dir,
+						},
+						runtimePlan: {
+							provider: "test",
+							modelId: "one",
+							model: "test/one",
+							thinking: "off",
+							modelSource: "request",
+							thinkingSource: "request",
+						},
+						behavior: {
+							deniedTools: [],
+							autoExit: true,
+							interactive: false,
+							sessionMode: "standalone",
+						},
+					},
+					{
+						worktree: effects,
+						createPane: () => {
+							throw new Error("unexpected ordinary pane");
+						},
+						createWorktree: () => worktree,
+						waitForShellReady: async () => {},
+						runScript: () => {
 							throw new Error("pane rejected command");
 						},
-					),
+						closePane: () => {
+							throw new Error("must retain worktree");
+						},
+					},
+				),
 				/worktree retained.*pane rejected command/i,
 			);
 
@@ -10896,7 +11326,9 @@ describe("subagent interruption", () => {
 			assert.equal(manifest.state, "failed");
 			assert.equal(manifest.path, worktree.path);
 			assert.match(manifest.gitError, /ENOENT|no such file/i);
-		});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("abbreviates large completion presentations while preserving their head, tail, and session path", () => {

@@ -1,9 +1,5 @@
 import { readFileSync } from "node:fs";
-import {
-	getSubagentsConfigExamplePath,
-	getSubagentsConfigPath,
-} from "./config-path.ts";
-import { isBoolean, isPlainObject } from "./type-guards.ts";
+import { isBoolean, isPlainObject } from "./config/type-guards.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
@@ -206,8 +202,8 @@ function readStatusConfigFile(
 }
 
 export function loadStatusConfig(
-	configPath = getSubagentsConfigPath(),
-	examplePath = getSubagentsConfigExamplePath(),
+	configPath: string,
+	examplePath: string,
 ): StatusConfig {
 	const { sourcePath, rawConfig } = readStatusConfigFile(
 		configPath,

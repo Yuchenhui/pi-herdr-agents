@@ -1,30 +1,13 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { getSubagentsConfigPath } from "./config-path.ts";
 import { isPlainObject, isString } from "./type-guards.ts";
 
-export const TASK_CATEGORIES = [
-	"coding",
-	"review",
-	"recon",
-	"qa",
-	"architecture",
-	"docs",
-] as const;
-export type TaskCategory = (typeof TASK_CATEGORIES)[number];
-export const TASK_CATEGORY_DESCRIPTIONS = {
-	coding: "Implementation workers",
-	review: "Code reviewers",
-	recon: "Reconnaissance scouts",
-	qa: "Software and test runners",
-	architecture: "Planning and diagnosis",
-	docs: "Documentation workers",
-} satisfies Record<TaskCategory, string>;
-export type TaskPreferences = Partial<Record<TaskCategory, string[]>>;
-export interface TaskPreferencesMeta {
-	generatedAt: string;
-	method: "research" | "registry-only";
-}
+import {
+	TASK_CATEGORIES,
+	type TaskCategory,
+	type TaskPreferences,
+	type TaskPreferencesMeta,
+} from "./task-model-types.ts";
 
 export interface ModelConfig {
 	default?: string;
@@ -203,9 +186,8 @@ export function resolveModelDefault(
 	return config.default;
 }
 
-export function loadModelConfig(
-	configPath = getSubagentsConfigPath(),
-): ModelConfig {
+export function loadModelConfig(configDir: string): ModelConfig {
+	const configPath = join(configDir, "config.json");
 	let raw: string;
 	try {
 		raw = readFileSync(configPath, "utf8");

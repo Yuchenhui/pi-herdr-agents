@@ -12,62 +12,18 @@ import {
 	isFiniteNumber,
 	isPlainObject,
 	isString,
-} from "./type-guards.ts";
-
-export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
-export type SubagentActivityScope =
-	| "agent"
-	| "turn"
-	| "provider"
-	| "streaming"
-	| "tool";
-
-export type SubagentActivityEvent =
-	| "session_start"
-	| "input"
-	| "before_agent_start"
-	| "agent_start"
-	| "agent_end"
-	| "turn_start"
-	| "turn_end"
-	| "before_provider_request"
-	| "after_provider_response"
-	| "message_update"
-	| "tool_execution_start"
-	| "tool_call"
-	| "tool_execution_update"
-	| "tool_result"
-	| "tool_execution_end"
-	| "caller_ping"
-	| "subagent_done"
-	| "session_shutdown";
-
-export interface SubagentActivityState {
-	version: 1;
-	runningChildId: string;
-	createdAt: number;
-	updatedAt: number;
-	sequence: number;
-	latestEvent: SubagentActivityEvent;
-	phase: SubagentActivityPhase;
-	agentActive: boolean;
-	turnActive: boolean;
-	providerActive: boolean;
-	toolActive: boolean;
-	activeScope?: SubagentActivityScope;
-	activeSince?: number;
-	waitingSince?: number;
-	turnIndex?: number;
-	messageEventType?: string;
-	toolCallId?: string;
-	toolName?: string;
-	toolStartedAt?: number;
-	toolEndedAt?: number;
-}
-
-export type ActivityReadResult =
-	| { ok: true; activity: SubagentActivityState }
-	| { ok: false; reason: "missing" | "invalid" | "wrong-id"; error?: string };
+} from "../../core/config/type-guards.ts";
+import {
+	isSubagentActivityScope,
+	projectActivity,
+} from "../../core/activity.ts";
+import type {
+	ActivityReadResult,
+	SubagentActivityEvent,
+	SubagentActivityPhase,
+	SubagentActivityScope,
+	SubagentActivityState,
+} from "../../core/types.ts";
 
 export type SubagentShutdownReason =
 	| "quit"
@@ -106,13 +62,6 @@ const KNOWN_PHASES = new Set<SubagentActivityPhase>([
 	"waiting",
 	"done",
 ]);
-const KNOWN_SCOPES = new Set<SubagentActivityScope>([
-	"agent",
-	"turn",
-	"provider",
-	"streaming",
-	"tool",
-]);
 const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
 	"session_start",
 	"input",
@@ -140,12 +89,6 @@ export function getSubagentActivityFile(
 	runningChildId: string,
 ): string {
 	return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
-}
-
-export function isSubagentActivityScope(
-	value: any,
-): value is SubagentActivityScope {
-	return isString(value) && KNOWN_SCOPES.has(value);
 }
 
 function requireObject(value: any) {
@@ -225,7 +168,7 @@ function validateActivity(
 	}
 	if (
 		object.activeScope != null &&
-		(!isString(object.activeScope) || !KNOWN_SCOPES.has(object.activeScope))
+		!isSubagentActivityScope(object.activeScope)
 	) {
 		return invalidActivity("unknown activeScope");
 	}
@@ -249,14 +192,14 @@ function validateActivity(
 	].find((error) => error != null);
 	if (validationError) return invalidActivity(validationError);
 
-	return { ok: true, activity: object };
+	return projectActivity(object);
 }
 
 export function readSubagentActivityFile(
 	activityFile: string,
 	expectedRunningChildId: string,
 ): ActivityReadResult {
-	if (!existsSync(activityFile)) return { ok: false, reason: "missing" };
+	if (!existsSync(activityFile)) return projectActivity(undefined);
 
 	let parsed: unknown;
 	try {

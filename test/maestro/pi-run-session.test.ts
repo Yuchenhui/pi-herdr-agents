@@ -7,9 +7,16 @@ import {
 	writeFileSync,
 	rmSync,
 	existsSync,
+	readFileSync,
+	readdirSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
+import {
+	createWorktreeOperations,
+	readWorktreeManifest,
+} from "../../maestro/runtime/worktree-operations.ts";
 import * as runtime from "../../maestro/runtime/index.ts";
 import type {
 	DefaultRunSessionOptions,
@@ -19,15 +26,112 @@ import type {
 } from "../../maestro/runtime/pi-run-session.ts";
 import { FakeSurfaceProvider } from "../../maestro/surfaces/fake/fake-surface-provider.ts";
 import { launchOperationsFromSurface } from "../../maestro/adapters/pi/launch.ts";
+import { discoverAgentCatalog } from "../../maestro/core/roles/discovery.ts";
 import {
 	appendPersistentTaskEvent,
 	readPersistentDeliveryLedger,
 	getNewEntries,
 	writeSubagentSessionPolicy,
 } from "../../maestro/adapters/pi/session.ts";
-import { markDelivery } from "../../pi-extension/subagents/lifecycle.ts";
-import { FileWakeRegistry } from "../../pi-extension/subagents/wake.ts";
-import { SupervisionCoordinator } from "../../pi-extension/subagents/supervision.ts";
+import {
+	createLifecycle,
+	markCompleted,
+	markCompletionDetected,
+	markDelivery,
+	markInterruptRequested,
+} from "../../maestro/core/lifecycle.ts";
+import { createSubagentActivityRecorder } from "../../maestro/adapters/pi/activity-file.ts";
+import { FileWakeRegistry } from "../../maestro/core/wake.ts";
+import { SupervisionCoordinator } from "../../maestro/core/supervision.ts";
+
+test("Task15 detached activity observation works before any factory and retains lifecycle rules", () => {
+	const dir = mkdtempSync(join(tmpdir(), "detached-activity-"));
+	try {
+		const file = join(dir, "activity.json");
+		const recorder = createSubagentActivityRecorder({
+			runningChildId: "detached",
+			activityFile: file,
+			now: () => 100,
+		});
+		recorder.sessionStart();
+		recorder.toolExecutionStart("tool", "bash");
+		const initial = createLifecycle(0);
+		const before = structuredClone(initial);
+		const observed = runtime.observePiActivity(
+			{ id: "detached", activityFile: file, lifecycle: initial },
+			200,
+		);
+		assert.deepEqual(initial, before);
+		assert.equal(observed.kind, "refresh");
+		assert.equal(observed.observedAt, 200);
+		assert.equal(observed.projection.kind, "active");
+		assert.equal(observed.projection.label, "bash");
+		assert.ok(observed.activityRead.ok);
+		assert.equal(observed.activity, observed.activityRead.activity);
+		const interrupted = markInterruptRequested(observed.lifecycle, 300);
+		assert.equal(
+			runtime.observePiActivity(
+				{ id: "detached", activityFile: file, lifecycle: interrupted },
+				400,
+			).lifecycle,
+			interrupted,
+		);
+		const completed = markCompleted(
+			markCompletionDetected(
+				observed.lifecycle,
+				{ reason: "done", exitCode: 0 },
+				300,
+			),
+			300,
+		);
+		assert.equal(
+			runtime.observePiActivity(
+				{ id: "detached", activityFile: file, lifecycle: completed },
+				400,
+			).lifecycle,
+			completed,
+		);
+		const suppressed = markDelivery(observed.lifecycle, "suppressed");
+		const afterSuppression = runtime.observePiActivity(
+			{ id: "detached", activityFile: file, lifecycle: suppressed },
+			400,
+		);
+		assert.equal(afterSuppression.lifecycle.delivery, "suppressed");
+		const wrong = runtime.observePiActivity(
+			{ id: "other", activityFile: file, lifecycle: initial },
+			200,
+		);
+		assert.deepEqual(wrong.activityRead, { ok: false, reason: "wrong-id" });
+		assert.deepEqual(wrong.lifecycle.activityHealth, {
+			kind: "problem",
+			reason: "wrong-id",
+			since: 200,
+		});
+		for (const activityFile of [undefined, "", join(dir, "missing")]) {
+			const missing = runtime.observePiActivity(
+				{ id: "detached", activityFile, lifecycle: initial },
+				200,
+			);
+			assert.deepEqual(missing.activityRead, { ok: false, reason: "missing" });
+			assert.equal(missing.activity, undefined);
+			assert.equal(missing.lifecycle.activityHealth.kind, "problem");
+		}
+		writeFileSync(file, "{");
+		const invalid = runtime.observePiActivity(
+			{ id: "detached", activityFile: file, lifecycle: initial },
+			200,
+		);
+		assert.ok(
+			!invalid.activityRead.ok &&
+				invalid.activityRead.reason === "invalid" &&
+				invalid.activityRead.error,
+		);
+		assert.equal(invalid.lifecycle.activityHealth.kind, "problem");
+		assert.deepEqual(initial, before);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 async function fixture(
@@ -85,6 +189,8 @@ async function makeFixture() {
 	let latest: PiRunRecord | undefined;
 	const options: DefaultRunSessionOptions = {
 		configDir: dir,
+		configExamplePath: new URL("../../config.json.example", import.meta.url)
+			.pathname,
 		infrastructure: {
 			surfaceProvider: provider,
 			launchOperations: operations,
@@ -107,6 +213,14 @@ async function makeFixture() {
 				find: (p, id) => ({ provider: p, id, reasoning: true }),
 				available: () => [],
 				hasConfiguredAuth: () => true,
+				supportedThinkingLevels: () => [
+					"off",
+					"minimal",
+					"low",
+					"medium",
+					"high",
+				],
+				clampThinkingLevel: (_model, level) => level,
 			},
 		}),
 		hooks: {
@@ -203,6 +317,246 @@ async function makeFixture() {
 		registrations: () => registrations,
 	};
 }
+
+test("Task17 discovered Role defaults reach the actual runtime launch without synthetic host roles", () =>
+	fixture(async (f) => {
+		const agents = join(f.dir, "agents");
+		mkdirSync(agents);
+		writeFileSync(
+			join(agents, "core-worker.md"),
+			"---\nname: core-worker\ndescription: Core role\nmodel: test/role-default\nthinking: low\nauto-exit: true\nspawning: false\ndeny-tools: write\nskills: first,second\nsystem-prompt: replace\n---\nCore role identity",
+		);
+		const definition = discoverAgentCatalog({
+			bundledAgentsDir: join(f.dir, "no-bundled"),
+			agentConfigDir: f.dir,
+			cwd: f.dir,
+			roleConfig: { bundled: false },
+		}).agents[0];
+		f.options.roles.push(definition.role);
+		const session = runtime.createDefaultRunSession(f.options, f.session);
+		const handle = await session.spawn({
+			id: "core-role",
+			name: "core-worker",
+			prompt: "bounded task",
+			role: definition.name,
+			cwd: f.dir,
+		});
+		const started = session.getStarted("core-role")!;
+		assert.equal(started.model, "test/role-default");
+		assert.equal(started.thinking, "low");
+		assert.equal(started.runtimePlan?.modelSource, "agent");
+		const record = session.getRecord("core-role")!;
+		assert.equal(record.interactive, false);
+		const script = f.commands[0];
+		assert.match(script, /PI_SUBAGENT_AUTO_EXIT=1/);
+		assert.match(script, /PI_DENY_TOOLS=.*write/);
+		assert.match(script, /\/skill:first/);
+		assert.match(script, /\/skill:second/);
+		const promptPath = script.match(/--system-prompt '([^']+)'/)?.[1];
+		assert.ok(promptPath);
+		assert.equal(readFileSync(promptPath, "utf8"), "Core role identity");
+		f.complete(record);
+		assert.equal(
+			(await session.supervise(handle, session.getTask("core-role")!)).outcome,
+			"completed",
+		);
+	}));
+
+function initializeWorktreeFixture(dir: string) {
+	const git = (args: string[]) =>
+		execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+	git(["init", "-q", "-b", "main"]);
+	git([
+		"-c",
+		"user.name=Test",
+		"-c",
+		"user.email=test@example.invalid",
+		"-c",
+		"commit.gpgsign=false",
+		"commit",
+		"--allow-empty",
+		"-qm",
+		"base",
+	]);
+	return git;
+}
+
+for (const mode of ["success", "focus-warning", "readiness-failure"] as const) {
+	test(`runtime handoff executes the unobserved transaction: ${mode}`, () =>
+		fixture(async (f) => {
+			const git = initializeWorktreeFixture(f.dir);
+			const snapshot = f.options.getLaunchSnapshot();
+			const source = snapshot.parent.sessionFile;
+			const bytes = `${JSON.stringify({ type: "session", version: 3, id: "parent", cwd: f.dir })}\n${JSON.stringify({ type: "message", id: "leaf", parentId: null, message: { role: "user", content: [{ type: "text", text: "active branch" }], timestamp: 1 } })}\n`;
+			writeFileSync(source, bytes);
+			const path = join(f.dir, "handoff-tree");
+			let focused = false;
+			let entered!: () => void, release!: () => void;
+			const readyEntered = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const readyRelease = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let manifestFile = "";
+			f.operations.createWorktree = (_name, _cwd, branch, base) => {
+				const manifests = join(
+					snapshot.parent.sessionDir,
+					"artifacts",
+					"parent",
+					"worktree-runs",
+				);
+				const manifest = readdirSync(manifests)[0];
+				manifestFile = join(manifests, manifest);
+				assert.equal(readWorktreeManifest(manifestFile)?.state, "provisioning");
+				git(["worktree", "add", "-q", "-b", branch, path, base]);
+				return { path, branch, workspaceId: "workspace", paneId: "pane" };
+			};
+			f.operations.waitForPiReady = async (_pane, sessionFile, cwd) => {
+				assert.equal(cwd, path);
+				assert.ok(existsSync(sessionFile));
+				assert.equal(readWorktreeManifest(manifestFile)?.state, "provisioned");
+				entered();
+				await readyRelease;
+				if (mode === "readiness-failure")
+					throw new Error("expected Pi not observed");
+			};
+			f.operations.focusWorkspace = () => {
+				assert.equal(readWorktreeManifest(manifestFile)?.state, "running");
+				focused = true;
+				if (mode === "focus-warning") throw new Error("focus unavailable");
+			};
+			const handoff = f.session.handoffWorktree({
+				name: "handoff",
+				task: "continue",
+				branch: "handoff",
+				leafId: "leaf",
+				snapshot,
+				runtimePlan: f.input().plans[0],
+			});
+			const observed = handoff.then(
+				(value) => ({ value }),
+				(error: Error) => ({ error }),
+			);
+			try {
+				await Promise.race([
+					readyEntered,
+					observed.then((result) => {
+						throw new Error(
+							`handoff ended before readiness: ${JSON.stringify(result)}`,
+						);
+					}),
+				]);
+				await turn();
+				assert.equal(focused, false);
+				assert.equal(f.registrations(), 0);
+				assert.equal(f.latest(), undefined);
+				assert.equal(f.session.getControlTaskId("handoff"), undefined);
+				assert.equal(f.session.diagnostics().watcherCount, 0);
+			} finally {
+				release();
+			}
+			const result = await observed;
+			assert.equal(readFileSync(source, "utf8"), bytes);
+			assert.equal(f.registrations(), 0);
+			assert.equal(f.settled.length, 0);
+			const command = f.commands[0];
+			assert.ok(
+				!command.includes("PI_SUBAGENT_") &&
+					!command.includes("subagent-done.ts") &&
+					!command.includes("__SUBAGENT_DONE_"),
+			);
+			if ("error" in result) {
+				assert.equal(mode, "readiness-failure");
+				assert.match(
+					result.error.message,
+					/worktree retained.*expected Pi not observed/,
+				);
+				assert.equal(readWorktreeManifest(manifestFile)?.state, "failed");
+				assert.equal(focused, false);
+			} else {
+				assert.equal(result.value.record.worktree?.sourceSessionFile, source);
+				assert.equal(result.value.record.worktree?.branch, "handoff");
+				assert.equal(result.value.record.interactive, true);
+				assert.equal(
+					result.value.focusError,
+					mode === "focus-warning" ? "focus unavailable" : undefined,
+				);
+				assert.equal(readWorktreeManifest(manifestFile)?.state, "running");
+			}
+		}));
+}
+
+test("injected worktree finalization precedes delivery and preserves inspection/manifest failures", () =>
+	fixture(async (f) => {
+		initializeWorktreeFixture(f.dir);
+		const calls: string[] = [];
+		const worktreeOps = createWorktreeOperations();
+		const write = worktreeOps.persistWorktreeResult;
+		worktreeOps.captureWorktreeHandoff = (worktree) => {
+			calls.push("capture");
+			return {
+				...worktree,
+				headSha: null,
+				commitsAhead: null,
+				clean: null,
+				conflicted: null,
+				changedFiles: null,
+				untrackedFiles: null,
+				gitError: "inspection unavailable",
+			};
+		};
+		worktreeOps.persistWorktreeResult = (worktree, state, handoff) => {
+			if (state !== "running") {
+				calls.push(`finalize:${state}`);
+				throw new Error("write unavailable");
+			}
+			write(worktree, state, handoff);
+		};
+		f.options.infrastructure!.worktreeOperations = worktreeOps;
+		const session = runtime.createDefaultRunSession(f.options);
+		f.operations.createWorktree = (_name, _cwd, branch) => ({
+			path: f.dir,
+			branch,
+			workspaceId: "workspace",
+			paneId: "pane",
+		});
+		const input = f.input();
+		input.task.worktree = { branch: "managed" };
+		f.options.hooks.onSettled = (_record, result) => {
+			calls.push("delivery");
+			assert.deepEqual(calls, [
+				"capture",
+				"capture",
+				"finalize:ready_for_review",
+				"delivery",
+			]);
+			assert.equal(result.worktree?.clean, null);
+			assert.match(
+				result.worktree!.gitError!,
+				/inspection unavailable; Manifest update failed: write unavailable/,
+			);
+		};
+		// The fake surface must exist for the unchanged completion producer.
+		const pane = f.provider.createSurface({ name: "worktree", cwd: f.dir });
+		f.operations.createWorktree = (_name, _cwd, branch) => ({
+			path: f.dir,
+			branch,
+			workspaceId: "workspace",
+			paneId: pane,
+		});
+		try {
+			const handle = await session.spawnPi(input);
+			const record = session.getRecord(input.task.id)!;
+			const wait = session.supervise(handle, input.task);
+			f.complete(record);
+			await wait;
+			assert.equal(calls.at(-1), "delivery");
+			assert.equal(f.provider.listSurfaces().length, 1);
+		} finally {
+			await session.shutdown("quit");
+		}
+	}));
 
 test("Pi composition consumes real launch metadata, retires live getters and rejects consumed IDs", () =>
 	fixture(async (f) => {

@@ -10,6 +10,7 @@ import type {
 	SurfaceHandle,
 	SubagentLifecycle,
 	RunResult,
+	ActivityReadResult,
 } from "../core/types.ts";
 import type {
 	SurfaceProvider,
@@ -19,10 +20,20 @@ import { shellQuote } from "../core/shell.ts";
 import { PiHarnessAdapter } from "../adapters/pi/pi-harness-adapter.ts";
 import {
 	launchOperationsFromSurface,
-	captureWorktreeHandoff,
-	persistWorktreeResult,
+	launchPiWorktreeHandoff,
 	type PiLaunchOperations,
 } from "../adapters/pi/launch.ts";
+import {
+	createWorktreeOperations,
+	createWorktreeCleanupOperations,
+} from "./worktree-operations.ts";
+import {
+	worktreeResultState,
+	type WorktreeOperations,
+	type WorktreeLaunch,
+	type WorktreeHandoff,
+} from "../core/worktree.ts";
+import type { WorktreeCleanupOperations } from "../core/worktree-cleanup.ts";
 import {
 	appendPersistentDeliveryLedger,
 	readPersistentDeliveryLedger,
@@ -35,7 +46,8 @@ import {
 	createBtwSessionSnapshot,
 } from "../adapters/pi/session.ts";
 import { HerdrSurfaceProvider } from "../surfaces/herdr/herdr-surface-provider.ts";
-import { readSubagentActivityFile } from "../../pi-extension/subagents/activity.ts";
+import { readSubagentActivityFile } from "../adapters/pi/activity-file.ts";
+import { projectActivity } from "../core/activity.ts";
 import {
 	markCompletionDetected,
 	markCompleted,
@@ -43,9 +55,9 @@ import {
 	markDelivery,
 	observeActivity,
 	projectLifecycle,
-} from "../../pi-extension/subagents/lifecycle.ts";
-import { FileWakeRegistry } from "../../pi-extension/subagents/wake.ts";
-import { SupervisionCoordinator } from "../../pi-extension/subagents/supervision.ts";
+} from "../core/lifecycle.ts";
+import { FileWakeRegistry } from "../core/wake.ts";
+import { SupervisionCoordinator } from "../core/supervision.ts";
 import {
 	isThinkingLevel,
 	resolveRuntimePlan,
@@ -53,11 +65,8 @@ import {
 	type ParentRuntime,
 	type ResolvedRuntimePlan,
 	type ModelRegistryAdapter,
-} from "../../pi-extension/subagents/runtime-routing.ts";
-import {
-	loadPaneConfig,
-	type PaneConfig,
-} from "../../pi-extension/subagents/pane-config.ts";
+} from "../core/routing.ts";
+import { loadPaneConfig, type PaneConfig } from "../core/config/pane-config.ts";
 import {
 	createRunSession,
 	type RunSession,
@@ -66,6 +75,25 @@ import {
 	type OwnedRunAttempt,
 	type PreparedRun,
 } from "./run-session.ts";
+
+// pi-herdr-agents extension; no owning session required
+export function observePiActivity(
+	input: { id: string; activityFile?: string; lifecycle: SubagentLifecycle },
+	observedAt: number,
+): RunObservation & { activityRead: ActivityReadResult } {
+	const read = input.activityFile
+		? readSubagentActivityFile(input.activityFile, input.id)
+		: projectActivity(undefined);
+	const lifecycle = observeActivity(input.lifecycle, read, observedAt);
+	return {
+		kind: "refresh",
+		observedAt,
+		lifecycle,
+		projection: projectLifecycle(lifecycle, observedAt),
+		activity: read.ok ? read.activity : undefined,
+		activityRead: read,
+	};
+}
 
 // pi-herdr-agents extension
 export interface PiLaunchSnapshot {
@@ -123,31 +151,14 @@ export interface PiResumeInput {
 }
 
 // pi-herdr-agents extension
-export interface PiWorktreeLaunch extends WorktreeHandoffBase {
-	workspaceId: string;
-	paneId: string;
-}
+export type PiWorktreeLaunch = WorktreeLaunch;
 // pi-herdr-agents extension
-export interface WorktreeHandoffBase {
-	path: string;
-	branch: string;
-	baseRef: string;
-	baseSha: string;
-	manifestFile: string;
-	sessionFile?: string;
-	sourceSessionFile?: string;
-	handoffMessage?: string;
-}
+export type WorktreeHandoffBase = Omit<
+	WorktreeLaunch,
+	"workspaceId" | "paneId"
+>;
 // pi-herdr-agents extension
-export interface PiWorktreeHandoff extends PiWorktreeLaunch {
-	headSha: string | null;
-	commitsAhead: number | null;
-	clean: boolean | null;
-	conflicted: boolean | null;
-	changedFiles: string[] | null;
-	untrackedFiles: string[] | null;
-	gitError?: string;
-}
+export type PiWorktreeHandoff = WorktreeHandoff;
 
 /** Structural view of the adapter's actual mutable child, not a copied registry row. */
 // pi-herdr-agents extension
@@ -255,6 +266,7 @@ export type PiStopAcknowledgement =
 export interface PiPersistentIO {
 	/** Raw events only; cursor indexes this array before generation filtering. */
 	readEvents(record: PiRunRecord): PiPersistentEvent[];
+	inspectWorktree(record: PiRunRecord): PiWorktreeHandoff | undefined;
 	/** Explicit lazy read, once per drain with eligible post-cursor events. */
 	readLedger(record: PiRunRecord): PiLedgerEntry[];
 	/** Transcript read only for an undelivered task-done, never help/quiet wakes. */
@@ -329,6 +341,7 @@ export interface PiRunSessionHooks {
 export interface PiRunSessionInfrastructure {
 	surfaceProvider: SurfaceProvider;
 	launchOperations: PiLaunchOperations;
+	worktreeOperations?: WorktreeOperations;
 	supervision: SupervisionCoordinator;
 }
 // pi-herdr-agents extension
@@ -336,6 +349,7 @@ export interface DefaultRunSessionOptions {
 	/** Test injection consumes the actual Stage 3 seams, not replacement launch logic. */
 	infrastructure?: PiRunSessionInfrastructure;
 	configDir: string;
+	configExamplePath: string;
 	/** Synchronous fresh snapshot, captured once at each launch/resume call. */
 	getLaunchSnapshot(): PiLaunchSnapshot;
 	roles: Role[];
@@ -344,7 +358,25 @@ export interface DefaultRunSessionOptions {
 	forcePolling: boolean;
 }
 // pi-herdr-agents extension
+export interface PiWorktreeHandoffInput {
+	name: string;
+	task: string;
+	branch: string;
+	leafId: string;
+	snapshot: PiLaunchSnapshot;
+	runtimePlan: ResolvedRuntimePlan;
+}
+
+// pi-herdr-agents extension
 export interface PiRunSession extends RunSession {
+	handoffWorktree(
+		input: PiWorktreeHandoffInput,
+	): Promise<{ record: PiRunRecord; focusError?: string }>;
+	createWorktreeCleanupOperations(input: {
+		manifestDir: string;
+		liveHolders: () => { path: string; persistent?: boolean }[];
+		managedRoot?: string;
+	}): WorktreeCleanupOperations;
 	spawnPi(input: PiLaunchInput): Promise<AgentHandle>;
 	resumePi(input: PiResumeInput): Promise<AgentHandle>;
 	/** Live-run metadata queries; all undefined after terminal retirement. */
@@ -398,6 +430,7 @@ interface PiSessionOwner {
 		PiRunSessionInfrastructure,
 		"surfaceProvider" | "supervision"
 	>;
+	worktreeOperations: WorktreeOperations;
 	btw?: PiBtwMetadata;
 }
 
@@ -457,7 +490,8 @@ export function createDefaultRunSession(
 			options.infrastructure?.surfaceProvider ??
 			new HerdrSurfaceProvider({
 				paneConfig: loadPaneConfig(
-					join(options.configDir, "herdr-agents", "config.json"),
+					join(options.configDir, "herdr-agents"),
+					options.configExamplePath,
 				),
 			});
 		const wake = options.infrastructure ? undefined : new FileWakeRegistry();
@@ -637,6 +671,10 @@ export function createDefaultRunSession(
 			roles,
 			pending,
 			resumePi,
+			worktreeOperations:
+				options.infrastructure?.worktreeOperations ??
+				options.infrastructure?.launchOperations.worktree ??
+				createWorktreeOperations(),
 		};
 	}
 	// Replacements must invoke the original kernel's invocation closure, which
@@ -686,6 +724,16 @@ export function createDefaultRunSession(
 		}
 		state.options.hooks.onObserved?.(child, observation);
 	}
+	function launchOperations(snapshot: PiLaunchSnapshot): PiLaunchOperations {
+		return {
+			...(state.options.infrastructure?.launchOperations ??
+				launchOperationsFromSurface(
+					new HerdrSurfaceProvider({ paneConfig: snapshot.paneConfig }),
+					snapshot.paneConfig,
+				)),
+			worktree: state.worktreeOperations,
+		};
+	}
 	function adapter(snapshot: PiLaunchSnapshot): PiHarnessAdapter {
 		return new PiHarnessAdapter({
 			surface: state.infrastructure.surfaceProvider,
@@ -694,12 +742,7 @@ export function createDefaultRunSession(
 			parent: snapshot.parent,
 			parentRuntime: snapshot.parentRuntime,
 			supervision: state.infrastructure.supervision,
-			operations:
-				state.options.infrastructure?.launchOperations ??
-				launchOperationsFromSurface(
-					new HerdrSurfaceProvider({ paneConfig: snapshot.paneConfig }),
-					snapshot.paneConfig,
-				),
+			operations: launchOperations(snapshot),
 			onObservation(child, kind) {
 				const at = Date.now();
 				// Local evidence only drains events. Tick/refresh still hydrate fresh
@@ -826,15 +869,13 @@ export function createDefaultRunSession(
 						: `Subagent error: ${result.error}`;
 				let worktree: PiWorktreeHandoff | undefined;
 				if (child.worktree) {
-					worktree = captureWorktreeHandoff(child.worktree);
+					worktree = state.worktreeOperations.captureWorktreeHandoff(
+						child.worktree,
+					);
 					try {
-						persistWorktreeResult(
+						state.worktreeOperations.persistWorktreeResult(
 							child.worktree,
-							evidence?.ping
-								? "needs_help"
-								: exitCode === 0
-									? "ready_for_review"
-									: "failed",
+							worktreeResultState(exitCode, !!evidence?.ping),
 							worktree,
 						);
 					} catch (error) {
@@ -986,6 +1027,10 @@ export function createDefaultRunSession(
 		};
 	}
 	const io: PiPersistentIO = {
+		inspectWorktree: (r) =>
+			r.worktree
+				? state.worktreeOperations.captureWorktreeHandoff(r.worktree)
+				: undefined,
 		readEvents: (r) => readPersistentTaskEvents(r.sessionFile),
 		readLedger: (r) => readPersistentDeliveryLedger(r.sessionFile),
 		readTaskSummary: (r) =>
@@ -1045,6 +1090,36 @@ export function createDefaultRunSession(
 	}
 	const facade: PiRunSession = {
 		...state.kernel,
+		async handoffWorktree(input) {
+			// This is a long-lived interactive handoff, deliberately outside the
+			// watched kernel: no task reservation, acquire, producer or watcher.
+			const snapshot = input.snapshot;
+			const result = await launchPiWorktreeHandoff(
+				{
+					kind: "fresh",
+					name: input.name,
+					task: input.task,
+					cwd: snapshot.parent.cwd,
+					worktree: { branch: input.branch },
+					handoff: { leafId: input.leafId },
+					parent: { ...snapshot.parent },
+					runtimePlan: input.runtimePlan,
+					behavior: {
+						deniedTools: [],
+						autoExit: false,
+						interactive: true,
+						sessionMode: "standalone",
+					},
+				},
+				launchOperations(snapshot),
+			);
+			return { record: result.running, focusError: result.focusError };
+		},
+		createWorktreeCleanupOperations: (input) =>
+			createWorktreeCleanupOperations(
+				state.infrastructure.surfaceProvider,
+				input,
+			),
 		async spawnPi(input) {
 			try {
 				return await state.kernel.spawn(input.task, prepare(input));

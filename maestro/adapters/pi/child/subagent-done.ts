@@ -13,8 +13,8 @@ import {
 	readPersistentDeliveryLedger,
 	readPersistentTaskEvents,
 } from "../session.ts";
-import { createSubagentActivityRecorder } from "../../../../pi-extension/subagents/activity.ts";
-import { isString } from "../../../../pi-extension/subagents/type-guards.ts";
+import { createSubagentActivityRecorder } from "../activity-file.ts";
+import { isString } from "../../../core/config/type-guards.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
 	return agentStarted;

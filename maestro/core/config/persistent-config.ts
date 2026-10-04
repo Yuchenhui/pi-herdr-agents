@@ -1,8 +1,5 @@
 import { readFileSync } from "node:fs";
-import {
-	getSubagentsConfigExamplePath,
-	getSubagentsConfigPath,
-} from "./config-path.ts";
+import { join } from "node:path";
 import { isFiniteNumber, isRecord } from "./type-guards.ts";
 
 export const DEFAULT_MAX_PERSISTENT_AGENTS = 3;
@@ -91,9 +88,10 @@ function readPersistentConfigFile(
 }
 
 export function loadPersistentConfig(
-	configPath = getSubagentsConfigPath(),
-	examplePath = getSubagentsConfigExamplePath(),
+	configDir: string,
+	examplePath: string,
 ): PersistentConfig {
+	const configPath = join(configDir, "config.json");
 	const { sourcePath, rawConfig } = readPersistentConfigFile(
 		configPath,
 		examplePath,

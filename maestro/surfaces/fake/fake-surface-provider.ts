@@ -84,7 +84,7 @@ export class FakeSurfaceProvider implements SurfaceProvider {
 		this.removeSurface(surfaceId);
 	}
 
-	listSurfaces(): SurfaceInfo[] {
+	listSurfaces(_opts?: { timeoutMs?: number }): SurfaceInfo[] {
 		return Array.from(
 			this.#surfaces.values(),
 			({ id, name, cwd, group, workspaceId }) => {
@@ -134,7 +134,10 @@ export class FakeSurfaceProvider implements SurfaceProvider {
 		return worktree;
 	}
 
-	removeWorktreeSurface(workspaceId: string): void {
+	removeWorktreeSurface(
+		workspaceId: string,
+		_opts?: { timeoutMs?: number },
+	): void {
 		const worktree = this.#worktrees.get(workspaceId);
 		if (!worktree) return;
 		this.#worktrees.delete(workspaceId);
@@ -184,7 +187,10 @@ export class FakeSurfaceProvider implements SurfaceProvider {
 		this.#surface(surfaceId).keys.push(keys);
 	}
 
-	getProcessInfo(surfaceId: string): SurfaceProcessInfo {
+	getProcessInfo(
+		surfaceId: string,
+		_opts?: { timeoutMs?: number },
+	): SurfaceProcessInfo {
 		const processInfo = this.#surface(surfaceId).processInfo;
 		return {
 			shellPid: processInfo.shellPid,

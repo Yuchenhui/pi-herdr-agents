@@ -25,7 +25,7 @@ import {
 	POLLING_INTERVAL_MS,
 	RECONCILE_INTERVAL_MS,
 	SupervisionCoordinator,
-} from "../../pi-extension/subagents/supervision.ts";
+} from "../../maestro/core/supervision.ts";
 import {
 	appendPersistentTaskEvent,
 	readPersistentTaskEvents,

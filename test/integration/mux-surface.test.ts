@@ -39,7 +39,7 @@ import {
 import {
 	createSubagentPaneFactory,
 	parsePaneConfig,
-} from "../../pi-extension/subagents/pane-config.ts";
+} from "../../maestro/core/config/pane-config.ts";
 
 const backends = getAvailableBackends();
 

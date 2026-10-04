@@ -1,129 +1,30 @@
-import type { ActivityReadResult, SubagentActivityScope } from "./activity.ts";
-import type { CompletionResult } from "../../maestro/adapters/pi/completion.ts";
+import type {
+	ActivityReadResult,
+	CompletionResult,
+	ActivityDetail,
+	ActivityHealth,
+	CompletionDelivery,
+	LifecycleProjection,
+	PaneInspection,
+	PaneObservation,
+	ProcessState,
+	SubagentLifecycle,
+	TurnState,
+} from "./types.ts";
 
-export type HerdrAgentStatus =
-	| "idle"
-	| "working"
-	| "blocked"
-	| "done"
-	| "unknown";
-
-export type PaneInspection =
-	| {
-			kind: "present";
-			agent?: string;
-			agentStatus: HerdrAgentStatus;
-			observedAt: number;
-	  }
-	| { kind: "missing"; error?: string }
-	| { kind: "unavailable"; error?: string };
-
-export type ProcessState =
-	| { kind: "starting"; startedAt: number }
-	| { kind: "running"; startedAt: number; confirmedAt: number }
-	| {
-			kind: "finalizing";
-			startedAt: number;
-			detectedAt: number;
-			completion: CompletionResult;
-	  }
-	| {
-			kind: "completed";
-			startedAt: number;
-			detectedAt: number;
-			completedAt: number;
-			completion: CompletionResult;
-	  }
-	| {
-			kind: "failed";
-			startedAt: number;
-			detectedAt: number;
-			completedAt: number;
-			error: string;
-			exitCode?: number;
-	  };
-
-export type ActivityDetail =
-	| { kind: "none"; observedAt: number }
-	| {
-			kind: "scope";
-			scope: SubagentActivityScope;
-			label?: string;
-			since: number;
-			observedAt: number;
-			sequence: number;
-	  };
-
-export type TurnState =
-	| { kind: "unknown" }
-	| { kind: "starting"; observedAt: number }
-	| {
-			kind: "active";
-			startedAt: number;
-			source: "activity" | "herdr" | "fallback";
-			activity?: ActivityDetail;
-	  }
-	| { kind: "blocked"; startedAt: number }
-	| { kind: "waiting"; startedAt: number }
-	| {
-			kind: "interrupted";
-			requestedAt: number;
-			previousActivitySequence: number | null;
-	  };
-
-export type ActivityHealth =
-	| { kind: "unseen" }
-	| { kind: "healthy"; observedAt: number }
-	| {
-			kind: "problem";
-			reason: "missing" | "invalid" | "wrong-id";
-			since: number;
-			error?: string;
-	  };
-
-export type PaneObservation =
-	| { kind: "unknown" }
-	| { kind: "present"; observedAt: number; agentStatus: HerdrAgentStatus }
-	| {
-			kind: "read-error";
-			firstFailedAt: number;
-			lastFailedAt: number;
-			consecutiveFailures: number;
-			error?: string;
-	  }
-	| { kind: "missing"; detectedAt: number; error?: string };
-
-export type CompletionDelivery = "pending" | "delivered" | "suppressed";
-
-export interface SubagentLifecycle {
-	process: ProcessState;
-	turn: TurnState;
-	activityHealth: ActivityHealth;
-	/** Latest optional Pi detail, independent of Herdr coarse turn state. */
-	activityDetail: ActivityDetail | null;
-	pane: PaneObservation;
-	/** Durable across unavailable/missing observations. */
-	hasWorked: boolean;
-	lastActivitySequence: number | null;
-	delivery: CompletionDelivery;
-}
-
-export interface LifecycleProjection {
-	kind:
-		| "starting"
-		| "running"
-		| "active"
-		| "blocked"
-		| "waiting"
-		| "interrupted"
-		| "stalled"
-		| "finalizing"
-		| "completed"
-		| "failed";
-	label?: string;
-	runtimeEndedAt?: number;
-	stateDurationSince?: number;
-}
+// Preserve the lifecycle owner's existing type surface without duplicate declarations.
+export type {
+	ActivityDetail,
+	ActivityHealth,
+	CompletionDelivery,
+	LifecycleProjection,
+	PaneInspection,
+	PaneObservation,
+	ProcessState,
+	SubagentLifecycle,
+	SurfaceAgentStatus as HerdrAgentStatus,
+	TurnState,
+} from "./types.ts";
 
 export function createLifecycle(startedAt: number): SubagentLifecycle {
 	return {

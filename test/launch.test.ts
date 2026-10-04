@@ -19,7 +19,8 @@ import {
 	type PiLaunchOperations,
 	type ResumePiLaunchRequest,
 } from "../maestro/adapters/pi/launch.ts";
-import { createSubagentPaneFactory } from "../pi-extension/subagents/pane-config.ts";
+import { createWorktreeOperations } from "../maestro/runtime/worktree-operations.ts";
+import { createSubagentPaneFactory } from "../maestro/core/config/pane-config.ts";
 import { FakeSurfaceProvider } from "../maestro/surfaces/fake/fake-surface-provider.ts";
 import type { SurfaceProvider } from "../maestro/core/surface-provider.ts";
 import { WorktreeProvisioningError } from "../maestro/core/surface-provider.ts";
@@ -353,6 +354,7 @@ describe("Pi launch", () => {
 					},
 				}),
 				{ mode: "grouped", direction: "right", maxPerTab: 4 },
+				createWorktreeOperations(),
 			);
 
 			await assert.rejects(
@@ -390,6 +392,7 @@ describe("Pi launch", () => {
 			let command = "";
 			let scriptPath = "";
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane(name, cwd) {
 					assert.equal(name, "Worker");
 					assert.equal(cwd, project, "placement must use the child's checkout");
@@ -460,6 +463,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ request, project }) => {
 			let worktreeCreationAttempts = 0;
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane(name, cwd) {
 					assert.equal(name, "Worker");
 					assert.equal(cwd, project);
@@ -514,6 +518,7 @@ describe("Pi launch", () => {
 								};
 					const expectedError = `${kind} ${failurePoint} failed`;
 					const operations: PiLaunchOperations = {
+						worktree: createWorktreeOperations(),
 						createPane: () => pane,
 						createWorktree: () => {
 							throw new Error("unexpected worktree creation");
@@ -547,6 +552,7 @@ describe("Pi launch", () => {
 			const childPane = "split-child-pane";
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: createSubagentPaneFactory(
 					{ mode: "split", direction: "down", maxPerTab: 4 },
 					() => {
@@ -587,6 +593,7 @@ describe("Pi launch", () => {
 			writeFileSync(blockedSessionDir, "not a directory\n");
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => "pane-artifact-failure",
 				createWorktree: () => {
 					throw new Error("unexpected worktree creation");
@@ -617,6 +624,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ request }) => {
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => {
 					throw new Error("pane creation failed");
 				},
@@ -646,6 +654,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ request }) => {
 			let cleanupAttempts = 0;
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => "pane-cleanup-error",
 				createWorktree: () => {
 					throw new Error("unexpected worktree creation");
@@ -674,6 +683,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ request }) => {
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => {
 					throw new Error("must not create a pane");
 				},
@@ -704,6 +714,7 @@ describe("Pi launch", () => {
 			const preambles: string[] = [];
 			let pane = 0;
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => `pane-${++pane}`,
 				createWorktree: () => {
 					throw new Error("unexpected worktree creation");
@@ -977,6 +988,7 @@ describe("Pi launch", () => {
 					parent: { sessionId: "parent", sessionDir },
 				};
 				const operations: PiLaunchOperations = {
+					worktree: createWorktreeOperations(),
 					createPane(name, cwd) {
 						assert.equal(name, "Resume worker");
 						assert.equal(cwd, project);
@@ -1137,6 +1149,7 @@ describe("Pi launch", () => {
 			const events: string[] = [];
 			let command = "";
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},
@@ -1217,6 +1230,7 @@ describe("Pi launch", () => {
 			);
 			let command = "";
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},
@@ -1323,6 +1337,7 @@ describe("Pi launch", () => {
 				"child-1.json",
 			);
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},
@@ -1449,6 +1464,7 @@ describe("Pi launch", () => {
 			const events: string[] = [];
 			let command = "";
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},
@@ -1601,6 +1617,7 @@ describe("Pi launch", () => {
 						handoff: { leafId: "ready-assistant" },
 					},
 					{
+						worktree: createWorktreeOperations(),
 						createPane: () => {
 							throw new Error("unexpected pane creation");
 						},
@@ -1707,6 +1724,7 @@ describe("Pi launch", () => {
 						handoff: { leafId: "startup-assistant" },
 					},
 					{
+						worktree: createWorktreeOperations(),
 						createPane: () => {
 							throw new Error("unexpected pane creation");
 						},
@@ -1802,6 +1820,7 @@ describe("Pi launch", () => {
 				"child-1.json",
 			);
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},

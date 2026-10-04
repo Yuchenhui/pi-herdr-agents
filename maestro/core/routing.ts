@@ -1,10 +1,7 @@
-import {
-	clampThinkingLevel,
-	getSupportedThinkingLevels,
-	type Model,
-} from "@earendil-works/pi-ai";
-import type { TaskPreferences } from "./model-config.ts";
-import { isFiniteNumber, isString } from "./type-guards.ts";
+import type { TaskPreferences } from "./config/task-model-types.ts";
+import type { ThinkingLevel } from "./types.ts";
+import { isFiniteNumber, isString } from "./config/type-guards.ts";
+export type { ThinkingLevel } from "./types.ts";
 
 export const THINKING_LEVELS = [
 	"off",
@@ -20,7 +17,6 @@ export function isThinkingLevel(value: string): value is ThinkingLevel {
 	return THINKING_LEVELS.some((level) => level === value);
 }
 
-export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export type RuntimeSource = "request" | "agent" | "parent";
 
 export interface RuntimeRequest {
@@ -38,7 +34,7 @@ export interface RoutingModel {
 	provider: string;
 	id: string;
 	reasoning: boolean;
-	thinkingLevelMap?: Model<any>["thinkingLevelMap"];
+	thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
 	input?: string[];
 	contextWindow?: number;
 	maxTokens?: number;
@@ -54,6 +50,10 @@ export interface ModelRegistryAdapter {
 	find(provider: string, modelId: string): RoutingModel | undefined;
 	available(): RoutingModel[];
 	hasConfiguredAuth(model: { provider: string; id: string }): boolean;
+	// pi-herdr-agents extension
+	supportedThinkingLevels(model: RoutingModel): ThinkingLevel[];
+	// pi-herdr-agents extension
+	clampThinkingLevel(model: RoutingModel, level: ThinkingLevel): ThinkingLevel;
 }
 
 export interface ResolvedRuntimePlan {
@@ -113,12 +113,22 @@ function toRoutingModel(value: any): RoutingModel | undefined {
 	};
 }
 
-export function wrapPiModelRegistry(registry: {
+// pi-herdr-agents extension
+export interface RoutingRegistrySource {
 	find(provider: string, modelId: string): any;
 	getAvailable?: () => any[];
 	getAll?: () => any[];
 	hasConfiguredAuth?: (model: any) => boolean;
-}): ModelRegistryAdapter {
+}
+
+// pi-herdr-agents extension
+export function createModelRegistryAdapter(
+	registry: RoutingRegistrySource,
+	capabilities: Pick<
+		ModelRegistryAdapter,
+		"supportedThinkingLevels" | "clampThinkingLevel"
+	>,
+): ModelRegistryAdapter {
 	return {
 		find(provider, modelId) {
 			return toRoutingModel(registry.find(provider, modelId));
@@ -155,35 +165,18 @@ export function wrapPiModelRegistry(registry: {
 			const original = registry.find(model.provider, model.id);
 			return !!original && registry.hasConfiguredAuth(original);
 		},
+		supportedThinkingLevels: (model) =>
+			capabilities.supportedThinkingLevels(model),
+		clampThinkingLevel: (model, level) =>
+			capabilities.clampThinkingLevel(model, level),
 	};
 }
 
-function asPiModel(model: RoutingModel): Model<any> {
-	return {
-		provider: model.provider,
-		id: model.id,
-		name: model.id,
-		api: "openai-completions",
-		baseUrl: "",
-		reasoning: model.reasoning,
-		thinkingLevelMap: model.thinkingLevelMap,
-		input: model.input?.filter(
-			(entry): entry is "text" | "image" =>
-				entry === "text" || entry === "image",
-		) ?? ["text"],
-		contextWindow: model.contextWindow ?? 0,
-		maxTokens: model.maxTokens ?? 0,
-		cost: {
-			input: model.cost?.input ?? 0,
-			output: model.cost?.output ?? 0,
-			cacheRead: model.cost?.cacheRead ?? 0,
-			cacheWrite: model.cost?.cacheWrite ?? 0,
-		},
-	};
-}
-
-function formatSupported(model: RoutingModel): string {
-	const levels = getSupportedThinkingLevels(asPiModel(model));
+function formatSupported(
+	model: RoutingModel,
+	registry: ModelRegistryAdapter,
+): string {
+	const levels = registry.supportedThinkingLevels(model);
 	return levels.length > 0 ? levels.join(", ") : "(none)";
 }
 
@@ -271,14 +264,14 @@ export function resolveRuntimePlan(
 				`model capability information is unavailable; cannot validate explicit thinking ${JSON.stringify(preferredThinking)}`,
 			);
 		}
-		const supported = getSupportedThinkingLevels(asPiModel(selectedModel));
+		const supported = registry.supportedThinkingLevels(selectedModel);
 		if (!supported.includes(preferredThinking)) {
 			throw new RuntimeResolutionError(
-				`thinking ${JSON.stringify(preferredThinking)} is not supported by ${JSON.stringify(`${provider}/${modelId}`)}; supported: ${formatSupported(selectedModel)}`,
+				`thinking ${JSON.stringify(preferredThinking)} is not supported by ${JSON.stringify(`${provider}/${modelId}`)}; supported: ${formatSupported(selectedModel, registry)}`,
 			);
 		}
 	} else if (selectedModel) {
-		thinking = clampThinkingLevel(asPiModel(selectedModel), preferredThinking);
+		thinking = registry.clampThinkingLevel(selectedModel, preferredThinking);
 		if (thinking !== preferredThinking) {
 			thinkingAdjustment = {
 				from: preferredThinking,
@@ -423,7 +416,7 @@ export function buildAuthenticatedModelCatalog(
 		"Authenticated subagent models (use exact provider/model-id only):",
 	];
 	for (const model of visibleModels) {
-		const supportedThinking = getSupportedThinkingLevels(asPiModel(model));
+		const supportedThinking = registry.supportedThinkingLevels(model);
 		const facts = [
 			model.reasoning
 				? `reasoning (${supportedThinking.join("/") || "no thinking levels"})`

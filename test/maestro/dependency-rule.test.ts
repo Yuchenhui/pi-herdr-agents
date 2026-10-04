@@ -5,10 +5,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as ts from "typescript";
-import {
-	ALLOWLIST,
-	type DependencyRuleAllowlistEntry,
-} from "./dependency-rule-allowlist.ts";
 
 type RepoArea =
 	| "core"
@@ -144,13 +140,6 @@ function classifyRepoPath(repoPath: string): RepoArea {
 	return "other";
 }
 
-function isScannedSource(repoPath: string) {
-	return rootsToScan.some(
-		(relativeRoot) =>
-			repoPath === relativeRoot || repoPath.startsWith(`${relativeRoot}/`),
-	);
-}
-
 function importedArea(
 	root: string,
 	reference: ModuleReference,
@@ -162,13 +151,6 @@ function importedArea(
 	);
 	const repoPath = toRepoPath(root, resolved);
 	return classifyRepoPath(repoPath);
-}
-
-function edgeKey(
-	edge: Pick<ModuleReference, "file" | "specifier">,
-	root: string,
-) {
-	return `${toRepoPath(root, edge.file)}\u0000${edge.specifier}`;
 }
 
 function isForbiddenEdge(root: string, reference: ModuleReference) {
@@ -243,102 +225,22 @@ function collectViolations(
 	return violations;
 }
 
-function filterAllowedViolations(
-	violations: readonly Violation[],
+function violationMessages(
 	root = repoRoot,
-	allowlist = ALLOWLIST,
-) {
-	const allowed = new Set(
-		allowlist.map((entry) => `${entry.importer}\u0000${entry.specifier}`),
-	);
-	return violations.filter(
-		(violation) => !allowed.has(edgeKey(violation, root)),
-	);
-}
-
-function isCanonicalRepoPath(repoPath: string) {
-	return (
-		repoPath.length > 0 &&
-		!path.isAbsolute(repoPath) &&
-		repoPath === repoPath.split(path.sep).join("/") &&
-		repoPath === path.posix.normalize(repoPath) &&
-		!repoPath.startsWith("../") &&
-		repoPath !== ".."
-	);
-}
-
-function validateAllowlist(
-	root = repoRoot,
-	allowlist = ALLOWLIST,
 	relativeRoots: readonly string[] = rootsToScan,
 ) {
-	const errors: string[] = [];
-	const keys = new Set<string>();
-	const violations = collectViolations(root, relativeRoots);
-	const violationKeys = new Set(
-		violations.map((violation) => edgeKey(violation, root)),
+	return collectViolations(root, relativeRoots).map(
+		(violation) => violation.message,
 	);
-	for (const entry of allowlist) {
-		const key = `${entry.importer}\u0000${entry.specifier}`;
-		if (keys.has(key)) {
-			errors.push(`${entry.importer}: duplicate allowlist ${entry.specifier}`);
-		}
-		keys.add(key);
-
-		if (!entry.specifier.trim()) {
-			errors.push(`${entry.importer}: allowlist entry missing specifier`);
-		}
-		if (!isCanonicalRepoPath(entry.importer)) {
-			errors.push(
-				`${entry.importer}: allowlist importer must be a canonical repo-relative path`,
-			);
-		}
-		if (!entry.reason.trim()) {
-			errors.push(`${entry.importer}: allowlist entry missing reason`);
-		}
-		if (!entry.removalTask.trim()) {
-			errors.push(`${entry.importer}: allowlist entry missing removal task`);
-		} else if (entry.removalTask === "Task 18") {
-			errors.push(
-				`${entry.importer}: allowlist entry must name the task that removes this edge, not only Task 18`,
-			);
-		}
-
-		const importerPath = path.join(root, entry.importer);
-		if (!fs.existsSync(importerPath)) {
-			errors.push(`${entry.importer}: allowlist file does not exist`);
-		}
-		if (!isScannedSource(entry.importer)) {
-			errors.push(
-				`${entry.importer}: allowlist importer is not in a scanned root`,
-			);
-		}
-		if (!violationKeys.has(key)) {
-			errors.push(`${entry.importer}: stale allowlist ${entry.specifier}`);
-		}
-	}
-	return errors;
-}
-
-function unallowedViolationMessages(
-	root = repoRoot,
-	allowlist = ALLOWLIST,
-	relativeRoots: readonly string[] = rootsToScan,
-) {
-	return filterAllowedViolations(
-		collectViolations(root, relativeRoots),
-		root,
-		allowlist,
-	).map((violation) => violation.message);
 }
 
 function assertNoForbiddenImports(
 	label: string,
 	predicate: (v: Violation) => boolean,
 ) {
-	const messages = filterAllowedViolations(
-		collectViolations().filter(predicate),
-	).map((violation) => violation.message);
+	const messages = collectViolations()
+		.filter(predicate)
+		.map((violation) => violation.message);
 	assert.deepEqual(messages, [], label);
 }
 
@@ -360,8 +262,8 @@ function withScratchFixture(
 }
 
 describe("maestro dependency rule", () => {
-	it("overall enforcement has no unallowlisted violations", () => {
-		assert.deepEqual(unallowedViolationMessages(), []);
+	it("overall enforcement has no violations", () => {
+		assert.deepEqual(violationMessages(), []);
 	});
 
 	it("core imports only node builtins and core", () => {
@@ -409,10 +311,6 @@ describe("maestro dependency rule", () => {
 			(violation) =>
 				toRepoPath(repoRoot, violation.file).startsWith("pi-extension/"),
 		);
-	});
-
-	it("allowlist entries exist and still violate", () => {
-		assert.deepEqual(validateAllowlist(), []);
 	});
 
 	it("scratch fixtures prove parser catches forbidden import forms", () => {
@@ -477,92 +375,34 @@ describe("maestro dependency rule", () => {
 		);
 	});
 
-	it("scratch fixtures apply exact-edge allowlist to any scanned source", () => {
+	it("scratch fixtures reject every adapter-to-host edge", () => {
 		withScratchFixture(
 			{
 				"maestro/adapters/pi/adapter-bridge.ts":
-					'import "../../../pi-extension/allowed.ts";\nimport "../../../pi-extension/blocked.ts";\n',
-				"pi-extension/allowed.ts": "export {};\n",
-				"pi-extension/blocked.ts": "export {};\n",
+					'import "../../../pi-extension/first.ts";\nimport "../../../pi-extension/second.ts";\n',
+				"pi-extension/first.ts": "export {};\n",
+				"pi-extension/second.ts": "export {};\n",
 			},
 			(root) => {
-				const allowlist: DependencyRuleAllowlistEntry[] = [
-					{
-						importer: "maestro/adapters/pi/adapter-bridge.ts",
-						specifier: "../../../pi-extension/allowed.ts",
-						reason: "Temporary adapter-to-legacy bridge",
-						removalTask: "Task 9",
-					},
-				];
-				assert.deepEqual(validateAllowlist(root, allowlist), []);
-				assert.deepEqual(unallowedViolationMessages(root, allowlist), [
-					"maestro/adapters/pi/adapter-bridge.ts: forbidden import ../../../pi-extension/blocked.ts",
+				assert.deepEqual(violationMessages(root), [
+					"maestro/adapters/pi/adapter-bridge.ts: forbidden import ../../../pi-extension/first.ts",
+					"maestro/adapters/pi/adapter-bridge.ts: forbidden import ../../../pi-extension/second.ts",
 				]);
 			},
 		);
 	});
 
-	it("scratch fixtures validate bad allowlist entries", () => {
+	it("scratch fixtures reject SDK imports outside Pi owners", () => {
 		withScratchFixture(
 			{
-				"pi-extension/bridge.ts":
-					'import "../maestro/adapters/pi/allowed.ts";\n',
-				"maestro/adapters/pi/allowed.ts": "export {};\n",
-				"test/not-scanned.ts": 'import "../maestro/adapters/pi/allowed.ts";\n',
+				"maestro/runtime/sdk.ts": 'import "@earendil-works/pi-ai";\n',
+				"maestro/surfaces/herdr/sdk.ts":
+					'import type { PiHost } from "@earendil-works/pi-ai";\n',
 			},
 			(root) => {
-				const badEntries: DependencyRuleAllowlistEntry[] = [
-					{
-						importer: "pi-extension/bridge.ts",
-						specifier: "../maestro/adapters/pi/allowed.ts",
-						reason: "Temporary bridge",
-						removalTask: "Task 9",
-					},
-					{
-						importer: "pi-extension/bridge.ts",
-						specifier: "../maestro/adapters/pi/allowed.ts",
-						reason: "Temporary bridge",
-						removalTask: "Task 9",
-					},
-					{
-						importer: "pi-extension/bridge.ts",
-						specifier: "../maestro/adapters/pi/stale.ts",
-						reason: " ",
-						removalTask: "",
-					},
-					{
-						importer: "pi-extension/missing.ts",
-						specifier: "../maestro/adapters/pi/allowed.ts",
-						reason: "Temporary bridge",
-						removalTask: "Task 18",
-					},
-					{
-						importer: "./pi-extension/bridge.ts",
-						specifier: "",
-						reason: "Temporary bridge",
-						removalTask: "Task 9",
-					},
-					{
-						importer: "test/not-scanned.ts",
-						specifier: "../maestro/adapters/pi/allowed.ts",
-						reason: "Temporary bridge",
-						removalTask: "Task 9",
-					},
-				];
-				assert.deepEqual(validateAllowlist(root, badEntries), [
-					"pi-extension/bridge.ts: duplicate allowlist ../maestro/adapters/pi/allowed.ts",
-					"pi-extension/bridge.ts: allowlist entry missing reason",
-					"pi-extension/bridge.ts: allowlist entry missing removal task",
-					"pi-extension/bridge.ts: stale allowlist ../maestro/adapters/pi/stale.ts",
-					"pi-extension/missing.ts: allowlist entry must name the task that removes this edge, not only Task 18",
-					"pi-extension/missing.ts: allowlist file does not exist",
-					"pi-extension/missing.ts: stale allowlist ../maestro/adapters/pi/allowed.ts",
-					"./pi-extension/bridge.ts: allowlist entry missing specifier",
-					"./pi-extension/bridge.ts: allowlist importer must be a canonical repo-relative path",
-					"./pi-extension/bridge.ts: allowlist importer is not in a scanned root",
-					"./pi-extension/bridge.ts: stale allowlist ",
-					"test/not-scanned.ts: allowlist importer is not in a scanned root",
-					"test/not-scanned.ts: stale allowlist ../maestro/adapters/pi/allowed.ts",
+				assert.deepEqual(violationMessages(root), [
+					"maestro/runtime/sdk.ts: forbidden import @earendil-works/pi-ai",
+					"maestro/surfaces/herdr/sdk.ts: forbidden import @earendil-works/pi-ai",
 				]);
 			},
 		);
@@ -575,7 +415,7 @@ describe("maestro dependency rule", () => {
 				"maestro/adapters/pi/x.ts": "export {};\n",
 			},
 			(root) => {
-				assert.deepEqual(unallowedViolationMessages(root), [
+				assert.deepEqual(violationMessages(root), [
 					"maestro/tools/escape.ts: unsupported maestro source location",
 				]);
 			},

@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	isPlainObject,
 	isString,
-} from "../../pi-extension/subagents/type-guards.ts";
+} from "../../maestro/core/config/type-guards.ts";
 
 const timeoutMs = 3_000;
 const publicCaseKeys = new Set(["id", "title", "reviewTask", "spec", "source"]);

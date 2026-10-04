@@ -1,36 +1,26 @@
-import { execFileSync } from "node:child_process";
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	renameSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { getSubagentActivityFile } from "../../../pi-extension/subagents/activity.ts";
+import { getSubagentActivityFile } from "./activity-file.ts";
 import {
 	createLifecycle,
 	type SubagentLifecycle,
-} from "../../../pi-extension/subagents/lifecycle.ts";
-import type { ResolvedRuntimePlan } from "../../../pi-extension/subagents/runtime-routing.ts";
-import {
-	loadPaneConfig,
-	type PaneConfig,
-} from "../../../pi-extension/subagents/pane-config.ts";
-import {
-	isNonEmptyString,
-	isRecord,
-	type JsonObject,
-} from "../../../pi-extension/subagents/type-guards.ts";
+} from "../../core/lifecycle.ts";
+import type { ResolvedRuntimePlan } from "../../core/routing.ts";
+import type { PaneConfig } from "../../core/config/pane-config.ts";
+import { isNonEmptyString } from "../../core/config/type-guards.ts";
 import { shellQuote } from "../../core/shell.ts";
 import type {
 	SurfaceProvider,
 	WorktreeSurface,
 } from "../../core/surface-provider.ts";
 import { WorktreeProvisioningError } from "../../core/surface-provider.ts";
-import { HerdrSurfaceProvider } from "../../surfaces/herdr/herdr-surface-provider.ts";
+import type {
+	FailedWorktreeManifest,
+	WorktreeLaunch,
+	WorktreeOperations,
+} from "../../core/worktree.ts";
 import {
 	createWorktreeSessionFork,
 	getNewEntries,
@@ -42,43 +32,6 @@ import {
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
-
-export interface WorktreeLaunch {
-	path: string;
-	workspaceId: string;
-	paneId: string;
-	branch: string;
-	baseRef: string;
-	baseSha: string;
-	manifestFile: string;
-	sessionFile?: string;
-	sourceSessionFile?: string;
-	handoffMessage?: string;
-}
-
-interface FailedWorktreeManifest extends JsonObject {
-	state: "failed";
-	id: string;
-	name: string;
-	sourceCwd: string;
-	branch: string;
-	baseRef: string;
-	baseSha: string;
-	createdAt: number;
-	path?: string;
-	workspaceId?: string;
-	error?: string;
-}
-
-export interface WorktreeHandoff extends WorktreeLaunch {
-	headSha: string | null;
-	commitsAhead: number | null;
-	clean: boolean | null;
-	conflicted: boolean | null;
-	changedFiles: string[] | null;
-	untrackedFiles: string[] | null;
-	gitError?: string;
-}
 
 export interface FreshPiLaunchRequest {
 	kind: "fresh";
@@ -174,6 +127,8 @@ interface WorktreeSurfaceForLaunch {
 }
 
 export interface PiLaunchOperations {
+	/** Required for managed worktree launches; ordinary panes need no Git effects. */
+	worktree?: WorktreeOperations;
 	createPane(name: string, cwd?: string): MaybePromise<string>;
 	createWorktree(
 		name: string,
@@ -270,8 +225,10 @@ async function waitForSurfacePiReady(
 export function launchOperationsFromSurface(
 	provider: SurfaceProvider,
 	config: PaneConfig,
+	worktree?: WorktreeOperations,
 ): PiLaunchOperations {
 	return {
+		worktree,
 		createPane(name, cwd) {
 			return provider.createSurface({
 				name,
@@ -302,13 +259,6 @@ export function launchOperationsFromSurface(
 		},
 	};
 }
-
-const paneConfig = loadPaneConfig();
-
-const defaultOperations: PiLaunchOperations = launchOperationsFromSurface(
-	new HerdrSurfaceProvider({ paneConfig }),
-	paneConfig,
-);
 
 interface ResolvedLaunch {
 	request: FreshPiLaunchRequest;
@@ -346,7 +296,7 @@ interface PreparedArtifacts extends PreparedSession {
  */
 export async function launchPiSubagent(
 	request: PiLaunchRequest,
-	operations: PiLaunchOperations = defaultOperations,
+	operations: PiLaunchOperations,
 ): Promise<PiRunningChild> {
 	return request.kind === "resume"
 		? launchResumedPiSubagent(request, operations)
@@ -355,7 +305,7 @@ export async function launchPiSubagent(
 
 export async function launchPiWorktreeHandoff(
 	request: FreshPiLaunchRequest,
-	operations: PiLaunchOperations = defaultOperations,
+	operations: PiLaunchOperations,
 ): Promise<{ running: PiRunningChild; focusError?: string }> {
 	if (!request.worktree || !request.handoff) {
 		throw new Error("A worktree handoff requires a worktree and active leaf");
@@ -368,10 +318,13 @@ export async function launchPiWorktreeHandoff(
 		await operations.focusWorkspace?.(running.worktree.workspaceId);
 	} catch (error) {
 		const focusError = errorMessage(error);
-		writeWorktreeManifest(running.worktree.manifestFile, {
-			state: "running",
-			focusError,
-		});
+		requireWorktreeOperations(operations).writeWorktreeManifest(
+			running.worktree.manifestFile,
+			{
+				state: "running",
+				focusError,
+			},
+		);
 		return {
 			running,
 			focusError,
@@ -389,13 +342,13 @@ async function launchFreshPiSubagent(
 
 	try {
 		surface = await prepareLaunchSurface(resolved, operations);
-		const session = prepareChildSession(resolved, surface);
+		const session = prepareChildSession(resolved, surface, operations);
 		const handoffArtifacts = request.handoff
-			? prepareTaskArtifacts(resolved, session)
+			? prepareTaskArtifacts(resolved, session, operations)
 			: undefined;
 		await confirmShellReady(session, operations);
 		const artifacts =
-			handoffArtifacts ?? prepareTaskArtifacts(resolved, session);
+			handoffArtifacts ?? prepareTaskArtifacts(resolved, session, operations);
 		const command = buildPiCommand(resolved, artifacts);
 		const launchScriptFile = await startPiProcess(
 			resolved,
@@ -413,7 +366,10 @@ async function launchFreshPiSubagent(
 				artifacts.targetCwd,
 			);
 			if (artifacts.worktree) {
-				persistWorktreeResult(artifacts.worktree, "running");
+				requireWorktreeOperations(operations).persistWorktreeResult(
+					artifacts.worktree,
+					"running",
+				);
 			}
 		}
 		return createRunningChild(resolved, artifacts, launchScriptFile);
@@ -429,9 +385,10 @@ async function launchFreshPiSubagent(
 			}
 			throw error;
 		}
-		const handoff = captureWorktreeHandoff(surface.worktree);
+		const worktreeOps = requireWorktreeOperations(operations);
+		const handoff = worktreeOps.captureWorktreeHandoff(surface.worktree);
 		try {
-			persistWorktreeResult(surface.worktree, "failed", handoff);
+			worktreeOps.persistWorktreeResult(surface.worktree, "failed", handoff);
 		} catch {
 			// The launch error remains authoritative when persistence also fails.
 		}
@@ -498,9 +455,12 @@ async function prepareLaunchSurface(
 	if (request.surface)
 		throw new Error("A worktree subagent cannot use a pre-created pane");
 
+	const worktreeOps = requireWorktreeOperations(operations);
 	const baseRef = request.worktree.base ?? "HEAD";
-	const baseSha = resolveGitCommit(resolved.sourceCwd, baseRef);
-	const provisionCwd = resolveWorktreeProvisionCwd(resolved.sourceCwd);
+	const baseSha = worktreeOps.resolveGitCommit(resolved.sourceCwd, baseRef);
+	const provisionCwd = worktreeOps.resolveWorktreeProvisionCwd(
+		resolved.sourceCwd,
+	);
 	const manifestFile = join(
 		resolved.artifactDir,
 		"worktree-runs",
@@ -515,7 +475,7 @@ async function prepareLaunchSurface(
 		baseSha,
 		createdAt: resolved.startTime,
 	};
-	writeWorktreeManifest(manifestFile, {
+	worktreeOps.writeWorktreeManifest(manifestFile, {
 		state: "provisioning",
 		...ownership,
 	});
@@ -537,7 +497,7 @@ async function prepareLaunchSurface(
 			Object.assign(failedManifest, error.recoveredWorktree);
 		}
 		failedManifest.error = errorMessage(error);
-		writeWorktreeManifest(manifestFile, failedManifest);
+		worktreeOps.writeWorktreeManifest(manifestFile, failedManifest);
 		throw error;
 	}
 
@@ -550,7 +510,7 @@ async function prepareLaunchSurface(
 		baseSha,
 		manifestFile,
 	};
-	writeWorktreeManifest(manifestFile, {
+	worktreeOps.writeWorktreeManifest(manifestFile, {
 		state: "provisioned",
 		...ownership,
 		...worktree,
@@ -571,6 +531,7 @@ async function prepareLaunchSurface(
 function prepareChildSession(
 	resolved: ResolvedLaunch,
 	surface: PreparedSurface,
+	operations: PiLaunchOperations,
 ): PreparedSession {
 	const sessionDir = getDefaultSessionDirFor(
 		surface.targetCwd,
@@ -586,7 +547,10 @@ function prepareChildSession(
 	const sessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 	if (surface.worktree) {
 		surface.worktree.sessionFile = sessionFile;
-		writeWorktreeManifest(surface.worktree.manifestFile, { sessionFile });
+		requireWorktreeOperations(operations).writeWorktreeManifest(
+			surface.worktree.manifestFile,
+			{ sessionFile },
+		);
 	}
 	writeSubagentSessionPolicy(sessionFile, {
 		owner: surface.worktree ? "managed-worktree" : "public",
@@ -640,6 +604,7 @@ function buildWorktreeHandoffMessage(
 function prepareTaskArtifacts(
 	resolved: ResolvedLaunch,
 	session: PreparedSession,
+	operations: PiLaunchOperations,
 ): PreparedArtifacts {
 	const { request } = resolved;
 	if (request.handoff) {
@@ -660,10 +625,13 @@ function prepareTaskArtifacts(
 		});
 		session.worktree.sourceSessionFile = request.parent.sessionFile;
 		session.worktree.handoffMessage = handoffMessage;
-		writeWorktreeManifest(session.worktree.manifestFile, {
-			sourceSessionFile: request.parent.sessionFile,
-			handoffMessage,
-		});
+		requireWorktreeOperations(operations).writeWorktreeManifest(
+			session.worktree.manifestFile,
+			{
+				sourceSessionFile: request.parent.sessionFile,
+				handoffMessage,
+			},
+		);
 	} else if (resolved.sessionMode !== "standalone") {
 		seedSubagentSessionFile({
 			mode: resolved.sessionMode,
@@ -807,7 +775,10 @@ async function startPiProcess(
 		`${safeName(resolved.request.name) || "subagent"}-${resolved.id}.sh`,
 	);
 	if (artifacts.worktree && !resolved.request.handoff) {
-		persistWorktreeResult(artifacts.worktree, "running");
+		requireWorktreeOperations(operations).persistWorktreeResult(
+			artifacts.worktree,
+			"running",
+		);
 	}
 	return await operations.runScript(artifacts.surface, command, {
 		scriptPath: launchScriptFile,
@@ -1021,218 +992,12 @@ function safeName(name: string): string {
 		.replace(/^-|-$/g, "");
 }
 
-function resolveGitCommit(cwd: string, ref: string): string {
-	return execFileSync("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
-		cwd,
-		encoding: "utf8",
-	}).trim();
-}
-
-function resolveWorktreeProvisionCwd(sourceCwd: string): string {
-	let gitDir: string;
-	let commonDir: string;
-	try {
-		gitDir = resolveGitPath(sourceCwd, "--git-dir");
-		commonDir = resolveGitPath(sourceCwd, "--git-common-dir");
-	} catch (error) {
-		throw new Error(
-			`Unable to identify the Git checkout for worktree provisioning from ${sourceCwd}: ${errorMessage(error)}`,
-		);
-	}
-	if (gitDir === commonDir) return sourceCwd;
-
-	try {
-		const output = execFileSync(
-			"git",
-			["worktree", "list", "--porcelain", "-z"],
-			{ cwd: sourceCwd },
-		).toString("utf8");
-		const principal = output
-			.split("\0")
-			.find((record) => record.startsWith("worktree "))
-			?.slice("worktree ".length);
-		if (!principal) throw new Error("Git returned no principal worktree");
-		return principal;
-	} catch (error) {
-		throw new Error(
-			`Unable to determine the principal Git checkout for linked worktree ${sourceCwd}: ${errorMessage(error)}`,
-		);
-	}
-}
-
-function resolveGitPath(
-	cwd: string,
-	flag: "--git-dir" | "--git-common-dir",
-): string {
-	const output = execFileSync(
-		"git",
-		["rev-parse", "--path-format=absolute", flag],
-		{ cwd, encoding: "utf8" },
-	);
-	return output.endsWith("\n") ? output.slice(0, -1) : output;
-}
-
-export function readWorktreeManifest(path: string): JsonObject | undefined {
-	try {
-		const value: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (
-			isRecord(value) &&
-			value.version === 1 &&
-			value.kind === "worktree-run" &&
-			value.owner === "pi-herdr-subagents"
-		)
-			return value;
-	} catch {
-		// Unreachable or malformed manifests do not establish ownership.
-	}
-	return undefined;
-}
-
-export function writeWorktreeManifest(path: string, value: JsonObject): void {
-	mkdirSync(dirname(path), { recursive: true });
-	let existing: JsonObject = {};
-	if (existsSync(path)) {
-		try {
-			existing = JSON.parse(readFileSync(path, "utf8"));
-		} catch {
-			existing = {};
-		}
-	}
-	const tempPath = `${path}.tmp`;
-	writeFileSync(
-		tempPath,
-		`${JSON.stringify(
-			{
-				...existing,
-				...value,
-				version: 1,
-				kind: "worktree-run",
-				owner: "pi-herdr-subagents",
-				updatedAt: Date.now(),
-			},
-			null,
-			2,
-		)}\n`,
-	);
-	renameSync(tempPath, path);
-}
-
-function gitPathList(cwd: string, args: string[]): string[] {
-	return execFileSync("git", args, { cwd, encoding: "utf8" })
-		.split("\0")
-		.filter(Boolean);
-}
-
-export function captureWorktreeHandoff(
-	worktree: WorktreeLaunch,
-): WorktreeHandoff {
-	try {
-		const headSha = resolveGitCommit(worktree.path, "HEAD");
-		const status = execFileSync(
-			"git",
-			["status", "--porcelain=v1", "--untracked-files=all", "-z"],
-			{ cwd: worktree.path, encoding: "utf8" },
-		);
-		const untrackedFiles = gitPathList(worktree.path, [
-			"ls-files",
-			"--others",
-			"--exclude-standard",
-			"-z",
-		]);
-		const conflictedFiles = gitPathList(worktree.path, [
-			"diff",
-			"--name-only",
-			"--diff-filter=U",
-			"-z",
-		]);
-		const changedFiles = new Set([
-			...gitPathList(worktree.path, [
-				"diff",
-				"--name-only",
-				"-z",
-				`${worktree.baseSha}...HEAD`,
-			]),
-			...gitPathList(worktree.path, ["diff", "--name-only", "-z"]),
-			...gitPathList(worktree.path, ["diff", "--cached", "--name-only", "-z"]),
-			...untrackedFiles,
-		]);
-		const commitsAhead = Number.parseInt(
-			execFileSync(
-				"git",
-				["rev-list", "--count", `${worktree.baseSha}..HEAD`],
-				{ cwd: worktree.path, encoding: "utf8" },
-			).trim(),
-			10,
-		);
-		return {
-			...worktree,
-			headSha,
-			commitsAhead: Number.isFinite(commitsAhead) ? commitsAhead : 0,
-			clean: status.length === 0,
-			conflicted: conflictedFiles.length > 0,
-			changedFiles: [...changedFiles].sort(),
-			untrackedFiles: untrackedFiles.sort(),
-		};
-	} catch (error) {
-		return {
-			...worktree,
-			headSha: null,
-			commitsAhead: null,
-			clean: null,
-			conflicted: null,
-			changedFiles: null,
-			untrackedFiles: null,
-			gitError: errorMessage(error),
-		};
-	}
-}
-
-export function persistWorktreeResult(
-	worktree: WorktreeLaunch,
-	state: "running" | "ready_for_review" | "failed" | "needs_help" | "removed",
-	handoff?: WorktreeHandoff,
-): void {
-	writeWorktreeManifest(worktree.manifestFile, {
-		state,
-		...worktree,
-		...handoff,
-	});
-}
-
-type RunSubagentScriptOptions = {
-	scriptPath?: string;
-	scriptPreamble?: string;
-};
-
-type RunSubagentScriptRunner = (
-	surface: string,
-	command: string,
-	options?: RunSubagentScriptOptions,
-) => string;
-
-export function runSubagentScript(
-	surface: string,
-	command: string,
-	options: RunSubagentScriptOptions | undefined,
-	worktree: WorktreeLaunch | undefined,
-	run: RunSubagentScriptRunner,
-): string {
-	if (worktree) persistWorktreeResult(worktree, "running");
-	try {
-		return run(surface, command, options);
-	} catch (error) {
-		if (!worktree) throw error;
-		const handoff = captureWorktreeHandoff(worktree);
-		try {
-			persistWorktreeResult(worktree, "failed", handoff);
-		} catch {
-			// The launch error remains authoritative when persistence also fails.
-		}
-		throw new Error(
-			`Failed to launch subagent; worktree retained at ${worktree.path} ` +
-				`(workspace ${worktree.workspaceId}): ${errorMessage(error)}`,
-		);
-	}
+function requireWorktreeOperations(
+	operations: PiLaunchOperations,
+): WorktreeOperations {
+	if (!operations.worktree)
+		throw new Error("Worktree operations are unavailable");
+	return operations.worktree;
 }
 
 function errorMessage(error: any): string {

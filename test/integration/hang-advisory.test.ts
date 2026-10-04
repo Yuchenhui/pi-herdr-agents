@@ -10,7 +10,7 @@ import {
 	createLifecycle,
 	observePaneInspection,
 	projectLifecycle,
-} from "../../pi-extension/subagents/lifecycle.ts";
+} from "../../maestro/core/lifecycle.ts";
 
 function activeChild(sessionFile: string, interactive = false) {
 	return {

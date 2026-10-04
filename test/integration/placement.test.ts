@@ -1,3 +1,7 @@
+import {
+	getSubagentsConfigDir,
+	getSubagentsConfigExamplePath,
+} from "../../pi-extension/subagents/config-path.ts";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -11,10 +15,36 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
-	launchPiSubagent,
-	readWorktreeManifest,
+	launchPiSubagent as launchWithOperations,
+	launchOperationsFromSurface,
 	type FreshPiLaunchRequest,
+	type PiLaunchRequest,
+	type PiLaunchOperations,
 } from "../../maestro/adapters/pi/launch.ts";
+import {
+	readWorktreeManifest,
+	createWorktreeOperations,
+} from "../../maestro/runtime/worktree-operations.ts";
+import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
+
+function launchPiSubagent(
+	request: PiLaunchRequest,
+	operations?: PiLaunchOperations,
+) {
+	const config = loadPaneConfig(
+		getSubagentsConfigDir(),
+		getSubagentsConfigExamplePath(),
+	);
+	return launchWithOperations(
+		request,
+		operations ??
+			launchOperationsFromSurface(
+				new HerdrSurfaceProvider({ paneConfig: config }),
+				config,
+				createWorktreeOperations(),
+			),
+	);
+}
 import {
 	closePane,
 	createSubagentPane,
@@ -28,9 +58,9 @@ import {
 import {
 	createSubagentPaneFactory,
 	loadPaneConfig,
-} from "../../pi-extension/subagents/pane-config.ts";
+} from "../../maestro/core/config/pane-config.ts";
 import subagentsExtension from "../../pi-extension/subagents/index.ts";
-import { isNonEmptyString } from "../../pi-extension/subagents/type-guards.ts";
+import { isNonEmptyString } from "../../maestro/core/config/type-guards.ts";
 import {
 	createEventBus,
 	SessionManager,
@@ -155,7 +185,10 @@ for (const backend of getAvailableBackends()) {
 					`
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { launchPiSubagent } from ${JSON.stringify(launchUrl)};
+import { launchPiSubagent, launchOperationsFromSurface } from ${JSON.stringify(launchUrl)};
+import { HerdrSurfaceProvider } from ${JSON.stringify(new URL("../../maestro/surfaces/herdr/herdr-surface-provider.ts", import.meta.url).href)};
+import { loadPaneConfig } from ${JSON.stringify(new URL("../../maestro/core/config/pane-config.ts", import.meta.url).href)};
+import { getSubagentsConfigDir, getSubagentsConfigExamplePath } from ${JSON.stringify(new URL("../../pi-extension/subagents/config-path.ts", import.meta.url).href)};
 const cli = (...args) => JSON.parse(execFileSync("herdr", args, { encoding: "utf8" })).result;
 const result = {};
 try {
@@ -163,7 +196,8 @@ try {
   result.before = cli("pane", "current", "--current").pane;
   result.move = cli("pane", "move", result.before.pane_id, "--new-tab", "--workspace", ${JSON.stringify(destination.workspaceId)}, "--no-focus").move_result;
   result.after = cli("pane", "current", "--current").pane;
-  result.child = await launchPiSubagent(${JSON.stringify(request(1))});
+  const config = loadPaneConfig(getSubagentsConfigDir(), getSubagentsConfigExamplePath());
+  result.child = await launchPiSubagent(${JSON.stringify(request(1))}, launchOperationsFromSurface(new HerdrSurfaceProvider({ paneConfig: config }), config));
 } catch (error) {
   result.error = String(error.stack ?? error);
 }
@@ -310,11 +344,13 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 		});
 
 		it("respects configured capacity during overlapping launches and rolls back only a failed child", async () => {
-			const configPath = join(env.dir, "placement-config.json");
+			const configDir = join(env.dir, "placement-config");
+			mkdirSync(configDir);
+			const configPath = join(configDir, "config.json");
 			writeFileSync(configPath, JSON.stringify({ panes: { maxPerTab: 2 } }));
 			const operations = {
 				createPane: createSubagentPaneFactory(
-					loadPaneConfig(configPath),
+					loadPaneConfig(configDir, getSubagentsConfigExamplePath()),
 					createSubagentPane,
 					splitCurrentPane,
 					createGroupedSubagentPane,

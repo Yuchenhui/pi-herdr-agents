@@ -11,10 +11,14 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { PiHarnessAdapter } from "../../maestro/adapters/pi/pi-harness-adapter.ts";
 import { launchOperationsFromSurface } from "../../maestro/adapters/pi/launch.ts";
+import {
+	createWorktreeOperations,
+	readWorktreeManifest,
+} from "../../maestro/runtime/worktree-operations.ts";
 import { FakeSurfaceProvider } from "../../maestro/surfaces/fake/fake-surface-provider.ts";
-import { createSubagentActivityRecorder } from "../../pi-extension/subagents/activity.ts";
-import { FileWakeRegistry } from "../../pi-extension/subagents/wake.ts";
-import { SupervisionCoordinator } from "../../pi-extension/subagents/supervision.ts";
+import { createSubagentActivityRecorder } from "../../maestro/adapters/pi/activity-file.ts";
+import { FileWakeRegistry } from "../../maestro/core/wake.ts";
+import { SupervisionCoordinator } from "../../maestro/core/supervision.ts";
 import {
 	readSubagentSessionPolicy,
 	appendPersistentTaskEvent,
@@ -58,6 +62,18 @@ function fixture() {
 		find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
 		available: () => [],
 		hasConfiguredAuth: () => true,
+		supportedThinkingLevels:
+			(): import("../../maestro/core/types.ts").ThinkingLevel[] => [
+				"off",
+				"minimal",
+				"low",
+				"medium",
+				"high",
+			],
+		clampThinkingLevel: (
+			_model: import("../../maestro/core/routing.ts").RoutingModel,
+			level: import("../../maestro/core/types.ts").ThinkingLevel,
+		) => level,
 	};
 	const adapter = new PiHarnessAdapter({
 		surface,
@@ -118,6 +134,48 @@ async function usingFixture(
 }
 
 describe("PiHarnessAdapter", () => {
+	it("standalone provider launch consumes injected worktree effects and refuses managed public resume before creating a pane", async () =>
+		usingFixture(async (f) => {
+			const effects = createWorktreeOperations();
+			const probes: string[] = [];
+			effects.resolveGitCommit = (_cwd, ref) => {
+				probes.push(ref);
+				return "base-sha";
+			};
+			effects.resolveWorktreeProvisionCwd = (cwd) => cwd;
+			const adapter = new PiHarnessAdapter({
+				surface: f.surface,
+				paneConfig,
+				worktreeOperations: effects,
+				modelRegistry: f.modelRegistry,
+				supervision: f.supervision,
+				parent: {
+					cwd: f.root,
+					sessionFile: join(f.root, "parent", "parent.jsonl"),
+					sessionId: "parent",
+					sessionDir: join(f.root, "parent"),
+					agentDir: join(f.root, "agent"),
+				},
+				parentRuntime: { provider: "fake", modelId: "test", thinking: "off" },
+			});
+			const handle = await adapter.spawn({
+				...f.options,
+				worktreeRequest: { branch: "task16" },
+			});
+			assert.deepEqual(probes, ["HEAD"]);
+			assert.equal(handle.worktree?.baseSha, "base-sha");
+			assert.equal(
+				readWorktreeManifest(handle.worktree!.manifestFile)?.owner,
+				"pi-herdr-subagents",
+			);
+			assert.equal(f.surface.listSurfaces().length, 1);
+			await assert.rejects(
+				adapter.resume({ name: "resume", sessionId: handle.sessionId! }),
+				/Cannot resume managed-worktree session/,
+			);
+			assert.equal(f.surface.listSurfaces().length, 1);
+			assert.equal(f.supervision.diagnostics().watcherCount, 0);
+		}));
 	it("preserves an already validated host plan without consulting the registry again", async () =>
 		usingFixture(async (f) => {
 			const plan = {

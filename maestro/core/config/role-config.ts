@@ -1,8 +1,5 @@
 import { readFileSync } from "node:fs";
-import {
-	getSubagentsConfigExamplePath,
-	getSubagentsConfigPath,
-} from "./config-path.ts";
+import { join } from "node:path";
 import { isBoolean, isPlainObject } from "./type-guards.ts";
 
 export interface RoleConfig {
@@ -79,9 +76,10 @@ function readRoleConfigFile(
 }
 
 export function loadRoleConfig(
-	configPath = getSubagentsConfigPath(),
-	examplePath = getSubagentsConfigExamplePath(),
+	configDir: string,
+	examplePath: string,
 ): RoleConfig {
+	const configPath = join(configDir, "config.json");
 	const { sourcePath, rawConfig } = readRoleConfigFile(configPath, examplePath);
 	let parsed;
 	try {

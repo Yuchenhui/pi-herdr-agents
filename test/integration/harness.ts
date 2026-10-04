@@ -26,7 +26,7 @@ import {
 	TEST_MODEL as FIXTURE_MODEL,
 	TEST_PROVIDER_URL,
 } from "./fake-provider.ts";
-import { isNonEmptyString } from "../../pi-extension/subagents/type-guards.ts";
+import { isNonEmptyString } from "../../maestro/core/config/type-guards.ts";
 import {
 	isTerminalAvailable,
 	createSubagentPane,

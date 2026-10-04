@@ -1,8 +1,5 @@
 import { readFileSync } from "node:fs";
-import {
-	getSubagentsConfigExamplePath,
-	getSubagentsConfigPath,
-} from "./config-path.ts";
+import { join } from "node:path";
 import { isBoolean, isFiniteNumber, isRecord } from "./type-guards.ts";
 
 export interface SupervisionConfig {
@@ -62,9 +59,10 @@ export function parseSupervisionConfig(
 }
 
 export function loadSupervisionConfig(
-	configPath = getSubagentsConfigPath(),
-	examplePath = getSubagentsConfigExamplePath(),
+	configDir: string,
+	examplePath: string,
 ): SupervisionConfig {
+	const configPath = join(configDir, "config.json");
 	let sourcePath = configPath;
 	let rawConfig: string;
 	try {

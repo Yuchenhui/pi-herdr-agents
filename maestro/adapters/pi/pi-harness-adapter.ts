@@ -14,15 +14,15 @@ import type {
 	CompletionEvidence,
 } from "../../core/types.ts";
 import type { SurfaceProvider } from "../../core/surface-provider.ts";
-import { readSubagentActivityFile } from "../../../pi-extension/subagents/activity.ts";
+import { readSubagentActivityFile } from "./activity-file.ts";
 import {
 	markCompletionDetected,
 	markInterruptRequested,
 	observeActivity,
 	observePaneInspection,
-} from "../../../pi-extension/subagents/lifecycle.ts";
-import { isNonEmptyString } from "../../../pi-extension/subagents/type-guards.ts";
-import type { PaneConfig } from "../../../pi-extension/subagents/pane-config.ts";
+} from "../../core/lifecycle.ts";
+import { isNonEmptyString } from "../../core/config/type-guards.ts";
+import type { PaneConfig } from "../../core/config/pane-config.ts";
 import {
 	isThinkingLevel,
 	parseExactModelRef,
@@ -30,17 +30,17 @@ import {
 	type ModelRegistryAdapter,
 	type ParentRuntime,
 	type ResolvedRuntimePlan,
-} from "../../../pi-extension/subagents/runtime-routing.ts";
-import type { FileWakeRegistry } from "../../../pi-extension/subagents/wake.ts";
-import type { SupervisionCoordinator } from "../../../pi-extension/subagents/supervision.ts";
+} from "../../core/routing.ts";
+import type { FileWakeRegistry } from "../../core/wake.ts";
+import type { SupervisionCoordinator } from "../../core/supervision.ts";
 import {
-	captureWorktreeHandoff,
 	launchOperationsFromSurface,
 	launchPiSubagent,
 	type FreshPiLaunchRequest,
 	type PiLaunchOperations,
 	type PiRunningChild,
 } from "./launch.ts";
+import type { WorktreeOperations } from "../../core/worktree.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
 	appendPersistentDeliveryLedger,
@@ -84,6 +84,7 @@ export interface PiHarnessAdapterOptions {
 	parentRuntime?: ParentRuntime;
 	/** Optional launch-operation injection, keeping the real Pi protocol in unit tests. */
 	operations?: PiLaunchOperations;
+	worktreeOperations?: WorktreeOperations;
 	/** Explicit local evidence/lifecycle bridge. The host still owns delivery and deduplication. */
 	onObservation?(
 		child: PiRunningChild,
@@ -114,7 +115,11 @@ export class PiHarnessAdapter implements HarnessAdapter {
 		this.options = options;
 		this.operations =
 			options.operations ??
-			launchOperationsFromSurface(options.surface, options.paneConfig);
+			launchOperationsFromSurface(
+				options.surface,
+				options.paneConfig,
+				options.worktreeOperations,
+			);
 	}
 	isAvailable(): boolean {
 		try {
@@ -168,7 +173,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
 				denied.add(name);
 		const resolved = opts.resolvedLaunch;
 		const cwd = resolved ? resolved.cwd : opts.cwd;
-		const roleCwd = resolved?.roleCwd;
+		const roleCwd = resolved ? resolved.roleCwd : defaults?.cwd;
 		const id = opts.launchIdentity?.id ?? randomUUID();
 		const taskId = opts.launchIdentity?.taskId ?? randomUUID();
 		const child = await launchPiSubagent(
@@ -203,7 +208,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
 						? resolved.tools
 						: (opts.tools ?? opts.role.allowedTools).join(","),
 					cwd: roleCwd,
-					skills: opts.behavior?.skills?.join(","),
+					skills: (opts.behavior?.skills ?? defaults?.skills)?.join(","),
 					deniedTools: [...denied],
 					autoExit,
 					interactive,
@@ -450,7 +455,10 @@ export class PiHarnessAdapter implements HarnessAdapter {
 								evidence.finalMessage.errorMessage = result.errorMessage;
 						}
 						if (child.worktree)
-							evidence.worktree = captureWorktreeHandoff(child.worktree);
+							evidence.worktree =
+								this.worktreeOperations().captureWorktreeHandoff(
+									child.worktree,
+								);
 						this.evidence.set(key, evidence);
 						child.lifecycle = markCompletionDetected(
 							child.lifecycle,
@@ -469,6 +477,11 @@ export class PiHarnessAdapter implements HarnessAdapter {
 			wait = next;
 		}
 		return this.joinWait(wait, signal);
+	}
+	private worktreeOperations(): WorktreeOperations {
+		const operations = this.operations.worktree;
+		if (!operations) throw new Error("Worktree operations are unavailable");
+		return operations;
 	}
 	private joinWait(
 		wait: CompletionWait,

@@ -11,7 +11,11 @@ export type {
 	RuntimeCandidate,
 } from "./run-session.ts";
 export { defaultRetainSurface } from "./surface-retention.ts";
-export { createDefaultRunSession } from "./pi-run-session.ts";
+export { initializeTaskModels } from "./task-model-init.ts";
+export {
+	createDefaultRunSession,
+	observePiActivity,
+} from "./pi-run-session.ts";
 export type {
 	DefaultRunSessionOptions,
 	PiLaunchSnapshot,
@@ -21,6 +25,7 @@ export type {
 	PiWorktreeLaunch,
 	WorktreeHandoffBase,
 	PiWorktreeHandoff,
+	PiWorktreeHandoffInput,
 	PiRunRecord,
 	PiStartedMetadata,
 	PiCompletedMetadata,

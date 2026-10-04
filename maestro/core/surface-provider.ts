@@ -114,7 +114,9 @@ export interface SurfaceProvider {
 	/** Close and discard a surface. */
 	closeSurface(surfaceId: string): void | Promise<void>;
 
-	listSurfaces(): SurfaceInfo[] | Promise<SurfaceInfo[]>;
+	listSurfaces(opts?: {
+		timeoutMs?: number;
+	}): SurfaceInfo[] | Promise<SurfaceInfo[]>;
 
 	/**
 	 * Wrap an already-existing surface id as a SurfaceHandle (for adapters and
@@ -128,7 +130,10 @@ export interface SurfaceProvider {
 	): WorktreeSurface | Promise<WorktreeSurface>;
 
 	/** Remove a worktree-backed surface created by createWorktreeSurface. */
-	removeWorktreeSurface(workspaceId: string): void | Promise<void>;
+	removeWorktreeSurface(
+		workspaceId: string,
+		opts?: { timeoutMs?: number },
+	): void | Promise<void>;
 
 	/** Human-readable hint when isAvailable() is false; today's terminalSetupHint(). */
 	// pi-herdr-agents extension
@@ -151,6 +156,7 @@ export interface SurfaceProvider {
 	// pi-herdr-agents extension
 	getProcessInfo(
 		surfaceId: string,
+		opts?: { timeoutMs?: number },
 	): SurfaceProcessInfo | Promise<SurfaceProcessInfo>;
 
 	// pi-herdr-agents extension

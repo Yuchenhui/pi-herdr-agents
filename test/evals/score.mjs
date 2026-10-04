@@ -6,7 +6,7 @@ import {
 	isFiniteNumber,
 	isPlainObject,
 	isString,
-} from "../../pi-extension/subagents/type-guards.ts";
+} from "../../maestro/core/config/type-guards.ts";
 
 const metricNames = ["latencyMs", "inputTokens", "outputTokens", "totalTokens"];
 const dispositions = new Set(["verified", "false_positive", "unresolved"]);

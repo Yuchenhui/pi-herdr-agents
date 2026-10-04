@@ -6,7 +6,7 @@ import {
 	isFiniteNumber,
 	isPlainObject,
 	isString,
-} from "../../../pi-extension/subagents/type-guards.ts";
+} from "../../core/config/type-guards.ts";
 import { WorktreeProvisioningError } from "../../core/surface-provider.ts";
 
 const execFileAsync = promisify(execFile);

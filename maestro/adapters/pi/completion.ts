@@ -1,9 +1,6 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 
-import {
-	isNonEmptyString,
-	isString,
-} from "../../../pi-extension/subagents/type-guards.ts";
+import { isNonEmptyString, isString } from "../../core/config/type-guards.ts";
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
 const TERMINAL_SENTINEL = /__SUBAGENT_DONE_(\d+)__/;

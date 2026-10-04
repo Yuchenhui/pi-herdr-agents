@@ -12,15 +12,16 @@ import { basename, dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { PiHarnessAdapter } from "../../maestro/adapters/pi/pi-harness-adapter.ts";
 import { launchOperationsFromSurface } from "../../maestro/adapters/pi/launch.ts";
+import { createWorktreeOperations } from "../../maestro/runtime/worktree-operations.ts";
 import type { SpawnOptions } from "../../maestro/core/harness-adapter.ts";
 import {
 	WorktreeProvisioningError,
 	type CreateWorktreeSurfaceOptions,
 } from "../../maestro/core/surface-provider.ts";
 import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
-import { FileWakeRegistry } from "../../pi-extension/subagents/wake.ts";
-import { SupervisionCoordinator } from "../../pi-extension/subagents/supervision.ts";
-import { readSubagentActivityFile } from "../../pi-extension/subagents/activity.ts";
+import { FileWakeRegistry } from "../../maestro/core/wake.ts";
+import { SupervisionCoordinator } from "../../maestro/core/supervision.ts";
+import { readSubagentActivityFile } from "../../maestro/adapters/pi/activity-file.ts";
 import { getProviderRequests } from "./fake-provider.ts";
 import { getNewEntries } from "../../maestro/adapters/pi/session.ts";
 import {
@@ -155,6 +156,7 @@ async function fixture(
 			}) + "\n",
 		);
 		const adapter = new PiHarnessAdapter({
+			worktreeOperations: createWorktreeOperations(),
 			surface,
 			paneConfig,
 			wake,
@@ -180,6 +182,14 @@ async function fixture(
 					{ provider: "pi-integration", id: "test", reasoning: true },
 				],
 				hasConfiguredAuth: () => true,
+				supportedThinkingLevels: () => [
+					"off",
+					"minimal",
+					"low",
+					"medium",
+					"high",
+				],
+				clampThinkingLevel: (_model, level) => level,
 			},
 			onObservation(child) {
 				if (child.lifecycle.pane.kind === "missing")

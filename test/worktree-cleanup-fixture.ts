@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type {
 	CleanupGitState,
 	WorktreeCleanupOperations,
-} from "../pi-extension/subagents/worktree-cleanup.ts";
+} from "../maestro/core/worktree-cleanup.ts";
 
 export function cleanupFixture() {
 	const calls: string[] = [];
@@ -24,7 +24,7 @@ export function cleanupFixture() {
 		realpath: (path) => path,
 		resolveSource: () => "/repo",
 		inspectGit: () => ({ ...state }),
-		listHerdr: () => [],
+		listWorktrees: () => [],
 		readManifests: () => [],
 		holders: async () => ({ blockers: [], warnings: [] }),
 		exists: () => present,

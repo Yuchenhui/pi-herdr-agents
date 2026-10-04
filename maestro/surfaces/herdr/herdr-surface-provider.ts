@@ -8,7 +8,7 @@ import type {
 	WorktreeSurfaceInfo,
 } from "../../core/surface-provider.ts";
 import type { PaneInspection, SurfaceHandle } from "../../core/types.ts";
-import type { PaneConfig } from "../../../pi-extension/subagents/pane-config.ts";
+import type { PaneConfig } from "../../core/config/pane-config.ts";
 import {
 	closeHerdrSurface,
 	createHerdrGroupedSurface,
@@ -16,6 +16,7 @@ import {
 	createHerdrSurfaceSplit,
 	createHerdrWorktree,
 	focusHerdrWorkspace,
+	getHerdrPaneProcessInfo,
 	getHerdrPaneProcessInfoAsync,
 	inspectHerdrPane,
 	isHerdrAvailable,
@@ -80,8 +81,8 @@ export class HerdrSurfaceProvider implements SurfaceProvider {
 		closeHerdrSurface(surfaceId);
 	}
 
-	async listSurfaces(): Promise<SurfaceInfo[]> {
-		const panes = await listHerdrPanes();
+	async listSurfaces(opts?: { timeoutMs?: number }): Promise<SurfaceInfo[]> {
+		const panes = await listHerdrPanes(opts?.timeoutMs);
 		if (panes === null) throw new Error("Unable to list Herdr panes");
 		return panes.map((pane) => {
 			const surface: SurfaceInfo = { id: pane.paneId };
@@ -118,8 +119,11 @@ export class HerdrSurfaceProvider implements SurfaceProvider {
 		};
 	}
 
-	removeWorktreeSurface(workspaceId: string): void {
-		removeHerdrWorktree(workspaceId);
+	removeWorktreeSurface(
+		workspaceId: string,
+		opts?: { timeoutMs?: number },
+	): void {
+		removeHerdrWorktree(workspaceId, opts?.timeoutMs);
 	}
 
 	setupHint(): string {
@@ -136,8 +140,16 @@ export class HerdrSurfaceProvider implements SurfaceProvider {
 		sendHerdrKeys(surfaceId, keys);
 	}
 
-	async getProcessInfo(surfaceId: string): Promise<SurfaceProcessInfo> {
-		const info = await getHerdrPaneProcessInfoAsync(surfaceId);
+	async getProcessInfo(
+		surfaceId: string,
+		opts?: { timeoutMs?: number },
+	): Promise<SurfaceProcessInfo> {
+		// Preserve ordinary asynchronous inspection; explicit cleanup probes retain
+		// the bounded synchronous CLI deadline used by the shipped cleanup path.
+		const info =
+			opts?.timeoutMs === undefined
+				? await getHerdrPaneProcessInfoAsync(surfaceId)
+				: getHerdrPaneProcessInfo(surfaceId, opts.timeoutMs);
 		return {
 			shellPid: info.shellPid,
 			foregroundProcessGroupId: info.foregroundProcessGroupId,

@@ -12,14 +12,16 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import type { Task } from "../../maestro/core/types.ts";
 import {
 	createDefaultRunSession,
+	initializeTaskModels,
+	observePiActivity,
 	type PiRunSession,
 	type PiRunSessionInfrastructure,
 	type PiRunRecord,
@@ -33,43 +35,54 @@ import {
 	type PiLedgerEntry,
 	type PiProgressEvidence,
 } from "../../maestro/runtime/index.ts";
-import { loadSupervisionConfig } from "./supervision-config.ts";
+import { loadSupervisionConfig } from "../../maestro/core/config/supervision-config.ts";
+import {
+	discoverAgentCatalog as discoverCoreAgentCatalog,
+	ROLE_PACK_DISCOVERY_EVENT,
+	type AgentCatalog,
+	type AgentDefaults,
+	type AgentDiagnostic,
+	type ListedAgentDefinition,
+	type SubagentSessionMode,
+} from "../../maestro/core/roles/discovery.ts";
 import {
 	buildAuthenticatedModelCatalog,
 	getAuthenticatedTaskPreferences,
 	parseExactModelRef,
 	resolveRuntimePlan,
 	resolveRuntimePlans,
-	wrapPiModelRegistry,
 	THINKING_LEVELS,
 	isThinkingLevel,
 	type ResolvedRuntimePlan,
 	type ThinkingLevel,
-} from "./runtime-routing.ts";
+} from "../../maestro/core/routing.ts";
+import { wrapPiModelRegistry } from "./model-registry.ts";
 import {
 	loadModelConfig,
 	resolveModelDefault,
 	writeTaskModelConfig,
+} from "../../maestro/core/config/model-config.ts";
+import {
 	TASK_CATEGORIES,
 	TASK_CATEGORY_DESCRIPTIONS,
 	type TaskPreferences,
 	type TaskPreferencesMeta,
-} from "./model-config.ts";
+} from "../../maestro/core/config/task-model-types.ts";
 import {
 	getAgentConfigDir,
+	getSubagentsConfigDir,
 	getSubagentsConfigExamplePath,
 	getSubagentsConfigPath,
 } from "./config-path.ts";
-import { loadRoleConfig, type RoleConfig } from "./role-config.ts";
 import {
-	buildTaskModelBrief,
-	buildTaskModelInitPrompt,
-} from "../../maestro/adapters/pi/task-model-init.ts";
+	loadRoleConfig,
+	type RoleConfig,
+} from "../../maestro/core/config/role-config.ts";
 import {
 	loadPersistentConfig,
 	type PersistentConfig,
-} from "./persistent-config.ts";
-import { loadPaneConfig } from "./pane-config.ts";
+} from "../../maestro/core/config/persistent-config.ts";
+import { loadPaneConfig } from "../../maestro/core/config/pane-config.ts";
 type NoProgressClassification = PiProgressEvidence["classification"];
 type NoProgressSessionTail = Pick<
 	PiProgressEvidence,
@@ -82,14 +95,14 @@ import {
 	formatStatusAggregate,
 	normalizeStatusName,
 	loadStatusConfig,
-} from "./status.ts";
+} from "../../maestro/core/status.ts";
+import { isSubagentActivityScope } from "../../maestro/core/activity.ts";
+import type { SubagentActivityState } from "../../maestro/core/types.ts";
 import {
-	readSubagentActivityFile,
-	isSubagentActivityScope,
-	type ActivityReadResult,
-	type SubagentActivityState,
-} from "./activity.ts";
-import { isFiniteNumber, isPlainObject, isString } from "./type-guards.ts";
+	isFiniteNumber,
+	isPlainObject,
+	isString,
+} from "../../maestro/core/config/type-guards.ts";
 import {
 	createLifecycle,
 	formatLifecycleTransitionLine,
@@ -102,23 +115,17 @@ import {
 	projectLifecycle,
 	type LifecycleProjection,
 	type SubagentLifecycle,
-} from "./lifecycle.ts";
+} from "../../maestro/core/lifecycle.ts";
 import {
-	createWorktreeCleanupOperations,
 	listContainedWorktrees,
 	removeContainedWorktree,
 	formatWorktreeInventory,
 	type WorktreeCleanupOperations,
-} from "./worktree-cleanup.ts";
-import {
-	captureWorktreeHandoff,
-	launchPiWorktreeHandoff,
-	runSubagentScript,
-	writeWorktreeManifest,
-	buildSubagentToolAllowlist,
-	type WorktreeHandoff,
-	type WorktreeLaunch,
-} from "../../maestro/adapters/pi/launch.ts";
+} from "../../maestro/core/worktree-cleanup.ts";
+import type {
+	WorktreeHandoff,
+	WorktreeLaunch,
+} from "../../maestro/core/worktree.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -287,55 +294,6 @@ const SubagentParams = Type.Object({
 	),
 });
 
-type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
-
-interface AgentDefaults {
-	model?: string;
-	tools?: string;
-	skills?: string;
-	thinking?: ThinkingLevel;
-	denyTools?: string;
-	spawning?: boolean;
-	persistent?: boolean;
-	autoExit?: boolean;
-	interactive?: boolean;
-	systemPromptMode?: "append" | "replace";
-	sessionMode?: SubagentSessionMode;
-	cwd?: string;
-	body?: string;
-	disableModelInvocation?: boolean;
-}
-
-type AgentSource = "package" | "global" | "project";
-
-interface AgentDefinition extends AgentDefaults {
-	name: string;
-	description?: string;
-	disableModelInvocation: boolean;
-}
-
-interface ListedAgentDefinition extends AgentDefinition {
-	source: AgentSource;
-	path: string;
-	provider?: string;
-	providerVersion?: string;
-}
-
-interface AgentDiagnostic {
-	code: string;
-	message: string;
-	path?: string;
-	agentName?: string;
-	provider?: string;
-}
-
-interface AgentCatalog {
-	agents: ListedAgentDefinition[];
-	diagnostics: AgentDiagnostic[];
-}
-
-const ROLE_PACK_DISCOVERY_EVENT = "pi-herdr-subagents:roles:discover:v1";
-
 /** Tools that are gated by `spawning: false` */
 const SPAWNING_TOOLS = new Set([
 	"subagent",
@@ -378,452 +336,19 @@ function getBundledAgentsDir(): string {
 	return join(SUBAGENTS_DIR, "../../agents");
 }
 
-function getFrontmatterLines(frontmatter: string, key: string): string[] {
-	const prefix = `${key}:`;
-	return frontmatter
-		.split("\n")
-		.filter((candidate) => candidate.startsWith(prefix));
-}
-
-function getFrontmatterValue(
-	frontmatter: string,
-	key: string,
-): string | undefined {
-	const line = getFrontmatterLines(frontmatter, key)[0];
-	return line?.slice(`${key}:`.length).trim() || undefined;
-}
-
-interface CapabilityDeclarations {
-	canonical: string[];
-	hasNoncanonical: boolean;
-}
-
-function isCapabilityDeclaration(
-	line: string,
-	field: "tools" | "deny-tools" | "spawning" | "persistent",
-): boolean {
-	const trimmed = line.trimStart();
-	const colon = trimmed.indexOf(":");
-	if (colon === -1) return false;
-	const key = trimmed.slice(0, colon).trim();
-	return key === field || key === `"${field}"` || key === `'${field}'`;
-}
-
-function getCapabilityDeclarations(
-	frontmatter: string,
-	field: "tools" | "deny-tools" | "spawning" | "persistent",
-): CapabilityDeclarations {
-	const canonicalPrefix = `${field}:`;
-	const lines = frontmatter.split("\n");
-	return {
-		canonical: lines.filter((line) => line.startsWith(canonicalPrefix)),
-		hasNoncanonical: lines.some(
-			(line) =>
-				isCapabilityDeclaration(line, field) &&
-				!line.startsWith(canonicalPrefix),
-		),
-	};
-}
-
-function validateCapabilityDeclarations(
-	frontmatter: string,
-): string | undefined {
-	for (const field of [
-		"tools",
-		"deny-tools",
-		"spawning",
-		"persistent",
-	] as const) {
-		const declarations = getCapabilityDeclarations(frontmatter, field);
-		if (declarations.hasNoncanonical) {
-			return `${field} must use an unquoted, unindented key written exactly as ${field}:`;
-		}
-		if (declarations.canonical.length > 1) {
-			return `${field} may be declared only once.`;
-		}
-		if (declarations.canonical.length === 0) continue;
-
-		const value = declarations.canonical[0].slice(`${field}:`.length).trim();
-		if (field === "spawning" || field === "persistent") {
-			if (value !== "true" && value !== "false") {
-				return `${field} must be true or false.`;
-			}
-			continue;
-		}
-
-		if (
-			!value ||
-			value.startsWith("[") ||
-			value.startsWith("{") ||
-			value.startsWith("|") ||
-			value.startsWith(">") ||
-			value.includes("#") ||
-			value.includes('"') ||
-			value.includes("'") ||
-			value.split(",").some((entry) => !entry.trim())
-		) {
-			return `${field} must use a non-empty comma-separated scalar; YAML lists and containers, comments and quotes are unsupported.`;
-		}
-	}
-	return undefined;
-}
-
-function parseOptionalBoolean(value: string | undefined): boolean | undefined {
-	return value == null ? undefined : value === "true";
-}
-
-function parseSessionMode(
-	value: string | undefined,
-): SubagentSessionMode | undefined {
-	if (value === "standalone" || value === "lineage-only" || value === "fork") {
-		return value;
-	}
-	return undefined;
-}
-
-function parseAgentDefinition(
-	content: string,
-	fallbackName: string,
-): AgentDefinition | null {
-	const match = content.match(/^---\n([\s\S]*?)\n---/);
-	if (!match) return null;
-
-	const frontmatter = match[1];
-	const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-	const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
-	const thinking = getFrontmatterValue(frontmatter, "thinking");
-
-	return {
-		name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
-		description: getFrontmatterValue(frontmatter, "description"),
-		model: getFrontmatterValue(frontmatter, "model"),
-		tools: getFrontmatterValue(frontmatter, "tools"),
-		systemPromptMode:
-			systemPromptMode === "replace"
-				? "replace"
-				: systemPromptMode === "append"
-					? "append"
-					: undefined,
-		skills:
-			getFrontmatterValue(frontmatter, "skills") ??
-			getFrontmatterValue(frontmatter, "skill"),
-		thinking: thinking && isThinkingLevel(thinking) ? thinking : undefined,
-		denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
-		spawning: parseOptionalBoolean(
-			getFrontmatterValue(frontmatter, "spawning"),
-		),
-		persistent: parseOptionalBoolean(
-			getFrontmatterValue(frontmatter, "persistent"),
-		),
-		autoExit: parseOptionalBoolean(
-			getFrontmatterValue(frontmatter, "auto-exit"),
-		),
-		interactive: parseOptionalBoolean(
-			getFrontmatterValue(frontmatter, "interactive"),
-		),
-		sessionMode: parseSessionMode(
-			getFrontmatterValue(frontmatter, "session-mode"),
-		),
-		cwd: getFrontmatterValue(frontmatter, "cwd"),
-		body: body || undefined,
-		disableModelInvocation:
-			getFrontmatterValue(
-				frontmatter,
-				"disable-model-invocation",
-			)?.toLowerCase() === "true",
-	};
-}
-
-function invalidCapabilityDeclarationDiagnostic(
-	content: string,
-	agentName: string,
-	path: string,
-): AgentDiagnostic | null {
-	const match = content.match(/^---\n([\s\S]*?)\n---/);
-	if (!match) return null;
-	const resolvedAgentName = getFrontmatterValue(match[1], "name") ?? agentName;
-	const error = validateCapabilityDeclarations(match[1]);
-	if (!error) return null;
-	return {
-		code: "invalid-capability-declaration",
-		message: `Role "${resolvedAgentName}" has an invalid capability declaration in ${path}: ${error} Use documented comma-separated tools or deny-tools values, true or false for spawning, or omit the field.`,
-		path,
-		agentName: resolvedAgentName,
-	};
-}
-
-function legacyExternalCliDiagnostic(
-	content: string,
-	agentName: string,
-	path: string,
-): AgentDiagnostic | null {
-	const match = content.match(/^---\n([\s\S]*?)\n---/);
-	const cli = match ? getFrontmatterValue(match[1], "cli") : undefined;
-	if (!match || !cli) return null;
-	const resolvedAgentName = getFrontmatterValue(match[1], "name") ?? agentName;
-	return {
-		code: "external-cli-unsupported",
-		message: `Role "${resolvedAgentName}" requests external CLI "${cli}" in ${path}. pi-herdr-agents is Pi-only; remove the cli and cli-model fields and select Claude through an authenticated Pi provider/model ID.`,
-		path,
-		agentName: resolvedAgentName,
-	};
-}
-
-function listMarkdownFiles(path: string): string[] {
-	const stat = statSync(path);
-	if (stat.isFile()) return path.endsWith(".md") ? [path] : [];
-	if (!stat.isDirectory()) return [];
-	return readdirSync(path)
-		.filter((entry) => entry.endsWith(".md"))
-		.sort((left, right) => left.localeCompare(right))
-		.map((entry) => join(path, entry));
-}
-
-interface PackageMetadata {
-	provider?: string;
-	providerVersion?: string;
-}
-
-function findPackageMetadata(path: string): PackageMetadata {
-	let current = statSync(path).isDirectory() ? path : dirname(path);
-	while (true) {
-		const packagePath = join(current, "package.json");
-		if (existsSync(packagePath)) {
-			try {
-				const pkg = JSON.parse(readFileSync(packagePath, "utf8"));
-				return {
-					provider: isString(pkg.name) ? pkg.name : undefined,
-					providerVersion: isString(pkg.version) ? pkg.version : undefined,
-				};
-			} catch {
-				return {};
-			}
-		}
-		const parent = dirname(current);
-		if (parent === current) return {};
-		current = parent;
-	}
-}
-
-interface RolePackDiscoveryResult {
-	paths: string[];
-	diagnostics: AgentDiagnostic[];
-}
-
-function discoverRolePackPaths(
-	pi?: Pick<ExtensionAPI, "events">,
-): RolePackDiscoveryResult {
-	const paths = new Set<string>();
-	const diagnostics: AgentDiagnostic[] = [];
-	if (!pi?.events) return { paths: [], diagnostics };
-
-	try {
-		pi.events.emit(ROLE_PACK_DISCOVERY_EVENT, {
-			apiVersion: 1,
-			register(path: any) {
-				if (!isString(path) || !isAbsolute(path)) {
-					diagnostics.push({
-						code: "invalid-role-pack-path",
-						message:
-							"Role packs must register an absolute file or directory path.",
-					});
-					return;
-				}
-				paths.add(resolve(path));
-			},
-		});
-	} catch (error) {
-		diagnostics.push({
-			code: "role-pack-discovery-failed",
-			message: `Role-pack discovery failed: ${error instanceof Error ? error.message : String(error)}`,
-		});
-	}
-
-	return { paths: [...paths], diagnostics };
-}
-
 function discoverAgentCatalog(
 	pi?: Pick<ExtensionAPI, "events">,
 	roleConfig: RoleConfig = bundledRoleConfig,
 ): AgentCatalog {
-	const agents = new Map<string, ListedAgentDefinition>();
-	const diagnostics: AgentDiagnostic[] = [];
-
-	const addDirectory = (path: string, source: AgentSource) => {
-		if (!existsSync(path)) return;
-		for (const filePath of listMarkdownFiles(path)) {
-			const fallbackName = basename(filePath, ".md");
-			const content = readFileSync(filePath, "utf8");
-			const legacyDiagnostic = legacyExternalCliDiagnostic(
-				content,
-				fallbackName,
-				filePath,
-			);
-			if (legacyDiagnostic) {
-				diagnostics.push(legacyDiagnostic);
-				agents.delete(legacyDiagnostic.agentName ?? fallbackName);
-				continue;
-			}
-			const capabilityDiagnostic = invalidCapabilityDeclarationDiagnostic(
-				content,
-				fallbackName,
-				filePath,
-			);
-			if (capabilityDiagnostic) {
-				diagnostics.push(capabilityDiagnostic);
-				agents.delete(capabilityDiagnostic.agentName ?? fallbackName);
-				continue;
-			}
-			const parsed = parseAgentDefinition(content, fallbackName);
-			if (parsed)
-				agents.set(parsed.name, { ...parsed, source, path: filePath });
-		}
-	};
-
-	if (roleConfig.bundled) addDirectory(getBundledAgentsDir(), "package");
-
-	const discovered = discoverRolePackPaths(pi);
-	diagnostics.push(...discovered.diagnostics);
-	const contributed = new Map<string, ListedAgentDefinition[]>();
-	for (const registeredPath of discovered.paths) {
-		if (!existsSync(registeredPath)) {
-			diagnostics.push({
-				code: "missing-role-pack-path",
-				message: `Registered role-pack path does not exist: ${registeredPath}`,
-				path: registeredPath,
-			});
-			continue;
-		}
-
-		let metadata: ReturnType<typeof findPackageMetadata>;
-		let roleFiles: string[];
-		try {
-			metadata = findPackageMetadata(registeredPath);
-			roleFiles = listMarkdownFiles(registeredPath);
-		} catch (error) {
-			diagnostics.push({
-				code: "unreadable-role-pack-path",
-				message: `Cannot read registered role-pack path ${registeredPath}: ${error instanceof Error ? error.message : String(error)}`,
-				path: registeredPath,
-			});
-			continue;
-		}
-		if (roleFiles.length === 0 && statSync(registeredPath).isFile()) {
-			diagnostics.push({
-				code: "invalid-role-pack-file",
-				message: `Registered role-pack file must use the .md extension: ${registeredPath}`,
-				path: registeredPath,
-				provider: metadata.provider,
-			});
-			continue;
-		}
-
-		for (const filePath of roleFiles) {
-			const fallbackName = basename(filePath, ".md");
-			let content: string;
-			try {
-				content = readFileSync(filePath, "utf8");
-			} catch (error) {
-				diagnostics.push({
-					code: "unreadable-role-definition",
-					message: `Cannot read role definition ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
-					path: filePath,
-					agentName: fallbackName,
-					provider: metadata.provider,
-				});
-				continue;
-			}
-			const legacyDiagnostic = legacyExternalCliDiagnostic(
-				content,
-				fallbackName,
-				filePath,
-			);
-			if (legacyDiagnostic) {
-				diagnostics.push({ ...legacyDiagnostic, provider: metadata.provider });
-				continue;
-			}
-			const capabilityDiagnostic = invalidCapabilityDeclarationDiagnostic(
-				content,
-				fallbackName,
-				filePath,
-			);
-			if (capabilityDiagnostic) {
-				diagnostics.push({
-					...capabilityDiagnostic,
-					provider: metadata.provider,
-				});
-				continue;
-			}
-			const parsed = parseAgentDefinition(content, fallbackName);
-			if (!parsed) {
-				diagnostics.push({
-					code: "invalid-role-definition",
-					message: `Role definition must start with frontmatter: ${filePath}`,
-					path: filePath,
-					agentName: fallbackName,
-					provider: metadata.provider,
-				});
-				continue;
-			}
-			if (parsed.name !== fallbackName) {
-				diagnostics.push({
-					code: "role-name-mismatch",
-					message: `Role name "${parsed.name}" must match filename "${fallbackName}" in ${filePath}`,
-					path: filePath,
-					agentName: fallbackName,
-					provider: metadata.provider,
-				});
-				continue;
-			}
-			if (!parsed.description) {
-				diagnostics.push({
-					code: "missing-role-description",
-					message: `Role "${parsed.name}" must declare a description in ${filePath}`,
-					path: filePath,
-					agentName: parsed.name,
-					provider: metadata.provider,
-				});
-				continue;
-			}
-			const definitions = contributed.get(parsed.name) ?? [];
-			definitions.push({
-				...parsed,
-				source: "package",
-				path: filePath,
-				...metadata,
-			});
-			contributed.set(parsed.name, definitions);
-		}
-	}
-
-	for (const [name, definitions] of contributed) {
-		if (agents.has(name)) {
-			diagnostics.push({
-				code: "bundled-role-collision",
-				message: `Role pack cannot replace bundled role "${name}"; use a global or project override instead.`,
-				agentName: name,
-			});
-			continue;
-		}
-		if (definitions.length > 1) {
-			const providers = definitions
-				.map((definition) => definition.provider ?? definition.path)
-				.sort((left, right) => left.localeCompare(right))
-				.join(", ");
-			diagnostics.push({
-				code: "duplicate-package-role",
-				message: `Role "${name}" is contributed by multiple role packs: ${providers}`,
-				agentName: name,
-			});
-			continue;
-		}
-		agents.set(name, definitions[0]);
-	}
-
-	addDirectory(join(getAgentConfigDir(), "agents"), "global");
-	addDirectory(join(process.cwd(), ".pi", "agents"), "project");
-
-	return { agents: [...agents.values()], diagnostics };
+	return discoverCoreAgentCatalog({
+		bundledAgentsDir: getBundledAgentsDir(),
+		agentConfigDir: getAgentConfigDir(),
+		cwd: process.cwd(),
+		roleConfig,
+		onRolePackDiscovered: pi?.events
+			? (event) => pi.events.emit(ROLE_PACK_DISCOVERY_EVENT, event)
+			: undefined,
+	});
 }
 
 function discoverAgentDefinitions(
@@ -1022,11 +547,23 @@ function resolveWorktreeLaunchWarning(
 		: undefined;
 }
 
-const statusConfig = loadStatusConfig();
-const modelConfig = loadModelConfig();
-const bundledRoleConfig = loadRoleConfig();
-const persistentConfig = loadPersistentConfig();
-const supervisionConfig = loadSupervisionConfig();
+const statusConfig = loadStatusConfig(
+	getSubagentsConfigPath(),
+	getSubagentsConfigExamplePath(),
+);
+const modelConfig = loadModelConfig(getSubagentsConfigDir());
+const bundledRoleConfig = loadRoleConfig(
+	getSubagentsConfigDir(),
+	getSubagentsConfigExamplePath(),
+);
+const persistentConfig = loadPersistentConfig(
+	getSubagentsConfigDir(),
+	getSubagentsConfigExamplePath(),
+);
+const supervisionConfig = loadSupervisionConfig(
+	getSubagentsConfigDir(),
+	getSubagentsConfigExamplePath(),
+);
 
 const MAX_RESULT_PRESENTATION_CHARS = 16_000;
 const MAX_SESSION_REFERENCE_CHARS = 10_000;
@@ -1337,7 +874,10 @@ interface RunningSubagent {
 	crashNotified?: boolean;
 }
 
-const paneConfig = loadPaneConfig();
+const paneConfig = loadPaneConfig(
+	getSubagentsConfigDir(),
+	getSubagentsConfigExamplePath(),
+);
 
 interface SubagentRuntime {
 	runningSubagents: Map<string, RunningSubagent>;
@@ -1692,23 +1232,22 @@ function observeRunningSubagent(
 		runtime.session!.observe(control, observedAt);
 		return;
 	}
-	ensureLifecycle(running);
-
-	const activityFile = running.activityFile;
-	const read: ActivityReadResult = activityFile
-		? readSubagentActivityFile(activityFile, running.id)
-		: { ok: false, reason: "missing" };
+	const observation = observePiActivity(
+		{
+			id: running.id,
+			activityFile: running.activityFile,
+			lifecycle: ensureLifecycle(running),
+		},
+		observedAt,
+	);
+	const read = observation.activityRead;
 
 	running.activityRead = read.ok
 		? { ok: true }
 		: { ok: false, reason: read.reason, error: read.error };
 
 	if (read.ok) running.activity = read.activity;
-	running.lifecycle = observeActivity(
-		ensureLifecycle(running),
-		read,
-		observedAt,
-	);
+	running.lifecycle = observation.lifecycle;
 }
 
 type NoProgressAdvisoryEvent =
@@ -1976,7 +1515,7 @@ function sendPersistentStopFailure(
 	const facts = persistentSpecialistFacts(
 		running,
 		io,
-		running.worktree ? captureWorktreeHandoff(running.worktree) : undefined,
+		io.inspectWorktree(asPiRecord(running)),
 	);
 	api.sendMessage(
 		{
@@ -2285,7 +1824,6 @@ export const __test__ = {
 	resolveLaunchBehavior,
 	resolveEffectiveAutoExit,
 	resolveEffectiveInteractive,
-	buildSubagentToolAllowlist,
 	buildPiPromptArgs,
 	resolveEffectivePersistent,
 	observeRunningSubagent,
@@ -2310,9 +1848,6 @@ export const __test__ = {
 	shouldRetainSubagentSurface,
 	resolveWorktreeLaunchWarning,
 	formatLivePersistentSpecialists,
-	captureWorktreeHandoff,
-	runSubagentScript,
-	writeWorktreeManifest,
 	runningSubagents,
 	formatElapsed,
 };
@@ -2401,13 +1936,18 @@ function normalizePiAttempt(
 			},
 			systemPrompt: params.agent ? undefined : params.systemPrompt,
 		},
-		role: {
-			name: params.agent ?? "",
-			version: "1",
-			description: "Pi host-resolved role",
-			systemPrompt: agentDefs?.body ?? params.systemPrompt ?? "",
-			allowedTools: [],
-		},
+		role: agentDefs
+			? {
+					...agentDefs.role,
+					systemPrompt: agentDefs.body ?? params.systemPrompt ?? "",
+				}
+			: {
+					name: "",
+					version: "1",
+					description: "Pi host-resolved role",
+					systemPrompt: params.systemPrompt ?? "",
+					allowedTools: [],
+				},
 		resolved: {
 			agent: params.agent,
 			cwd: params.cwd,
@@ -2731,6 +2271,7 @@ export default function subagentsExtension(
 	runtime.session = createDefaultRunSession(
 		{
 			configDir: getAgentConfigDir(),
+			configExamplePath: getSubagentsConfigExamplePath(),
 			roles: [],
 			forcePolling: supervisionConfig.forcePolling,
 			infrastructure: options.infrastructure,
@@ -2811,7 +2352,7 @@ export default function subagentsExtension(
 		cwd: ctx.cwd,
 		operations:
 			options.cleanupOperations?.(ctx) ??
-			createWorktreeCleanupOperations({
+			runtime.session!.createWorktreeCleanupOperations({
 				manifestDir: join(
 					ctx.sessionManager.getSessionDir(),
 					"artifacts",
@@ -3422,7 +2963,10 @@ export default function subagentsExtension(
 							text: lines.join("\n") || "No subagent definitions found.",
 						},
 					],
-					details: { agents: list, diagnostics: catalog.diagnostics },
+					details: {
+						agents: list.map(({ role: _role, ...definition }) => definition),
+						diagnostics: catalog.diagnostics,
+					},
 				};
 			},
 
@@ -3592,12 +3136,14 @@ export default function subagentsExtension(
 			description:
 				"Draft task-category model preferences from the live registry; optional arguments set ranking preferences",
 			handler: async (args, ctx) => {
-				const brief = buildTaskModelBrief(
-					ctx.modelRegistry,
-					loadModelConfig(),
-					args,
-				);
-				pi.sendUserMessage(buildTaskModelInitPrompt(brief));
+				const registry = ctx.modelRegistry;
+				const current = loadModelConfig(getSubagentsConfigDir());
+				const prompt = initializeTaskModels({
+					projectActiveRegistry: (project) => project(registry),
+					current,
+					preferences: args,
+				});
+				pi.sendUserMessage(prompt);
 			},
 		});
 
@@ -3773,30 +3319,26 @@ export default function subagentsExtension(
 					},
 					wrapPiModelRegistry(ctx.modelRegistry),
 				);
-				const result = await launchPiWorktreeHandoff({
-					kind: "fresh",
+				const result = await runtime.session!.handoffWorktree({
 					name: `wt: ${branch}`,
 					task,
-					cwd: ctx.cwd,
-					worktree: { branch },
-					handoff: { leafId },
-					parent: {
-						cwd: ctx.cwd,
-						invocationCwd: process.cwd(),
-						sessionFile,
-						sessionId: ctx.sessionManager.getSessionId(),
-						sessionDir: ctx.sessionManager.getSessionDir(),
-						agentDir: getAgentConfigDir(),
-					},
+					branch,
+					leafId,
 					runtimePlan,
-					behavior: {
-						deniedTools: [],
-						autoExit: false,
-						interactive: true,
-						sessionMode: "standalone",
+					snapshot: {
+						parent: {
+							cwd: ctx.cwd,
+							invocationCwd: process.cwd(),
+							sessionFile,
+							sessionId: ctx.sessionManager.getSessionId(),
+							sessionDir: ctx.sessionManager.getSessionDir(),
+							agentDir: getAgentConfigDir(),
+						},
+						paneConfig,
+						modelRegistry: wrapPiModelRegistry(ctx.modelRegistry),
 					},
 				});
-				const worktree = result.running.worktree;
+				const worktree = result.record.worktree;
 				if (!worktree) {
 					throw new Error("Worktree handoff did not return worktree metadata");
 				}

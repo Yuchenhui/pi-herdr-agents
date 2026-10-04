@@ -8,7 +8,7 @@ import { existsSync } from "node:fs";
 import {
 	isPlainObject,
 	isString,
-} from "../../pi-extension/subagents/type-guards.ts";
+} from "../../maestro/core/config/type-guards.ts";
 
 interface ChatMessage {
 	role?: string;
