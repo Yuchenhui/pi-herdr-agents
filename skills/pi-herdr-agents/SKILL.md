@@ -1,6 +1,6 @@
 ---
 name: pi-herdr-agents
-description: Operate the pi-herdr-agents host. Use when asked to launch, delegate to, supervise, interrupt, stop, resume, or clean up Pi subagents; to use worktrees, persistent specialists, or model routing; to edit the host's config.json or task-model preferences; or when a child looks hung, stalled, or unwanted.
+description: Operate the pi-herdr-agents host. Use when asked to launch, delegate to, supervise, interrupt, cancel, stop, resume, or clean up Pi subagents; to use worktrees, persistent specialists, or model routing; to edit the host's config.json or task-model preferences; or when a child looks hung, stalled, or unwanted.
 ---
 
 # pi-herdr-agents operating guide
@@ -106,10 +106,42 @@ tools, model, thinking, and worktree binding are fixed at launch.
 | End a persistent specialist | `subagent_stop` | Graceful, then confirmed exit | Persistent only; not immediate |
 | Continue an exited ordinary child | `subagent_resume` | New ordinary pane on the old session | Rejected for managed-worktree and persistent sessions; cannot change model |
 | Follow up a live persistent specialist | `subagent_send` | One task if idle | Rejected while busy or stop-unconfirmed |
+| Terminate an ordinary child | `subagent_cancel({ id\|name })` | Records cancel intent first, terminates the owned process, delivers one `cancelled` result; no fallback or retry | Ordinary only (persistent rejected); not confirmed unless the status says so |
 | Close the pane, kill the process, Ctrl-C by hand | Avoid | See fallback gotcha | Can launch a replacement run |
 
 `id` or `name` must be an exact running ID or an exact, unambiguous name; `id`
 wins if both are given.
+
+## Cancelling an ordinary child: `subagent_cancel`
+
+`subagent_cancel({ id|name })` ends one running ordinary child, including an
+interrupted one (targets resolve as for `subagent_interrupt`). Intent is
+recorded before anything is killed, so no fallback, retry, or recovery starts
+afterwards. Do not poll; the result arrives on its own.
+
+| Status | Meaning for you |
+| `confirmed` | Termination confirmed. One cancelled result is delivered. |
+| `requested` | Launch in flight; terminated once acquired, no later model tried. Wait. |
+| `unconfirmed` | Termination failed. The run stays live and supervised; nothing is delivered. Retry, or report. |
+| `already-terminal` | Already had a natural result or was retired; nothing cancelled. |
+
+Repeated cancels join an in-flight one and keep the first request time; there
+is no SIGKILL escalation. The one `subagent_result` carries `error: "cancelled"`
+and a `cancellation` record (not a provider failure); a natural result taken
+before the cancel stays authoritative.
+
+Termination follows ownership:
+
+- **Ordinary pane:** the pane is closed. Confirmed means Herdr reports the pane
+  absent; this is not a separate OS process check.
+- **Worktree child:** pane, workspace, checkout, and commits are never closed
+  or removed. SIGTERM goes only to the owned Pi process; confirmed only when it
+  is gone and the shell is idle (any other foreground process is never
+  signalled: `unconfirmed`). The manifest records `cancelled`; the normal
+  handoff is delivered. No Git cleanup; `worktree_remove` stays separate.
+- **Persistent specialist:** rejected with a pointer to `subagent_stop`.
+
+Widget labels: `cancelling…`, `cancel unconfirmed`. `spawning: false` denies it.
 
 ### State labels
 
@@ -127,7 +159,9 @@ A request is not an exit. `interrupt` sent, `stop` requested, or `stop-pending`
 means nothing has stopped. A delivered task result ends the task, not the
 session: persistent specialists stay alive after results and keep their
 worktree lease. Say an ordinary child is stopped only with a delivered
-result or failure notice for that run, or confirmed process exit. Say a
+result or failure notice for that run (including the cancelled result), or a
+`subagent_cancel` status of `confirmed`. A `requested` or `unconfirmed` cancel
+means it is still live: retry or report. Say a
 persistent specialist is stopped only with confirmed process exit (for
 example `subagent_stop` reporting `stopped`). Otherwise report the
 uncertainty. Do not start a concurrent writer on the same files or worktree
@@ -140,8 +174,8 @@ A pane that disappears without completion evidence is treated as error or
 retries after a provider/agent error. So closing a pane by hand can, as
 observed in practice (not guaranteed), launch a replacement run and keep the
 work you tried to cancel going. Persistent specialists never auto-restart.
-Never close panes, kill processes, or send raw terminal keystrokes to cancel.
-If a replacement launched anyway, identify the new run and handle it with the
+Never close panes, kill processes, or send raw terminal keystrokes to cancel;
+use `subagent_cancel`, which blocks fallback first. If a replacement launched anyway, identify the new run and handle it with the
 tools above.
 
 ## Worktrees
@@ -225,7 +259,7 @@ installed versions may still bundle them. Verify with `subagents_list`,
 
 ## Finding current help
 
-Read live tool descriptions first, then the installed README sections:
-"Spawning Subagents", "Persistent specialists", "Interrupting a running
-subagent", "The `/worktree` Workflow", "Custom Agents", and "Configuration".
-Confirm the installed version before trusting source on a branch.
+Read live tool descriptions first, then the installed README sections
+("Spawning Subagents", "Persistent specialists", "Interrupting a running
+subagent", "Cancelling a running subagent", "The `/worktree` Workflow",
+"Custom Agents", "Configuration"). Confirm the installed version first.
