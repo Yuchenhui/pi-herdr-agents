@@ -120,6 +120,7 @@ recorded before anything is killed, so no fallback, retry, or recovery starts
 afterwards. Do not poll; the result arrives on its own.
 
 | Status | Meaning for you |
+| --- | --- |
 | `confirmed` | Termination confirmed. One cancelled result is delivered. |
 | `requested` | Launch in flight; terminated once acquired, no later model tried. Wait. |
 | `unconfirmed` | Termination failed. The run stays live and supervised; nothing is delivered. Retry, or report. |
@@ -135,9 +136,10 @@ Termination follows ownership:
 - **Ordinary pane:** the pane is closed. Confirmed means Herdr reports the pane
   absent; this is not a separate OS process check.
 - **Worktree child:** pane, workspace, checkout, and commits are never closed
-  or removed. SIGTERM goes only to the owned Pi process; confirmed only when it
-  is gone and the shell is idle (any other foreground process is never
-  signalled: `unconfirmed`). The manifest records `cancelled`; the normal
+  or removed. SIGTERM goes only to the owned Pi process; confirmed when it is gone
+  and the shell is idle, or when Herdr reports the pane already gone (any other
+  foreground process is never signalled: `unconfirmed`). Cancel itself never
+  closes the retained pane. The manifest records `cancelled`; the normal
   handoff is delivered. No Git cleanup; `worktree_remove` stays separate.
 - **Persistent specialist:** rejected with a pointer to `subagent_stop`.
 
@@ -160,8 +162,10 @@ means nothing has stopped. A delivered task result ends the task, not the
 session: persistent specialists stay alive after results and keep their
 worktree lease. Say an ordinary child is stopped only with a delivered
 result or failure notice for that run (including the cancelled result), or a
-`subagent_cancel` status of `confirmed`. A `requested` or `unconfirmed` cancel
-means it is still live: retry or report. Say a
+`subagent_cancel` status of `confirmed`. A `requested` cancel means it is still
+live and terminates once the launch settles: wait for the cancelled result. An
+`unconfirmed` cancel means termination failed and it is still live: retry or
+report the uncertainty. Say a
 persistent specialist is stopped only with confirmed process exit (for
 example `subagent_stop` reporting `stopped`). Otherwise report the
 uncertainty. Do not start a concurrent writer on the same files or worktree
