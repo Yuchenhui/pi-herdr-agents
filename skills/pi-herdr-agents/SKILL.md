@@ -61,8 +61,9 @@ registered by installed role packs. An empty catalog is valid. `subagents_list`
 and `/subagent list` show each visible role and its source. Roles that request
 an external CLI (`cli`) fail before launch. Role frontmatter can set
 `spawning: false` (denies all subagent lifecycle tools) and `deny-tools`
-(tools registered by this package). Children also get `caller_ping` and, for
-autonomous-exit control, `subagent_done`; these exist only inside child
+(tools registered by this package). Children also get `caller_ping`, and
+interactive (non-`auto-exit`) children get `subagent_done` to mark themselves
+complete; `auto-exit` roles exit on their own. These exist only inside child
 sessions. Parent-only tools (`worktree_list`, `worktree_remove`,
 `subagents_write_task_models`, `/subagents-init`) are omitted in children. For
 frontmatter authoring, read the README "Custom Agents" and "Tool Access Control".
