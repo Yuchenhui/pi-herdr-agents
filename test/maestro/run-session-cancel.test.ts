@@ -358,6 +358,147 @@ describe("RunSession operator cancel", { timeout: 5000 }, () => {
 		assert.equal(f.delivered.length, 1);
 	});
 
+	it("after every fallback launch fails, a cancel during delivery is already-terminal", async () => {
+		const adapter = new Adapter();
+		const delivering = deferred();
+		const release = deferred();
+		const delivered: RunResult[] = [];
+		const session = createRunSession({
+			adapter,
+			roles: [role],
+			cwd: "/parent",
+			hooks: {
+				onSettled: async (result) => {
+					delivered.push(result);
+					delivering.resolve();
+					await release.promise;
+				},
+			},
+		});
+		let attempts = 0;
+		const t = task();
+		const handle = await session.spawn(t, {
+			role,
+			persistent: false,
+			candidates,
+			spawnAttempt: async (spawn, index) => {
+				attempts++;
+				if (index > 0) throw new Error(`launch ${index} failed`);
+				return { handle: await adapter.spawn(spawn), adapter };
+			},
+		});
+		const result = session.supervise(handle, t);
+		adapter.fail(handle.id, "provider refused");
+		await delivering.promise;
+		assert.equal(attempts, 3, "every fallback was attempted");
+		// The natural failure is being delivered: a cancel cannot add an outcome.
+		assert.deepEqual(await session.cancel(t.id), {
+			status: "already-terminal",
+		});
+		release.resolve();
+		const settled = await result;
+		assert.equal(settled.outcome, "failed");
+		assert.equal(settled.cancellation, undefined);
+		assert.match(settled.error!, /Fallback launch failures: .*launch 2 failed/);
+		assert.deepEqual(adapter.kills, []);
+		assert.deepEqual(delivered, [settled]);
+	});
+
+	it("projects cancel state onto a transferred owner and its automatic kill outcome", async () => {
+		const states: string[] = [];
+		const adapter = new Adapter();
+		const delivered: RunResult[] = [];
+		const session = createRunSession({
+			adapter,
+			roles: [role],
+			cwd: "/parent",
+			hooks: {
+				onCancelState: (handle, _task, state) => {
+					states.push(`${handle.id}:${state}`);
+				},
+				onSettled: (result) => void delivered.push(result),
+			},
+		});
+		const acquired = deferred<OwnedRunAttempt>();
+		const started = deferred();
+		const t = task();
+		const first = await session.spawn(t, {
+			role,
+			persistent: false,
+			candidates,
+			spawnAttempt: async (spawn, index) => {
+				if (index === 0) return { handle: await adapter.spawn(spawn), adapter };
+				started.resolve();
+				return acquired.promise;
+			},
+		});
+		const result = session.supervise(first, t);
+		adapter.fail(first.id, "provider refused");
+		await started.promise;
+		assert.equal((await session.cancel(t.id)).status, "requested");
+		assert.deepEqual(states, [`${first.id}:requested`]);
+		const second = await adapter.spawn({
+			name: "second",
+			task: "work",
+			role,
+			cwd: "/source",
+			sessionId: "second",
+		});
+		adapter.killError = () => new Error("pane still present");
+		acquired.resolve({ handle: second, adapter });
+		while (adapter.kills.length === 0) await turn();
+		await turn();
+		// The kernel's own kill of the transferred owner failed: the new owner,
+		// not the one captured by the cancel call, shows it, and nothing settles.
+		assert.deepEqual(states, [
+			`${first.id}:requested`,
+			`${second.id}:requested`,
+			`${second.id}:unconfirmed`,
+		]);
+		assert.equal(session.getHandle(t.id), second);
+		assert.equal(delivered.length, 0);
+		adapter.killError = undefined;
+		const retry = await session.cancel(t.id);
+		assert.equal(retry.status, "confirmed");
+		assert.deepEqual(states.slice(3), [
+			`${second.id}:requested`,
+			`${second.id}:confirmed`,
+		]);
+		assertCancelled(await result, second);
+		assert.equal(delivered.length, 1);
+	});
+
+	it("a cancel taken too late projects no cancel state", async () => {
+		const states: string[] = [];
+		const adapter = new Adapter();
+		const session = createRunSession({
+			adapter,
+			roles: [role],
+			cwd: "/parent",
+			hooks: {
+				onCancelState: (handle, _task, state) =>
+					void states.push(`${handle.id}:${state}`),
+			},
+		});
+		const t = task({ runtime: candidates[0] });
+		const handle = await session.spawn(t, {
+			role,
+			persistent: false,
+			candidates: [candidates[0]],
+			spawnAttempt: async (spawn) => ({
+				handle: await adapter.spawn(spawn),
+				adapter,
+			}),
+		});
+		const result = session.supervise(handle, t);
+		adapter.complete(handle.id, { reason: "done", exitCode: 0 });
+		await result;
+		assert.deepEqual(await session.cancel(t.id), {
+			status: "already-terminal",
+		});
+		assert.deepEqual(states, []);
+	});
+
 	it("cancel during the initial acquisition terminates the acquired owner without a leak", async () => {
 		const f = fixture();
 		const acquired = deferred<OwnedRunAttempt>();

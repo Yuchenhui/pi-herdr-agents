@@ -2144,6 +2144,11 @@ describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
 	it("cancels a worktree child: stops only its process, retains workspace, commits, and handoff", async () =>
 		withAdapterHost(async (f) => {
 			const { retained, git } = await worktreeHost(f);
+			// The host process table holds the shell and no owned Pi process.
+			f.patch(f.infrastructure, "localProcesses", () => ({
+				owned: [],
+				shellVisible: true,
+			}));
 			const child = await f.launch({
 				name: "writer",
 				task: "bounded",
@@ -2202,6 +2207,106 @@ describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
 			assert.equal(
 				readFileSync(join(retained, "work"), "utf8"),
 				"committed work",
+			);
+		}));
+
+	it("a worktree child that is only absent from the foreground stays unconfirmed; shutdown never records cancelled", async () =>
+		withAdapterHost(async (f) => {
+			const { retained } = await worktreeHost(f);
+			// Suspended Pi: Herdr shows the idle shell; the host still has the process.
+			f.patch(f.infrastructure, "localProcesses", () => ({
+				owned: [4242],
+				shellVisible: true,
+			}));
+			const child = await f.launch({
+				name: "suspended",
+				task: "bounded",
+				worktree: { branch: "cancel-worktree" },
+			});
+			f.patch(f.surface, "getProcessInfo", () => ({
+				shellPid: 10,
+				foregroundProcessGroupId: 10,
+				pids: [10],
+				foregroundProcesses: [],
+			}));
+			const manifest = () =>
+				JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state;
+			const report = await cancel(f, { id: child.id });
+			assert.equal(report.details.status, "unconfirmed");
+			assert.match(
+				report.details.error,
+				/owned Pi process 4242 is still alive outside the pane foreground/,
+			);
+			assert.equal(child.cancelState, "unconfirmed");
+			assert.equal(manifest(), "running");
+			// Parent shutdown suppresses the unconfirmed run: it is not a cancellation.
+			f.runtime.session.suppress(f.runtime.session.getControlTaskId(child.id));
+			await until(f, () => manifest() !== "running", "the shutdown manifest");
+			assert.equal(manifest(), "failed");
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(results(f).length, 0);
+			assert.deepEqual(f.closed, []);
+			assert.ok(existsSync(retained));
+		}));
+
+	it("a fallback owner transferred after the cancel shows its own unconfirmed kill and stays live", async () =>
+		withAdapterHost(async (f) => {
+			const first = await f.launch({
+				name: "transferred",
+				task: "bounded",
+				model: "fake/first, fake/second, fake/third",
+			});
+			let launched!: () => void;
+			let release!: () => void;
+			const launching = new Promise<void>((resolve) => {
+				launched = resolve;
+			});
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const runScript = f.launchOperations.runScript;
+			f.patch(f.launchOperations, "runScript", async (...args: any[]) => {
+				launched();
+				await gate;
+				return runScript(...args);
+			});
+			await f.finish(first, {
+				type: "error",
+				errorMessage: "provider refused",
+			});
+			await launching;
+			const requested = await cancel(f, { id: first.id });
+			assert.equal(requested.details.status, "requested");
+			assert.equal(first.cancelState, "requested");
+			// The transferred owner's automatic kill cannot confirm termination.
+			f.patch(f.surface, "closeSurface", async () => {
+				throw new Error("herdr pane close timed out");
+			});
+			release();
+			let second: any;
+			await until(
+				f,
+				() => {
+					second = f.runtime.runningSubagents.get(first.id);
+					return second !== first && second?.cancelState === "unconfirmed";
+				},
+				"the transferred owner's unconfirmed cancel",
+			);
+			assert.match(
+				subagentsModule.__test__
+					.renderSubagentWidgetLines([second], 100)
+					.join("\n"),
+				/cancel unconfirmed/,
+			);
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(
+				results(f).length,
+				0,
+				"nothing is delivered while unconfirmed",
+			);
+			assert.equal(f.commands.length, 2, "the third model is never launched");
+			assert.ok(
+				f.surface.listSurfaces().some((s: any) => s.id === second.surface),
 			);
 		}));
 });

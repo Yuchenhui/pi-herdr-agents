@@ -136,11 +136,14 @@ Termination follows ownership:
 - **Ordinary pane:** the pane is closed. Confirmed means Herdr reports the pane
   absent; this is not a separate OS process check.
 - **Worktree child:** pane, workspace, checkout, and commits are never closed
-  or removed. SIGTERM goes only to the owned Pi process; confirmed when it is gone
-  and the shell is idle, or when Herdr reports the pane already gone (any other
-  foreground process is never signalled: `unconfirmed`). Cancel itself never
-  closes the retained pane. The manifest records `cancelled`; the normal
-  handoff is delivered. No Git cleanup; `worktree_remove` stays separate.
+  or removed. SIGTERM goes only to the owned foreground Pi process; confirmed
+  when Herdr shows it gone with the shell idle and the host process table holds
+  no process with the child's session, or when Herdr reports the pane already
+  gone. Foreground absence alone (a suspended or backgrounded Pi, an unreadable
+  process table) and any other foreground process, never signalled, leave it
+  `unconfirmed`. Cancel itself never closes the retained pane. The manifest
+  records `cancelled` only after confirmation; the normal handoff is
+  delivered. No Git cleanup; `worktree_remove` stays separate.
 - **Persistent specialist:** rejected with a pointer to `subagent_stop`.
 
 Widget labels: `cancelling…`, `cancel unconfirmed`. `spawning: false` denies it.

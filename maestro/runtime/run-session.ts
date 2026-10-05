@@ -51,6 +51,16 @@ export interface RunSessionHooks {
 		projection: LifecycleProjection,
 		observation: RunObservation,
 	): void;
+	/**
+	 * Operator cancel state of the run's current owner: "requested" when intent is
+	 * recorded or a cancelled owner is transferred, then each owned kill's
+	 * outcome, including kills the run starts itself. Presentation only.
+	 */
+	onCancelState?(
+		handle: AgentHandle,
+		task: Task,
+		state: "requested" | "confirmed" | "unconfirmed",
+	): void;
 	/** Successful void/delivered/suppressed permits cleanup; rejection retains panes. */
 	onSettled?(
 		result: RunResult,
@@ -335,10 +345,29 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 			// Even a suppressed or cancelled in-flight acquisition must transfer its
 			// real owner; a cancelled one is terminated as soon as it is registered.
 			register(entry, owner);
-			if (entry.cancel) void terminate(entry);
+			terminateTransferred(entry);
 			return { owner, failures };
 		}
 		return { owner: undefined, failures };
+	}
+
+	function notifyCancel(
+		entry: RunEntry,
+		state: "requested" | "confirmed" | "unconfirmed",
+		owner = entry.active,
+	) {
+		if (!owner) return;
+		try {
+			options.hooks?.onCancelState?.(owner.handle, entry.task, state);
+		} catch {
+			/* presentation only; never affects termination */
+		}
+	}
+
+	function terminateTransferred(entry: RunEntry) {
+		if (!entry.cancel) return;
+		notifyCancel(entry, "requested");
+		void terminate(entry);
 	}
 
 	// One owned kill at a time. Only a resolved kill confirms termination; only
@@ -361,6 +390,7 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 				state.error = errorText(error);
 			} finally {
 				state.kill = undefined;
+				notifyCancel(entry, state.termination, owner);
 				wake(state);
 			}
 		})();
@@ -488,6 +518,9 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 						evidence: { ...result.evidence, errorMessage: message },
 					};
 				}
+				// Every fallback failed: this natural failure is now terminal, so a
+				// cancel during its delivery is too late, never a second outcome.
+				entry.settled = true;
 			}
 			return deliver(entry, result);
 		}
@@ -557,7 +590,7 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 					entry.acquiring = false;
 				}
 				register(entry, owner);
-				if (entry.cancel) void terminate(entry);
+				terminateTransferred(entry);
 				if (entry.suppressed) {
 					suppressedBeforeSupervision(entry);
 					throw new Error(ABORT_MESSAGE);
@@ -669,6 +702,7 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 				termination: "unconfirmed",
 				waiters: new Set(),
 			});
+			if (state.termination !== "confirmed") notifyCancel(entry, "requested");
 			const report = (status: CancelReport["status"]): CancelReport => {
 				const value: CancelReport = { status, requestedAt: state.requestedAt };
 				if (status === "unconfirmed" && state.error) value.error = state.error;

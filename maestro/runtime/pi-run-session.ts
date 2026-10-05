@@ -16,7 +16,10 @@ import type {
 	SurfaceProvider,
 	WorktreeSurfaceInfo,
 } from "../core/surface-provider.ts";
-import { PiHarnessAdapter } from "../adapters/pi/pi-harness-adapter.ts";
+import {
+	PiHarnessAdapter,
+	type LocalProcessProbe,
+} from "../adapters/pi/pi-harness-adapter.ts";
 import {
 	launchOperationsFromSurface,
 	launchPiWorktreeHandoff,
@@ -324,6 +327,8 @@ export interface PiRunSessionInfrastructure {
 	launchOperations: PiLaunchOperations;
 	worktreeOperations?: WorktreeOperations;
 	supervision: SupervisionCoordinator;
+	/** Host process-table probe for worktree cancel confirmation; tests inject it. */
+	localProcesses?: LocalProcessProbe;
 }
 // pi-herdr-agents extension
 export interface DefaultRunSessionOptions {
@@ -407,7 +412,7 @@ interface PiSessionOwner {
 	entries: Map<string, PiEntry>;
 	infrastructure: Pick<
 		PiRunSessionInfrastructure,
-		"surfaceProvider" | "supervision"
+		"surfaceProvider" | "supervision" | "localProcesses"
 	>;
 	worktreeOperations: WorktreeOperations;
 }
@@ -584,6 +589,17 @@ export function createDefaultRunSession(
 						task,
 					);
 				},
+				onCancelState(handle, task, cancelState) {
+					// The kernel owns the intent; project it onto whichever owner is
+					// current, including one transferred after the cancel call.
+					const entry = entries.get(task.id);
+					if (
+						entry &&
+						entry.record.id === handle.id &&
+						entry.record.sessionFile === handle.sessionId
+					)
+						entry.record.cancelState = cancelState;
+				},
 				onObserved(_handle, _projection, observation) {
 					const entry = [...entries.values()].find(
 						(e) =>
@@ -730,6 +746,7 @@ export function createDefaultRunSession(
 			parent: snapshot.parent,
 			parentRuntime: snapshot.parentRuntime,
 			supervision: state.infrastructure.supervision,
+			localProcesses: state.infrastructure.localProcesses,
 			operations: launchOperations(snapshot),
 			onObservation(child, kind) {
 				const at = Date.now();
@@ -861,9 +878,11 @@ export function createDefaultRunSession(
 						child.worktree,
 					);
 					try {
+						// Only confirmed termination is a cancellation. Shutdown suppression
+						// of an unconfirmed cancel records what a plain shutdown would.
 						state.worktreeOperations.persistWorktreeResult(
 							child.worktree,
-							result.cancellation
+							result.cancellation?.termination === "confirmed"
 								? "cancelled"
 								: worktreeResultState(exitCode, !!evidence?.ping),
 							worktree,
@@ -1142,21 +1161,10 @@ export function createDefaultRunSession(
 			state.entries.delete(id);
 		},
 		async cancel(id) {
-			// The kernel records the terminal intent in this call's synchronous prefix.
-			const pending = state.kernel.cancel(id);
-			const r = live(id)?.record;
-			const previous = r?.cancelState;
-			if (r && !r.persistent) r.cancelState = "requested";
+			// The kernel records the intent and projects every owner's cancel state
+			// through onCancelState; a natural result taken first keeps its own.
 			try {
-				const report = await pending;
-				if (r)
-					// A natural result taken first keeps its own presentation.
-					r.cancelState =
-						report.status === "already-terminal" ? previous : report.status;
-				return report;
-			} catch (error) {
-				if (r) r.cancelState = previous;
-				throw error;
+				return await state.kernel.cancel(id);
 			} finally {
 				prune(id);
 			}

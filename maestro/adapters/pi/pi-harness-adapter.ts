@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -91,6 +91,8 @@ export interface PiHarnessAdapterOptions {
 	worktreeOperations?: WorktreeOperations;
 	/** Signals one Herdr-identified owned Pi process; injected by tests. */
 	terminateProcess?(pid: number, sessionFile: string): void;
+	/** Host process-table evidence for a retained worktree child's exit; injected by tests. */
+	localProcesses?: LocalProcessProbe;
 	/** Bound for confirming a retained worktree child's exit. Default: 5000ms. */
 	killTimeoutMs?: number;
 	/** Explicit local evidence/lifecycle bridge. The host still owns delivery and deduplication. */
@@ -105,6 +107,24 @@ export interface PiHarnessAdapterOptions {
 			| "interrupt",
 	): void;
 }
+/**
+ * This host's process table, seen from the parent. Herdr enumerates only a
+ * pane's foreground processes, so a suspended or backgrounded Pi is invisible
+ * there; exit is proven only when no local process still carries the child's
+ * exact `--session` argv. `shellVisible` shows the pane's shell is in this PID
+ * namespace, so an empty owned list is evidence rather than a blind spot.
+ * Throws when the process table cannot be read.
+ */
+export interface LocalProcessView {
+	/** Local PIDs whose argv carries the child's exact `--session`. */
+	owned: number[];
+	shellVisible: boolean;
+}
+export type LocalProcessProbe = (
+	sessionFile: string,
+	shellPid: number,
+) => LocalProcessView;
+
 interface CompletionWait {
 	controller: AbortController;
 	promise: Promise<CompletionEvidence>;
@@ -386,23 +406,40 @@ export class PiHarnessAdapter implements HarnessAdapter {
 			info.foregroundProcesses.filter((candidate) =>
 				isExpectedPiProcess(candidate, child.sessionFile, cwd),
 			);
-		// Confirmed only by Herdr: no owned Pi process and an idle retained shell,
-		// or the pane itself is gone.
+		// Confirmed by Herdr's pane being gone, or by Herdr showing no owned Pi in
+		// the foreground and an idle retained shell AND this host's process table
+		// holding no process with the child's session. Foreground absence alone is
+		// never exit evidence: a suspended or backgrounded Pi is still alive.
 		const stopped = async (): Promise<boolean | string> => {
+			let info: SurfaceProcessInfo;
 			try {
-				const info = await this.options.surface.getProcessInfo(child.surface);
-				return (
-					(owned(info).length === 0 &&
-						info.shellPid !== undefined &&
-						info.foregroundProcessGroupId === info.shellPid) ||
-					"owned Pi process is still in the pane foreground"
-				);
+				info = await this.options.surface.getProcessInfo(child.surface);
 			} catch (error) {
 				const pane = await this.options.surface
 					.inspectSurface(child.surface)
 					.catch(() => undefined);
 				return pane?.kind === "missing" || errorText(error);
 			}
+			if (
+				owned(info).length > 0 ||
+				info.shellPid === undefined ||
+				info.foregroundProcessGroupId !== info.shellPid
+			)
+				return "owned Pi process is still in the pane foreground";
+			let local: LocalProcessView;
+			try {
+				local = (this.options.localProcesses ?? inspectLocalProcesses)(
+					child.sessionFile,
+					info.shellPid,
+				);
+			} catch (error) {
+				return `only foreground absence is known; this host's process table is unreadable: ${errorText(error)}`;
+			}
+			if (!local.shellVisible)
+				return `only foreground absence is known; pane shell ${info.shellPid} is not visible in this host's process table`;
+			if (local.owned.length > 0)
+				return `owned Pi process ${local.owned.join(", ")} is still alive outside the pane foreground (suspended or backgrounded)`;
+			return true;
 		};
 		// Providers may throw synchronously or reject; both mean "unknown".
 		const info = await (async () =>
@@ -664,8 +701,58 @@ function terminateOwnedPiProcess(pid: number, sessionFile: string): void {
 	} catch (error) {
 		// SAFETY: fs and process.kill failures are Node errors with an optional code.
 		const code = (error as NodeJS.ErrnoException).code;
-		// Already gone: Herdr confirmation below decides, never this exception.
+		// Already gone: the exit evidence check decides, never this exception.
 		if (code === "ENOENT" || code === "ESRCH") return;
 		throw error;
 	}
+}
+
+function ownsSession(argv: readonly string[], sessionFile: string): boolean {
+	const index = argv.indexOf("--session");
+	return index >= 0 && argv[index + 1] === sessionFile;
+}
+
+// Linux reads exact NUL-separated argv from /proc; zombies have an empty
+// cmdline and count as exited. Elsewhere `ps` lists space-joined commands.
+export function inspectLocalProcesses(
+	sessionFile: string,
+	shellPid: number,
+): LocalProcessView {
+	if (process.platform === "linux") {
+		const owned: number[] = [];
+		for (const name of readdirSync("/proc")) {
+			if (!/^\d+$/.test(name)) continue;
+			let argv: string[];
+			try {
+				argv = readFileSync(`/proc/${name}/cmdline`, "utf8").split("\0");
+			} catch (error) {
+				// SAFETY: fs failures are Node errors with an optional code.
+				const code = (error as NodeJS.ErrnoException).code;
+				// Exited mid-scan, or another user's process (never the owned child).
+				if (code === "ENOENT" || code === "ESRCH" || code === "EACCES")
+					continue;
+				throw error;
+			}
+			if (ownsSession(argv, sessionFile)) owned.push(Number(name));
+		}
+		return { owned, shellVisible: existsSync(`/proc/${shellPid}`) };
+	}
+	const rows = execFileSync("ps", ["-A", "-o", "pid=", "-o", "command="], {
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	const owned: number[] = [];
+	let shellVisible = false;
+	const marker = ` --session ${sessionFile}`;
+	for (const row of rows.split("\n")) {
+		const match = /^\s*(\d+)\s(.*)$/.exec(row);
+		if (!match) continue;
+		const pid = Number(match[1]);
+		if (pid === shellPid) shellVisible = true;
+		const command = match[2]!;
+		const at = command.indexOf(marker);
+		const next = command[at + marker.length];
+		if (at >= 0 && (next === undefined || next === " ")) owned.push(pid);
+	}
+	return { owned, shellVisible };
 }

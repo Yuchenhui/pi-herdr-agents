@@ -35,10 +35,15 @@ kernel producer, adapter, and finalization. It is not a second engine.
    aborted, so a failed kill leaves the run supervised.
 4. **Pending acquisition.** With an acquisition in flight, cancel reports
    `requested`. The acquired owner is registered as usual, so it is never
-   leaked, and killed immediately; no later candidate is attempted. A cancel
+   leaked, and killed immediately; no later candidate is attempted. The
+   kernel projects the cancel state (`requested`, then each kill's outcome,
+   including kills it starts itself) onto whichever owner is current, so a
+   transferred owner's unconfirmed kill is visible. A cancel
    before any acquisition rejects the launch without acquiring anything. If
    the in-flight acquisition fails, the settled previous attempt is still owned
-   and is terminated before delivery.
+   and is terminated before delivery. Once every fallback launch has failed,
+   the natural failure is terminal before its delivery starts, so a later
+   cancel reports `already-terminal`.
 5. **One result.** A confirmed cancel is finalized once by the attempt that owns
    it and delivered once with the existing `killed` outcome and a
    `cancellation` record (`requestedAt`, `termination`, `confirmedAt`). Pi
@@ -49,7 +54,9 @@ kernel producer, adapter, and finalization. It is not a second engine.
    delivered, retired, or released. A retry repeats the kill and keeps the first
    `requestedAt`. If the wait later settles on its own, the producer makes one
    kill attempt itself, then waits for an operator retry or shutdown
-   suppression, which settles without delivery.
+   suppression, which settles without delivery and is not a cancellation:
+   a worktree manifest records what a plain shutdown would, never
+   `cancelled`.
 7. **Surface ownership.** Pi `kill` closes an ordinary pane and confirms its
    absence through Herdr; a close error on an already-absent pane is still
    confirmed by that absence. A managed-worktree root pane is the retained
@@ -57,11 +64,19 @@ kernel producer, adapter, and finalization. It is not a second engine.
    signals SIGTERM only to the Pi process Herdr reports in the pane foreground
    with the child's exact `--session` and worktree cwd. On Linux it also
    re-checks `/proc/<pid>/cmdline`, so a PID-namespace mismatch cannot misfire.
-   Confirmation requires Herdr to report that process gone and the retained
-   shell idle, or the pane gone. Any other foreground process is never
-   signalled and makes termination unconfirmed. The manifest records
-   `cancelled`, and the handoff is captured as for any completion. There is no
-   Git cleanup.
+   Herdr enumerates only foreground processes, so a suspended or backgrounded
+   Pi is invisible there. Confirmation therefore requires the pane gone, or
+   Herdr to show no owned Pi in the foreground and the retained shell idle
+   **and** owned-process exit evidence from the parent host's process table
+   (`/proc` on Linux, `ps` elsewhere): no process still carries the child's
+   exact `--session` argv, and Herdr's shell PID is visible there, so the
+   table shares the pane's PID namespace. When only foreground absence is
+   known (table unreadable, shell not visible, or an owned process still
+   alive), termination is unconfirmed. Neither a non-foreground Pi nor any
+   other foreground process is ever signalled; both leave termination
+   unconfirmed. The manifest records `cancelled` only for
+   confirmed termination, and the handoff is captured as for any completion.
+   There is no Git cleanup.
 8. **Persistent specialists are rejected** before any kill; `subagent_stop`
    keeps its graceful v1 semantics.
 
@@ -69,7 +84,9 @@ kernel producer, adapter, and finalization. It is not a second engine.
 
 - Cancel never confirms more than its evidence: ordinary confirmation is Herdr
   pane absence, which terminates the pane's PTY, not an OS PID check. Worktree
-  confirmation is Herdr's process-info view of the retained pane.
+  confirmation combines Herdr's process-info view of the retained pane with
+  the parent host's process table; a stopped Pi keeps SIGTERM pending and
+  stays unconfirmed until it is resumed or exits.
 - An unconfirmed cancel can leave a live row indefinitely until a retry, the
   child's exit, manual pane closure, or parent shutdown.
 - Late callbacks after delivery change nothing: the retired ID answers

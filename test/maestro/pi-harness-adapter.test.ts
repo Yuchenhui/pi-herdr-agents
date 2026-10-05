@@ -9,7 +9,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { PiHarnessAdapter } from "../../maestro/adapters/pi/pi-harness-adapter.ts";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import {
+	PiHarnessAdapter,
+	inspectLocalProcesses,
+	type LocalProcessProbe,
+} from "../../maestro/adapters/pi/pi-harness-adapter.ts";
 import { launchOperationsFromSurface } from "../../maestro/adapters/pi/launch.ts";
 import {
 	createWorktreeOperations,
@@ -704,9 +710,13 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 	}
 	async function worktreeChild(
 		f: ReturnType<typeof fixture>,
-		options: { signalled?: (pid: number) => void } = {},
+		options: {
+			signalled?: (pid: number) => void;
+			local?: LocalProcessProbe;
+		} = {},
 	) {
 		const signals: Array<[number, string]> = [];
+		const probes: Array<[string, number]> = [];
 		const adapter = new PiHarnessAdapter({
 			surface: f.surface,
 			paneConfig,
@@ -726,6 +736,13 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 				signals.push([pid, sessionFile]);
 				options.signalled?.(pid);
 			},
+			// Default host view: the shell is local and no owned Pi remains.
+			localProcesses(sessionFile, shellPid) {
+				probes.push([sessionFile, shellPid]);
+				return options.local
+					? options.local(sessionFile, shellPid)
+					: { owned: [], shellVisible: true };
+			},
 		});
 		const h = await adapter.spawn(f.options);
 		const child = adapter.getRunningChild(h);
@@ -744,7 +761,7 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 		f.surface.closeSurface = (id) => {
 			closes.push(id);
 		};
-		return { adapter, h, child, path, signals, closes };
+		return { adapter, h, child, path, signals, closes, probes };
 	}
 	it("signals only the owned Pi process, keeps the pane, and confirms the idle shell", async () =>
 		usingFixture(async (f) => {
@@ -830,6 +847,99 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 				assert.deepEqual(w.signals, []);
 				assert.deepEqual(w.closes, []);
 			}));
+	const idleShell = () => ({
+		shellPid: 10,
+		foregroundProcessGroupId: 10,
+		pids: [10],
+		foregroundProcesses: [],
+	});
+	it("a suspended Pi outside the pane foreground is unconfirmed, never confirmed by foreground absence", async () =>
+		usingFixture(async (f) => {
+			// Herdr lists foreground processes only: a stopped/backgrounded Pi leaves
+			// the idle shell in the foreground while its process is still alive.
+			const w = await worktreeChild(f, {
+				local: () => ({ owned: [20], shellVisible: true }),
+			});
+			f.surface.getProcessInfo = idleShell;
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/owned Pi process 20 is still alive outside the pane foreground/,
+			);
+			assert.deepEqual(
+				w.signals,
+				[],
+				"a non-foreground process is not signalled",
+			);
+			assert.deepEqual(w.probes, [[w.child.sessionFile, 10]]);
+			assert.deepEqual(w.closes, []);
+		}));
+	it("negative control: the same Herdr view with host exit evidence confirms", async () =>
+		usingFixture(async (f) => {
+			const w = await worktreeChild(f, {
+				local: () => ({ owned: [], shellVisible: true }),
+			});
+			f.surface.getProcessInfo = idleShell;
+			await w.adapter.kill(w.h);
+			assert.deepEqual(w.probes, [[w.child.sessionFile, 10]]);
+		}));
+	it("a signalled Pi that leaves the foreground but stays alive is unconfirmed", async () =>
+		usingFixture(async (f) => {
+			let signalled = false;
+			const w = await worktreeChild(f, {
+				signalled: () => {
+					signalled = true;
+				},
+				// SIGTERM stays pending on a stopped process: it is still in the table.
+				local: () => ({ owned: [20], shellVisible: true }),
+			});
+			f.surface.getProcessInfo = () =>
+				signalled
+					? idleShell()
+					: {
+							shellPid: 10,
+							foregroundProcessGroupId: 20,
+							pids: [10, 20],
+							foregroundProcesses: [piProcess(20, w.child.sessionFile, w.path)],
+						};
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/exit unconfirmed after 150ms .*owned Pi process 20 is still alive outside the pane foreground/,
+			);
+			assert.deepEqual(w.signals, [[20, w.child.sessionFile]]);
+		}));
+	for (const [label, local, pattern] of [
+		[
+			"an unreadable host process table",
+			() => {
+				throw new Error("ps unavailable");
+			},
+			/only foreground absence is known; this host's process table is unreadable: ps unavailable/,
+		],
+		[
+			"a pane shell outside this host's PID namespace",
+			() => ({ owned: [], shellVisible: false }),
+			/only foreground absence is known; pane shell 10 is not visible/,
+		],
+	] as const)
+		it(`only foreground absence is known with ${label}: unconfirmed`, async () =>
+			usingFixture(async (f) => {
+				const w = await worktreeChild(f, { local });
+				f.surface.getProcessInfo = idleShell;
+				await assert.rejects(w.adapter.kill(w.h), pattern);
+				assert.deepEqual(w.signals, []);
+			}));
+	it("a missing pane confirms without consulting the host process table", async () =>
+		usingFixture(async (f) => {
+			const w = await worktreeChild(f, {
+				local: () => ({ owned: [20], shellVisible: true }),
+			});
+			f.surface.removeSurface(w.child.surface);
+			f.surface.getProcessInfo = () => {
+				throw new Error("pane not found");
+			};
+			await w.adapter.kill(w.h);
+			assert.deepEqual(w.probes, []);
+		}));
 	it("an unreadable process state is unconfirmed, never guessed exited", async () =>
 		usingFixture(async (f) => {
 			const w = await worktreeChild(f);
@@ -839,6 +949,57 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 			await assert.rejects(w.adapter.kill(w.h), /herdr unavailable/);
 			assert.deepEqual(w.signals, []);
 		}));
+});
+
+describe("inspectLocalProcesses", () => {
+	it("finds a live or suspended owned process by its exact --session argv, and not after it exits", async () => {
+		const sessionFile = join(
+			tmpdir(),
+			`pi-owned-${process.pid}-${Date.now()}.jsonl`,
+		);
+		const child = spawn(
+			process.execPath,
+			["-e", "setInterval(() => {}, 1000)", "--", "--session", sessionFile],
+			{ stdio: "ignore" },
+		);
+		try {
+			const pid = child.pid!;
+			let view = inspectLocalProcesses(sessionFile, process.pid);
+			for (let i = 0; i < 100 && !view.owned.includes(pid); i++) {
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				view = inspectLocalProcesses(sessionFile, process.pid);
+			}
+			assert.deepEqual(view, { owned: [pid], shellVisible: true });
+			// A different session, or a prefix of it, is never owned.
+			assert.deepEqual(
+				inspectLocalProcesses(`${sessionFile}.other`, process.pid).owned,
+				[],
+			);
+			assert.deepEqual(
+				inspectLocalProcesses(sessionFile.slice(0, -1), process.pid).owned,
+				[],
+			);
+			// A suspended process is alive: it stays owned.
+			process.kill(pid, "SIGSTOP");
+			assert.deepEqual(inspectLocalProcesses(sessionFile, process.pid).owned, [
+				pid,
+			]);
+			process.kill(pid, "SIGCONT");
+			const exited = once(child, "exit");
+			process.kill(pid, "SIGTERM");
+			await exited;
+			assert.deepEqual(
+				inspectLocalProcesses(sessionFile, process.pid).owned,
+				[],
+			);
+			assert.equal(
+				inspectLocalProcesses(sessionFile, 2 ** 31 - 1).shellVisible,
+				false,
+			);
+		} finally {
+			child.kill("SIGKILL");
+		}
+	});
 });
 
 function deferred() {
