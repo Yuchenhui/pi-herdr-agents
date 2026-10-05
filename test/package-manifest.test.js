@@ -66,7 +66,9 @@ describe("pack-neutral package contents", () => {
 		assert.deepEqual(manifest.pi?.extensions, [
 			"./pi-extension/subagents/index.ts",
 		]);
-		assert.equal(Object.hasOwn(manifest.pi ?? {}, "skills"), false);
+		// An explicit `pi` manifest disables conventional `skills/` discovery, so
+		// the host-owned operational skill must be declared to load at all.
+		assert.deepEqual(manifest.pi?.skills, ["./skills"]);
 		assert.equal(Object.hasOwn(manifest.pi ?? {}, "prompts"), false);
 		for (const script of ["format", "format:check", "lint", "test"]) {
 			assert.doesNotMatch(

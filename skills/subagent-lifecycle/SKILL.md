@@ -15,7 +15,8 @@ Live tool descriptions, the installed package's README, and the installed
 version are authoritative. An installed release can predate current source, so
 a tool described here may be absent. Check which `subagent*` and `worktree_*`
 tools you actually have, and read the README under the installed package root
-(`pi list` shows it) before relying on a behavior not listed below.
+(the path in your Pi packages settings) before relying on a behavior not listed
+below.
 
 ## Decision table
 
@@ -43,7 +44,10 @@ Widget labels as documented in the README:
 - `stalled` — pane inspection unhealthy; the parent cannot trust the run (also used for an unconfirmed stop)
 - `running` — coarse process presence only
 - `finalizing` — completion observed, delivery in progress
-- `idle`, `done`, `unknown` — may appear in tool output or Herdr agent status; treat `unknown` as "no evidence", never as stopped or clean
+
+Herdr's own `agent_status` values (`idle`, `working`, `blocked`, `done`,
+`unknown`) describe the pane occupant as the multiplexer sees it, not the host's
+run state above. Treat `unknown` as "no evidence", never as stopped or clean.
 
 Check the README and live output for the exact set in your installed version.
 

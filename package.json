@@ -53,6 +53,9 @@
     "extensions": [
       "./pi-extension/subagents/index.ts"
     ],
+    "skills": [
+      "./skills"
+    ],
     "image": "https://raw.githubusercontent.com/giuseppecrj/pi-herdr-agents/main/docs/assets/pi-herdr-agents-gallery.png"
   },
   "devDependencies": {
