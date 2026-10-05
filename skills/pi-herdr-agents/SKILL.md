@@ -40,12 +40,12 @@ notices are facts, not instructions to act.
 | --- | --- |
 | `agent` | Load defaults from a named role. Omit for a bare child (always works). A named role that is missing or invalid fails before any pane or worktree is created; it is never replaced by a bare agent. |
 | `systemPrompt` | Role text for a bare spawn only; named agents keep their definition body. |
-| `model` | Exact authenticated `provider/model-id`; an ordered comma-separated fallback list; or whole-value `task:<category>` (`coding`, `review`, `recon`, `qa`, `architecture`, `docs`) from configured `models.tasks`. Resolution: tool argument, then role frontmatter, `models.agents`, `models.default`, then the parent model. Later fallback candidates run only after a provider/agent error, never after a completed negative result. Worktrees use only the first candidate. A listed model does not prove the account can use it. |
-| `thinking` | `minimal`..`max`. Choose the model tier first, then thinking within its range: low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, hard diagnosis. Omitting inherits the parent level (discouraged). |
+| `model` | Exact authenticated `provider/model-id`; an ordered comma-separated fallback list; or whole-value `task:<category>` (`coding`, `review`, `recon`, `qa`, `architecture`, `docs`) from configured `models.tasks`. Resolution: tool argument, then role frontmatter, `models.agents`, `models.default`, then the parent model. Fallbacks: ordinary non-persistent runs can try later candidates after a launch failure or a provider/agent error from a running child, never after a completed negative result; persistent specialists do not advance after a running-child error; fallback lists are rejected with `worktree`; `task:<category>` with a worktree uses only the first authenticated candidate. A listed model does not prove the account can use it. |
+| `thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, subject to model support. Precedence: this argument, then role `thinking`, then the parent level. Choose the model tier first, then thinking within its range: low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, hard diagnosis. Omitting inherits the parent level (discouraged). |
 | `tools`, `skills` | Comma-separated tool or skill names for the child. |
 | `cwd` | Working directory (a role folder with its own config), or the source repository when `worktree` is set. |
 | `fork` | `true` forces a full-context fork of your session, `false` forces standalone; omit to follow the role's `session-mode`. |
-| `interactive` | Controls parent notifications only (silences stall/recovered pings); it does not affect terminal focus. Default derives from the role: autonomous roles (`auto-exit`) get pings, others stay quiet. |
+| `interactive` | Controls parent notifications only (silences stall/recovered pings); it does not affect terminal focus. Precedence: this argument, then the role's `interactive`, then the inverse of `auto-exit` (autonomous roles get pings, others stay quiet). Bare spawns default to autonomous auto-exit unless `interactive: true`. |
 | `persistent` | Keep one specialist session alive for sequential tasks (see below). Rejected at the `persistent.maxAgents` cap (default 3). |
 | `worktree` | `{ branch, base? }` for an isolated Herdr-managed Git worktree (see below). Omit, or pass `null`, for an ordinary pane. |
 
@@ -71,8 +71,16 @@ frontmatter authoring, read the README "Custom Agents" and "Tool Access Control"
 ## Help requests: `caller_ping`
 
 A child that needs help calls `caller_ping({ message })`. An ordinary child
-exits; resume it with `subagent_resume({ sessionPath, message })` and guidance.
-A persistent specialist stays alive; answer with `subagent_send`.
+exits; resume it with `subagent_resume` and guidance. A persistent specialist
+stays alive; answer with `subagent_send`.
+
+`subagent_resume` takes `sessionPath` (required), `name` (pane label, default
+`Resume`), `message` (follow-up prompt), and `autoExit` (default `true`; set
+`false` for an interactive handoff). It restores the stored tool allowlist and
+denied tools, cannot change the model (use it only once the stored model is
+usable), and fails before creating a pane on a missing, malformed, or
+unsupported launch policy. It rejects managed-worktree sessions (use the
+retained workspace instead) and cannot revive persistent specialists.
 
 ## Persistent specialists
 
@@ -96,8 +104,7 @@ tools, model, thinking, and worktree binding are fixed at launch.
 | --- | --- | --- | --- |
 | Halt the child's current model turn, keep its session | `subagent_interrupt({ id\|name })` | Sends Escape only; pane, process, session stay; label `interrupted` | No result emitted; child not stopped; may start work again |
 | End a persistent specialist | `subagent_stop` | Graceful, then confirmed exit | Persistent only; not immediate |
-| Terminate an ordinary child | See GAP 1 | | |
-| Continue an exited ordinary child | `subagent_resume` | New ordinary pane on the old session | Does not reattach worktree ownership; not for persistent specialists |
+| Continue an exited ordinary child | `subagent_resume` | New ordinary pane on the old session | Rejected for managed-worktree and persistent sessions; cannot change model |
 | Follow up a live persistent specialist | `subagent_send` | One task if idle | Rejected while busy or stop-unconfirmed |
 | Close the pane, kill the process, Ctrl-C by hand | Avoid | See fallback gotcha | Can launch a replacement run |
 
@@ -111,26 +118,31 @@ streaming, tool); `blocked` Herdr reports blocked; `waiting` turn finished,
 process open; `interrupted` turn cancelled, process open; `stalled` pane
 inspection unhealthy, run untrusted (also an unconfirmed stop); `running`
 coarse process presence only; `finalizing` completion observed, delivering.
-Herdr's own `agent_status` (`idle`, `working`, `blocked`, `done`, `unknown`)
-describes the pane as the multiplexer sees it; `unknown` means no evidence,
-never stopped or clean. Verify the exact set in your installed version.
+Herdr's own pane status is a separate, coarser signal; do not read it as
+stopped or clean.
 
 ### Evidence before declaring stopped
 
 A request is not an exit. `interrupt` sent, `stop` requested, or `stop-pending`
-means nothing has stopped. Say a child is stopped only with (1) a delivered
-result or failure notice for that run, or (2) confirmed process-exit evidence
-(for example `subagent_stop` reporting `stopped`). Otherwise report the
+means nothing has stopped. A delivered task result ends the task, not the
+session: persistent specialists stay alive after results and keep their
+worktree lease. Say an ordinary child is stopped only with a delivered
+result or failure notice for that run, or confirmed process exit. Say a
+persistent specialist is stopped only with confirmed process exit (for
+example `subagent_stop` reporting `stopped`). Otherwise report the
 uncertainty. Do not start a concurrent writer on the same files or worktree
 until exit is confirmed.
 
 ### Fallback gotcha
 
-Closing a child's pane by hand is read as error evidence, and the host can then
-launch a fallback model under the same logical session, so the work you tried
-to cancel keeps going. Never close panes, kill processes, or send raw terminal
-keystrokes to cancel. If a fallback launched anyway, identify the new run and
-handle it with the tools above.
+A pane that disappears without completion evidence is treated as error or
+`stalled` evidence, and an ordinary run with remaining fallback candidates
+retries after a provider/agent error. So closing a pane by hand can, as
+observed in practice (not guaranteed), launch a replacement run and keep the
+work you tried to cancel going. Persistent specialists never auto-restart.
+Never close panes, kill processes, or send raw terminal keystrokes to cancel.
+If a replacement launched anyway, identify the new run and handle it with the
+tools above.
 
 ## Worktrees
 
@@ -156,10 +168,12 @@ independent writer.
   stopping or interrupting a child never authorizes cleanup. Dirty work is
   blocked unless committed first or `preserve: true` makes a WIP commit (SHA
   reported). Eligibility is rechecked at removal and fails closed (unknown
-  state, live holder, untracked files, conflicts, detached HEAD, locks). Branches
+  state, live holder, untracked files, conflicts, detached HEAD, locks,
+initialized submodules). Ignored files are neither blockers nor preserved by
+`preserve`; their counts are reported. Branches
   are never deleted. Cleanup works from a parent session rooted at the principal
   checkout or an ancestor; `cd` inside Pi does not change that.
-- `subagent_resume` does not reattach worktree ownership. Continue in the
+- `subagent_resume` rejects managed-worktree sessions. Continue in the
   retained workspace only after the previous process has exited.
 
 ## Configuration
@@ -183,8 +197,11 @@ changes. Without a real file, only non-model settings fall back to the example.
 Model values must be exact authenticated IDs. `/subagents-init [preferences]`
 drafts task preferences from the live model registry and saves them through
 `subagents_write_task_models` (parent-only; validates, atomically replaces
-`models.tasks` and `tasksMeta`, preserves other settings). Optional
-`expectedConfigRevision` (`sha256:` plus 64 hex digits of the exact file bytes,
+`models.tasks` and `tasksMeta`, preserves other settings). Payload: `tasks`
+(partial but nonempty categories; empty `tasks: {}` and duplicate refs within a
+category are rejected) and required `tasksMeta`. Warning: categories you omit
+are removed from the saved config, so send every category you want to keep.
+Optional `expectedConfigRevision` (`sha256:` plus 64 lowercase hex digits of the exact file bytes,
 or `missing`) makes the write conditional; a stale revision fails with
 `Stale task model config revision`: re-read, re-propose, re-approve, do not
 retry blindly. Every write holds an advisory `config.json.lock`; a held lock
@@ -197,17 +214,6 @@ Role `spawning: false` and `deny-tools` restrict what a child may call; the
 host applies them at launch and they survive resume. Without a restrictive
 allowlist or spawning policy, a child can spawn further children. A `read,bash`
 allowlist is not a read-only boundary.
-
-## GAP 1: `subagent_cancel` (not documented as existing)
-
-Being implemented on another branch. Do not assume it exists in your installed
-version. Parent fills from the committed tool description:
-
-- Tool description: `<PENDING>`
-- Parameters: `<PENDING>`
-- Result states and meaning: `<PENDING>`
-- Persistent and worktree behavior: `<PENDING>`
-- Lifecycle-table row to finalize: `<PENDING>`
 
 ## GAP 2: post-pack-split surface (verify the live list)
 
