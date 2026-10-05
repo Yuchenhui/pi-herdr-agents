@@ -24,6 +24,10 @@ const ordinaryReviewClauses = [
 	"Disclose that this review is context-isolated, not cross-family independent.",
 	"Cross-family verification must not use this fallback.",
 ];
+// Host-owned operational skills are the only shipped skills; workflow skills
+// such as orchestrate and plan belong to role packs.
+const hostSkills = ["subagent-lifecycle"];
+const hostSkillFiles = new Set(hostSkills.map((n) => `skills/${n}/SKILL.md`));
 const packageFiles = new Set(
 	JSON.parse(
 		execFileSync("npm", ["pack", "--dry-run", "--json"], {
@@ -95,9 +99,14 @@ describe("pack-neutral package contents", () => {
 		for (const path of packageFiles) {
 			assert.doesNotMatch(
 				path,
-				/^(?:agents|skills)\//,
-				`moved role or skill resource is still packaged: ${path}`,
+				/^agents\//,
+				`moved role resource is still packaged: ${path}`,
 			);
+			if (path.startsWith("skills/"))
+				assert.ok(
+					hostSkillFiles.has(path),
+					`unexpected packaged skill resource: ${path}`,
+				);
 			assert.doesNotMatch(path, /(^|\/)(?:claude\.ts|plugin)(?:\/|$)/);
 			assert.doesNotMatch(path, /^tools\//);
 			assert.doesNotMatch(
@@ -115,8 +124,27 @@ describe("pack-neutral package contents", () => {
 	});
 
 	it("leaves no empty bundled-resource directories in the source tree", () => {
-		for (const path of ["agents", "skills"])
-			assert.equal(existsSync(join(root, path)), false, `${path}/ remains`);
+		assert.equal(existsSync(join(root, "agents")), false, "agents/ remains");
+	});
+
+	it("ships only valid host-owned operational skills", () => {
+		for (const name of hostSkills) {
+			const path = `skills/${name}/SKILL.md`;
+			assert.equal(packageFiles.has(path), true, `missing ${path}`);
+			const body = readFileSync(join(root, path), "utf8");
+			const front = body.match(/^---\n([\s\S]*?)\n---\n/)?.[1] ?? "";
+			assert.match(name, /^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+			assert.ok(name.length <= 64);
+			assert.ok(front.includes(`name: ${name}`), `${path} name mismatch`);
+			const description = front.match(/^description: (.+)$/m)?.[1] ?? "";
+			assert.ok(
+				description.length > 0 && description.length <= 1024,
+				`${path} needs a description of at most 1024 characters`,
+			);
+		}
+		for (const path of packageFiles)
+			if (path.startsWith("skills/"))
+				assert.doesNotMatch(path, /orchestrate|plan/);
 	});
 
 	it("locks fork override semantics in README", () => {

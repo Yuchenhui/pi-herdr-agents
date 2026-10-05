@@ -692,6 +692,8 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
+The package ships one host-owned operational skill, `subagent-lifecycle`, that helps choose between interrupt, stop, resume, and manual pane actions and describes the evidence needed before declaring a child stopped. Live tool descriptions and this README remain authoritative.
+
 ---
 
 ## caller_ping — Child-to-Parent Help Request
