@@ -1,7 +1,7 @@
 # ADR-0003: Discover installable role packs through Pi's event bus
 
-- **Status:** Accepted
-- **Date:** 2026-08-02
+- **Status:** Accepted; bundled-role provisions superseded by [ADR-0013](0013-pack-neutral-execution-host.md)
+- **Date:** 2026-08-02 (bundled layer retired 2026-10-05)
 - **Decision owners:** `acrnm`
 - **Scope:** `giuseppecrj/pi-herdr-agents`
 
@@ -62,10 +62,9 @@ leaving stale roles.
 
 Listing and exact-name launch use one resolved catalog. Collection order is:
 
-1. enabled bundled package roles;
-2. registered role-pack definitions;
-3. global definitions;
-4. project definitions.
+1. registered role-pack definitions;
+2. global definitions;
+3. project definitions.
 
 Effective precedence remains:
 
@@ -73,17 +72,26 @@ Effective precedence remains:
 project > global > package
 ```
 
-Role-pack definitions remain in the `package` source layer and add package name,
-version, and path provenance. Global and project definitions can intentionally
-override them.
+Role-pack definitions form the entire `package` source layer and add package
+name, version, and path provenance. Global and project definitions can
+intentionally override them. The host ships no roles, so an empty catalog is
+valid.
 
 Within the package layer:
 
-- bundled roles are protected fallbacks while enabled;
-- a role pack colliding with an enabled bundled name is rejected;
-- copying the packaged `config.json.example` to `$PI_CODING_AGENT_DIR/herdr-agents/config.json` and setting `roles.bundled` to `false` removes only the bundled layer; registered role packs remain package roles and may supply those names; package-root configuration is ignored, so manually move older files or re-run `/subagents-init`; 
-- a name contributed by multiple role packs is disabled;
+- registered packs have no priority over one another, and no pack is a
+  privileged default;
+- a name contributed by multiple role packs is disabled with a diagnostic naming
+  every contributor;
 - collisions never resolve through incidental extension load order.
+
+Earlier versions collected an enabled bundled layer first, rejected role packs
+that collided with it, and let `roles.bundled: false` remove it. ADR-0013
+retires that layer. Valid `roles.bundled` booleans in
+`$PI_CODING_AGENT_DIR/herdr-agents/config.json` are now accepted as deprecated
+no-ops with one parent-session warning per extension load; malformed values and
+unknown `roles` keys remain errors, and the file is never rewritten. Package-root
+configuration is still ignored.
 
 Invalid registrations do not suppress unrelated roles. Listing surfaces report
 concise diagnostics, and an exact-name launch reports the matching diagnostic

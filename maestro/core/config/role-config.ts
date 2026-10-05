@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { isBoolean, isPlainObject } from "./type-guards.ts";
 
 export interface RoleConfig {
-	bundled: boolean;
+	/** Accepted no-op settings, each with actionable migration text. */
+	deprecations: string[];
 }
 
 function invalidRoleConfig(source: string, message: string): never {
@@ -17,7 +18,7 @@ export function parseRoleConfig(
 	if (!isPlainObject(rawConfig)) {
 		invalidRoleConfig(source, "root must be an object");
 	}
-	if (!Object.hasOwn(rawConfig, "roles")) return { bundled: true };
+	if (!Object.hasOwn(rawConfig, "roles")) return { deprecations: [] };
 	if (!isPlainObject(rawConfig.roles)) {
 		invalidRoleConfig(source, "roles must be an object");
 	}
@@ -31,11 +32,17 @@ export function parseRoleConfig(
 			`roles has unsupported key(s): ${unsupportedKeys.join(", ")}`,
 		);
 	}
-	if (!Object.hasOwn(rawConfig.roles, "bundled")) return { bundled: true };
+	if (!Object.hasOwn(rawConfig.roles, "bundled")) return { deprecations: [] };
 	if (!isBoolean(rawConfig.roles.bundled)) {
 		invalidRoleConfig(source, "roles.bundled must be a boolean");
 	}
-	return { bundled: rawConfig.roles.bundled };
+	// The host ships no roles, so both legacy booleans are no-ops. Never rewrite
+	// user configuration to remove the key.
+	return {
+		deprecations: [
+			`Deprecated setting roles.bundled (${rawConfig.roles.bundled}) in ${source} is ignored: pi-herdr-agents no longer ships bundled roles. Install a role pack or add global or project definitions for the roles you use, then remove roles.bundled. The file was not changed.`,
+		],
+	};
 }
 
 interface RoleConfigSource {

@@ -596,18 +596,6 @@ function getForkContentLines(parentSessionFile: string): string[] {
 	});
 }
 
-export function createBtwSessionSnapshot(
-	parentSessionFile: string,
-	leafId: string,
-): string {
-	const detached = SessionManager.open(parentSessionFile);
-	const childSessionFile = detached.createBranchedSession(leafId);
-	if (!childSessionFile || !existsSync(childSessionFile)) {
-		throw new Error("Pi did not persist the BTW child session");
-	}
-	return childSessionFile;
-}
-
 export function seedSubagentSessionFile(params: {
 	mode: SeededSubagentSessionMode;
 	parentSessionFile: string;

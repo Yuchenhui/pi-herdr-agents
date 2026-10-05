@@ -440,6 +440,8 @@ describe("Pi launch", () => {
 			assert.doesNotMatch(command, /subagent_done/);
 			assert.match(command, /PI_DENY_TOOLS='subagent,subagent_resume'/);
 			assert.match(command, /PI_SUBAGENT_AUTO_EXIT=1/);
+			// Documented child-context hint: fresh children receive PI_SUBAGENT_ID.
+			assert.match(command, /PI_SUBAGENT_ID='child-1'/);
 			assert.match(command, /'' '\/skill:tdd' '@[^']+\.md'/);
 
 			const taskPath = command.match(/'@([^']+\.md)'/)?.[1];
@@ -916,6 +918,11 @@ describe("Pi launch", () => {
 				/'@[^']+\.md'/,
 				"fork mode must use direct delivery, not artifact-backed",
 			);
+			assert.match(
+				command,
+				/PI_SUBAGENT_ID='child-1'/,
+				"forked children receive the same child-context hint as standalone children",
+			);
 		});
 	});
 
@@ -925,8 +932,8 @@ describe("Pi launch", () => {
 			const running = await launchPiSubagent(
 				{
 					...request,
-					name: "Adversarial review",
-					agent: "adversarial-reviewer",
+					name: "Coordinator",
+					agent: "test-coordinator",
 					behavior: {
 						...request.behavior,
 						tools: "read,bash,grep,find,ls",
@@ -1044,6 +1051,7 @@ describe("Pi launch", () => {
 						`PI_SUBAGENT_SESSION=${expectedShellQuote(sessionFile)}`,
 					),
 				);
+				// Documented child-context hint: resumed children receive a new ID.
 				assert.match(command, /PI_SUBAGENT_ID='resume-1'/);
 				assert.match(command, /PI_SUBAGENT_ACTIVITY_FILE='/);
 				assert.match(command, /PI_SUBAGENT_AUTO_EXIT=1/);
@@ -1532,6 +1540,8 @@ describe("Pi launch", () => {
 			assert.ok(
 				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
 			);
+			// A user-driven worktree handoff is a normal interactive Pi session,
+			// not a subagent: it receives no PI_SUBAGENT_ID or child protocol.
 			assert.doesNotMatch(
 				command,
 				/subagent-done|PI_SUBAGENT_|__SUBAGENT_DONE_/,

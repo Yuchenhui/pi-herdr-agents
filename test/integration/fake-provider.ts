@@ -333,18 +333,8 @@ async function waitForIntegrationGate(source: string): Promise<void> {
 		throw new Error(`Integration gate was not opened: ${path}`);
 }
 
-function btwText(source: string): string | undefined {
-	// Prefer the latest BTW question over inherited "Reply with only SECRET_" context.
-	if (/BTW question:\s*Say FIRST/i.test(source)) return "FIRST";
-	if (/BTW question:\s*Read the previous assistant answer/i.test(source)) {
-		const secret = source.match(/SECRET_([a-z0-9_]+)/i)?.[1];
-		return secret ? `BTW_CONFIRMED_SECRET_${secret}` : "BTW_CONFIRMED";
-	}
-	const requestedSecret = source.match(
-		/Reply with only (SECRET_[a-z0-9_]+)/i,
-	)?.[1];
-	if (requestedSecret) return requestedSecret;
-	return undefined;
+function directReplyText(source: string): string | undefined {
+	return source.match(/Reply with only ((?:SECRET|SEED)_[a-z0-9_]+)/i)?.[1];
 }
 
 function resumeRestrictionResponse(request: ChatRequest): ResponsePlan | null {
@@ -488,8 +478,8 @@ async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 		? user.match(/RESUME_FOLLOWUP_INPUT:\s*([a-z0-9]+)/i)?.[1]
 		: undefined;
 	if (resumed) return { text: `RESUME_RESULT_${resumed}` };
-	const btw = btwText(source);
-	if (btw) return { text: btw };
+	const directReply = directReplyText(source);
+	if (directReply) return { text: directReply };
 
 	// caller_ping is always allowlisted for public children; only use it when the
 	// prompt actually asks for a help ping (test-ping), not for ordinary tasks.

@@ -1,4 +1,4 @@
-import { existsSync, rmSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SpawnOptions } from "../core/harness-adapter.ts";
@@ -16,7 +16,6 @@ import type {
 	SurfaceProvider,
 	WorktreeSurfaceInfo,
 } from "../core/surface-provider.ts";
-import { shellQuote } from "../core/shell.ts";
 import { PiHarnessAdapter } from "../adapters/pi/pi-harness-adapter.ts";
 import {
 	launchOperationsFromSurface,
@@ -43,7 +42,6 @@ import {
 	findLastAssistantMessage,
 	findObservedSessionRuntime,
 	inspectNoProgressSessionTail,
-	createBtwSessionSnapshot,
 } from "../adapters/pi/session.ts";
 import { HerdrSurfaceProvider } from "../surfaces/herdr/herdr-surface-provider.ts";
 import { readSubagentActivityFile } from "../adapters/pi/activity-file.ts";
@@ -304,25 +302,6 @@ export interface PiProgressEvidence {
 	lastEntryKind: "assistant" | "tool-result" | "message" | "other" | "none";
 }
 // pi-herdr-agents extension
-export interface PiBtwInput {
-	question: string;
-	parentSessionFile: string;
-	leafId: string;
-	cwd: string;
-	invocationCwd: string;
-	sessionDir: string;
-	sessionId: string;
-	model: string;
-	thinking: ThinkingLevel;
-	agentDir?: string;
-}
-// pi-herdr-agents extension
-export interface PiBtwMetadata {
-	surface: string;
-	sessionFile: string;
-	launchScriptFile: string;
-}
-// pi-herdr-agents extension
 export interface PiRunSessionHooks {
 	onSpawned?(
 		record: PiRunRecord,
@@ -396,8 +375,6 @@ export interface PiRunSession extends RunSession {
 		timeoutMs?: number,
 	): Promise<PiStopAcknowledgement>;
 	inspectProgress(taskId: string): PiProgressEvidence;
-	openBtw(input: PiBtwInput): Promise<PiBtwMetadata>;
-	closeBtw(): Promise<boolean>;
 	diagnostics(): {
 		mode: "wake+batch" | "polling(forced)" | "polling(fallback)";
 		watcherCount: number;
@@ -431,7 +408,6 @@ interface PiSessionOwner {
 		"surfaceProvider" | "supervision"
 	>;
 	worktreeOperations: WorktreeOperations;
-	btw?: PiBtwMetadata;
 }
 
 // A detached close can outlive settlement without capturing a child, metadata,
@@ -1178,89 +1154,6 @@ export function createDefaultRunSession(
 			return { ...inspectNoProgressSessionTail(r.sessionFile), updatedAt };
 		},
 		diagnostics: () => state.infrastructure.supervision.diagnostics(),
-		async openBtw(input) {
-			await facade.closeBtw();
-			const provider = state.infrastructure.surfaceProvider;
-			let sessionFile: string | undefined,
-				surface: string | undefined,
-				launchScriptFile: string | undefined;
-			try {
-				sessionFile = createBtwSessionSnapshot(
-					input.parentSessionFile,
-					input.leafId,
-				);
-				surface = await provider.createSurface({
-					name: "BTW",
-					cwd: input.invocationCwd,
-					placement: { kind: "tab" },
-				});
-				await provider.waitForShellReady(surface);
-				launchScriptFile = join(
-					input.sessionDir,
-					"artifacts",
-					input.sessionId,
-					"subagent-scripts",
-					`btw-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-				);
-				const boundary = `You are answering an ephemeral BTW side question.\nTreat inherited conversation history only as reference context. Do not resume or complete an\nearlier task. Answer only the question after this boundary. Do not modify the workspace unless\nthat side question explicitly requests a mutation.\n\nBTW question:\n`;
-				const command = `cd ${shellQuote(input.cwd)} && ${input.agentDir ? `PI_CODING_AGENT_DIR=${shellQuote(input.agentDir)} ` : ""}pi --session ${shellQuote(sessionFile)} --no-extensions --model ${shellQuote(input.model)} --thinking ${shellQuote(input.thinking)} ${shellQuote(boundary + input.question)}`;
-				await provider.runScript(surface, command, {
-					scriptPath: launchScriptFile,
-					scriptPreamble: [
-						"# BTW side-question session",
-						`# Session: ${sessionFile}`,
-						`# Generated: ${new Date().toISOString()}`,
-					].join("\n"),
-				});
-				return (state.btw = { surface, sessionFile, launchScriptFile });
-			} catch (error) {
-				if (surface) {
-					try {
-						await provider.closeSurface(surface);
-					} catch {
-						/* recoverable */
-					}
-				}
-				for (const file of [sessionFile, launchScriptFile])
-					if (file) {
-						try {
-							rmSync(file, { force: true });
-						} catch {
-							/* best effort */
-						}
-					}
-				throw error;
-			}
-		},
-		async closeBtw() {
-			const child = state.btw;
-			if (!child) return false;
-			const provider = state.infrastructure.surfaceProvider;
-			let missing = false;
-			try {
-				missing =
-					(await provider.inspectSurface(child.surface)).kind === "missing";
-			} catch {
-				/* best effort */
-			}
-			if (!missing) {
-				try {
-					await provider.sendKeys(child.surface, "Escape");
-				} catch {
-					/* best effort */
-				}
-				await provider.closeSurface(child.surface);
-			}
-			state.btw = undefined;
-			for (const file of [child.sessionFile, child.launchScriptFile]) {
-				try {
-					rmSync(file, { force: true });
-				} catch {
-					/* best effort */
-				}
-			}
-			return true;
-		},
 		async shutdown(reason) {
 			if (!["reload", "new", "resume", "fork"].includes(reason ?? "")) {
 				for (const id of new Set([
@@ -1269,11 +1162,6 @@ export function createDefaultRunSession(
 				]))
 					facade.suppress(id);
 				state.infrastructure.supervision.close();
-			}
-			try {
-				await facade.closeBtw();
-			} catch {
-				/* recoverable BTW pane */
 			}
 		},
 	};

@@ -1,6 +1,6 @@
 # ADR-0009: Remove the workflow subsystem
 
-**Status:** Accepted
+**Status:** Accepted; the `orchestrate` skill described below has since moved to the `pi-herdr-roles` pack ([ADR-0013](0013-pack-neutral-execution-host.md))
 
 ## Context
 

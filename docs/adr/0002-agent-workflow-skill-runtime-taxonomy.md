@@ -1,6 +1,6 @@
 # ADR-0002: Adopt the agent, workflow, skill, and runtime taxonomy
 
-**Status:** Partially superseded by ADR-0009 for workflow-runner taxonomy; retained for agent, skill, and runtime terminology.
+**Status:** Partially superseded by ADR-0009 for workflow-runner taxonomy and by [ADR-0013](0013-pack-neutral-execution-host.md) for shipped roles and workflows; retained for agent, skill, and runtime terminology. The role and workflow mapping below is historical: this package no longer ships those roles, `/plan`, `/iterate`, `/btw`, or `orchestrate`.
 
 - **Status:** Accepted in part; external CLI provisions superseded
 - **Date:** 2026-08-02

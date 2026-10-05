@@ -245,7 +245,7 @@ function buildWorktreeCreateArgs(
 }
 
 export function createHerdrSurface(name: string, cwd = process.cwd()): string {
-	// Legacy tab mode and BTW target the caller workspace explicitly; Herdr's
+	// Legacy tab mode targets the caller workspace explicitly; Herdr's
 	// implicit default may be another workspace.
 	const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
 	const output = herdrExec(buildTabCreateArgs(name, cwd, workspaceId));

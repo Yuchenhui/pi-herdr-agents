@@ -1,6 +1,6 @@
 # ADR-0001: Add `/btw` as an ephemeral side-question child
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0013](0013-pack-neutral-execution-host.md); `/btw` and `/btw-close` were removed, not relocated
 - **Date:** 2026-07-31
 - **Decision owners:** `acrnm`
 - **Scope:** `giuseppecrj/pi-herdr-agents`

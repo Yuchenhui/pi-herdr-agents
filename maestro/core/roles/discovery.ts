@@ -2,7 +2,6 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { isString } from "../config/type-guards.ts";
 import { isThinkingLevel, type ThinkingLevel } from "../routing.ts";
-import type { RoleConfig } from "../config/role-config.ts";
 import type { Role } from "../types.ts";
 
 export type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
@@ -62,10 +61,8 @@ export interface RolePackDiscoveryEvent {
 }
 
 export interface RoleDiscoveryOptions {
-	bundledAgentsDir: string;
 	agentConfigDir: string;
 	cwd: string;
-	roleConfig: RoleConfig;
 	onRolePackDiscovered?(event: RolePackDiscoveryEvent): void;
 }
 
@@ -413,9 +410,7 @@ export function discoverAgentCatalog(
 		}
 	};
 
-	if (options.roleConfig.bundled)
-		addDirectory(options.bundledAgentsDir, "package");
-
+	// Registered role packs are the entire package layer; the host ships no roles.
 	const discovered = discoverRolePackPaths(options.onRolePackDiscovered);
 	diagnostics.push(...discovered.diagnostics);
 	const contributed = new Map<string, ListedAgentDefinition[]>();
@@ -532,14 +527,6 @@ export function discoverAgentCatalog(
 	}
 
 	for (const [name, definitions] of contributed) {
-		if (agents.has(name)) {
-			diagnostics.push({
-				code: "bundled-role-collision",
-				message: `Role pack cannot replace bundled role "${name}"; use a global or project override instead.`,
-				agentName: name,
-			});
-			continue;
-		}
 		if (definitions.length > 1) {
 			const providers = definitions
 				.map((definition) => definition.provider ?? definition.path)
@@ -547,7 +534,7 @@ export function discoverAgentCatalog(
 				.join(", ");
 			diagnostics.push({
 				code: "duplicate-package-role",
-				message: `Role "${name}" is contributed by multiple role packs: ${providers}`,
+				message: `Role "${name}" is contributed by multiple role packs: ${providers}. It stays unavailable until only one pack provides it; use a global or project definition for an intentional override.`,
 				agentName: name,
 			});
 			continue;

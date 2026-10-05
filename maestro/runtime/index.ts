@@ -37,8 +37,6 @@ export type {
 	PiSettlementIO,
 	PiPersistentHostOperations,
 	PiProgressEvidence,
-	PiBtwInput,
-	PiBtwMetadata,
 	PiRunSessionHooks,
 	PiRunSessionInfrastructure,
 	PiRunSession,
