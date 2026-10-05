@@ -174,7 +174,7 @@ skills, not to this package. See
 
 This package is a pack-neutral execution host: it ships no agent roles, no
 `/plan` command, and no planning or review skills. Its one skill,
-`subagent-lifecycle`, only documents the host's control tools. A named launch resolves
+`pi-herdr-agents`, is a general operating guide for the host. A named launch resolves
 `agent` from project definitions, global definitions, and roles registered by
 installed role packs, in that precedence order (see below). An empty catalog is
 valid. A bare launch without `agent` always works. An explicitly named role that
@@ -693,7 +693,7 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
-The package ships one host-owned operational skill, `subagent-lifecycle`, that helps choose between interrupt, stop, resume, and manual pane actions and describes the evidence needed before declaring a child stopped. Live tool descriptions and this README remain authoritative.
+The package ships one host-owned skill, `pi-herdr-agents`, a general operating guide covering launching, lifecycle control, persistent specialists, worktrees, and configuration. Live tool descriptions and this README remain authoritative.
 
 ---
 

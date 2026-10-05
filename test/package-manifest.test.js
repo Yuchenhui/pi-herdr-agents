@@ -26,7 +26,7 @@ const ordinaryReviewClauses = [
 ];
 // Host-owned operational skills are the only shipped skills; workflow skills
 // such as orchestrate and plan belong to role packs.
-const hostSkills = ["subagent-lifecycle"];
+const hostSkills = ["pi-herdr-agents"];
 const hostSkillFiles = new Set(hostSkills.map((n) => `skills/${n}/SKILL.md`));
 const packageFiles = new Set(
 	JSON.parse(
