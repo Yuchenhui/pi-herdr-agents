@@ -55,6 +55,14 @@ The parent-facing handoff of a child run's observed outcome and available
 evidence. Receiving it does not establish that the work is correct or accepted.
 _Avoid_: Wake-up signal, acceptance
 
+**Operator cancel**:
+A parent's `subagent_cancel` of one ordinary managed run. Its terminal intent is
+recorded before any abort, kill, or await, so no fallback, retry, or recovery
+follows. The run settles with one cancelled result only after its owned process
+or pane termination is confirmed; unconfirmed termination keeps it live for a
+retry. A natural result taken first stays authoritative.
+_Avoid_: Interrupt, suppression, persistent stop, pane-close fallback
+
 **No-progress advisory**:
 An internal warning that an active child shows no durable progress in its session
 JSONL or activity snapshot. It is advisory only and never changes the child's

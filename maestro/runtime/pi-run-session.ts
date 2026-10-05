@@ -187,6 +187,8 @@ export interface PiRunRecord {
 	stopState?: "requested" | "pending" | "failed";
 	stopFailure?: string;
 	crashNotified?: boolean;
+	/** Presentation of the latest operator cancel; the kernel owns the intent. */
+	cancelState?: "requested" | "confirmed" | "unconfirmed";
 }
 
 // pi-herdr-agents extension
@@ -597,6 +599,16 @@ export function createDefaultRunSession(
 					const completed = { ...entry.completed!, run: result };
 					if (result.evidence?.errorMessage !== undefined)
 						completed.errorMessage = result.evidence.errorMessage;
+					if (result.cancellation) {
+						// A cancel can settle after a retryable attempt was finalized with
+						// its natural error; present the run's actual cancelled outcome.
+						completed.summary = "Subagent cancelled.";
+						completed.error = "cancelled";
+						completed.exitCode = 1;
+						completed.sessionFile = entry.record.sessionFile;
+						completed.errorMessage = undefined;
+						completed.ping = undefined;
+					}
 					entry.completed = completed;
 					try {
 						const decision = await state.options.hooks.onSettled(
@@ -851,7 +863,9 @@ export function createDefaultRunSession(
 					try {
 						state.worktreeOperations.persistWorktreeResult(
 							child.worktree,
-							worktreeResultState(exitCode, !!evidence?.ping),
+							result.cancellation
+								? "cancelled"
+								: worktreeResultState(exitCode, !!evidence?.ping),
 							worktree,
 						);
 					} catch (error) {
@@ -1126,6 +1140,26 @@ export function createDefaultRunSession(
 			if (r) r.lifecycle = markDelivery(r.lifecycle, "suppressed");
 			state.kernel.suppress(id);
 			state.entries.delete(id);
+		},
+		async cancel(id) {
+			// The kernel records the terminal intent in this call's synchronous prefix.
+			const pending = state.kernel.cancel(id);
+			const r = live(id)?.record;
+			const previous = r?.cancelState;
+			if (r && !r.persistent) r.cancelState = "requested";
+			try {
+				const report = await pending;
+				if (r)
+					// A natural result taken first keeps its own presentation.
+					r.cancelState =
+						report.status === "already-terminal" ? previous : report.status;
+				return report;
+			} catch (error) {
+				if (r) r.cancelState = previous;
+				throw error;
+			} finally {
+				prune(id);
+			}
 		},
 		async sendPersistent(id, text) {
 			return state.options.persistent.send(record(id), text, io);

@@ -114,6 +114,7 @@ Possible states are:
 | `ready_for_review` | Child exited successfully; workspace retained |
 | `needs_help` | Child called `caller_ping`; workspace retained |
 | `failed` | Creation, launch, or execution failed; any created workspace is retained |
+| `cancelled` | The parent cancelled the run with `subagent_cancel` and the child's Pi process exit was confirmed; workspace, checkout, and commits retained |
 | `removed` | Explicit parent cleanup verified checkout absence; branch and manifest retained |
 
 The manifest supports ownership and inspection; v1 does not provide automatic reconciliation after a full Pi/Herdr restart. Do not edit manifests by hand.
@@ -193,6 +194,7 @@ The extension never pushes, creates a PR, merges, cherry-picks, or changes the p
 - **Creation failure:** the manifest is marked failed. If Herdr created the branch but returned an incomplete response, the extension reconciles a unique branch match through `/worktree list` and records any recovered workspace/path.
 - **Launch failure after creation:** the manifest is marked failed and the workspace, forked session, and path are retained. The destination is not focused unless Pi startup is confirmed.
 - **Worker failure:** summary and available Git state are returned; the workspace remains open. Auto-exit waits until Pi is fully settled, so a transient provider error followed by automatic compaction or retry does not end the worker early.
+- **Operator cancel:** `subagent_cancel` never closes the retained root pane or workspace. It sends SIGTERM only to the Pi process that Herdr reports in that pane's foreground with the child's exact `--session` and worktree cwd (on Linux, also re-checked against `/proc/<pid>/cmdline`), then confirms through Herdr that the process left and the retained shell is idle. Any other foreground process is never signalled and makes termination `unconfirmed`; the run stays live, and retrying `subagent_cancel` re-checks. On confirmation, the manifest is marked `cancelled` and the normal Git handoff is delivered once. No Git cleanup, branch change, or removal happens.
 - **`caller_ping`:** the child exits with `needs_help`; continue worktree-bound follow-up in the retained workspace rather than through `subagent_resume`. Public `subagent_resume` rejects managed-worktree child sessions before creating a pane so it cannot silently lose worktree ownership or policy.
 - **Parent `/reload`, `/new`, `/resume`, or `/fork`:** active in-memory watchers transfer to the replacement parent session.
 - **Full process restart or crash:** the worktree remains, but v1 does not automatically rediscover and resume its watcher.

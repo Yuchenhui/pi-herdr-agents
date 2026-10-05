@@ -1,5 +1,6 @@
 export { createRunSession } from "./run-session.ts";
 export type {
+	CancelReport,
 	DeliveryDecision,
 	OwnedRunAttempt,
 	PreparedRun,

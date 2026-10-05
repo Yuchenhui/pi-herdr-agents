@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -13,7 +13,10 @@ import type {
 	AgentState,
 	CompletionEvidence,
 } from "../../core/types.ts";
-import type { SurfaceProvider } from "../../core/surface-provider.ts";
+import type {
+	SurfaceProcessInfo,
+	SurfaceProvider,
+} from "../../core/surface-provider.ts";
 import { readSubagentActivityFile } from "./activity-file.ts";
 import {
 	markCompletionDetected,
@@ -34,6 +37,7 @@ import {
 import type { FileWakeRegistry } from "../../core/wake.ts";
 import type { SupervisionCoordinator } from "../../core/supervision.ts";
 import {
+	isExpectedPiProcess,
 	launchOperationsFromSurface,
 	launchPiSubagent,
 	type FreshPiLaunchRequest,
@@ -85,6 +89,10 @@ export interface PiHarnessAdapterOptions {
 	/** Optional launch-operation injection, keeping the real Pi protocol in unit tests. */
 	operations?: PiLaunchOperations;
 	worktreeOperations?: WorktreeOperations;
+	/** Signals one Herdr-identified owned Pi process; injected by tests. */
+	terminateProcess?(pid: number, sessionFile: string): void;
+	/** Bound for confirming a retained worktree child's exit. Default: 5000ms. */
+	killTimeoutMs?: number;
 	/** Explicit local evidence/lifecycle bridge. The host still owns delivery and deduplication. */
 	onObservation?(
 		child: PiRunningChild,
@@ -165,6 +173,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
 			for (const name of [
 				"subagent",
 				"subagent_interrupt",
+				"subagent_cancel",
 				"subagent_send",
 				"subagent_stop",
 				"subagents_list",
@@ -349,10 +358,78 @@ export class PiHarnessAdapter implements HarnessAdapter {
 		child.lifecycle = markInterruptRequested(child.lifecycle, Date.now());
 		this.options.onObservation?.(child, "interrupt");
 	}
+	/** Resolves only with termination evidence; otherwise rejects (unconfirmed). */
 	async kill(handle: AgentHandle): Promise<void> {
 		const child = this.getRunningChild(handle);
-		await this.options.surface.closeSurface(child.surface);
-		await this.options.surface.waitForSurfaceAbsence(child.surface);
+		// A worktree root pane is the retained review workspace (Herdr refuses to
+		// close it): stop only the owned Pi process and keep pane and checkout.
+		if (child.worktree) return this.stopRetainedPi(child, child.worktree.path);
+		let closeError: unknown;
+		try {
+			await this.options.surface.closeSurface(child.surface);
+		} catch (error) {
+			// Absence is still checked: a pane that is already gone is terminated.
+			closeError = error;
+		}
+		try {
+			await this.options.surface.waitForSurfaceAbsence(child.surface);
+		} catch (error) {
+			if (closeError === undefined) throw error;
+			throw new Error(`${errorText(closeError)}; ${errorText(error)}`);
+		}
+	}
+	private async stopRetainedPi(
+		child: PiRunningChild,
+		cwd: string,
+	): Promise<void> {
+		const owned = (info: SurfaceProcessInfo) =>
+			info.foregroundProcesses.filter((candidate) =>
+				isExpectedPiProcess(candidate, child.sessionFile, cwd),
+			);
+		// Confirmed only by Herdr: no owned Pi process and an idle retained shell,
+		// or the pane itself is gone.
+		const stopped = async (): Promise<boolean | string> => {
+			try {
+				const info = await this.options.surface.getProcessInfo(child.surface);
+				return (
+					(owned(info).length === 0 &&
+						info.shellPid !== undefined &&
+						info.foregroundProcessGroupId === info.shellPid) ||
+					"owned Pi process is still in the pane foreground"
+				);
+			} catch (error) {
+				const pane = await this.options.surface
+					.inspectSurface(child.surface)
+					.catch(() => undefined);
+				return pane?.kind === "missing" || errorText(error);
+			}
+		};
+		// Providers may throw synchronously or reject; both mean "unknown".
+		const info = await (async () =>
+			this.options.surface.getProcessInfo(child.surface))().catch(
+			() => undefined,
+		);
+		const targets = info ? owned(info) : [];
+		if (targets.length === 0) {
+			const state = await stopped();
+			if (state === true) return;
+			throw new Error(
+				`Owned Pi process not identified in retained worktree pane ${child.surface}: ${state}`,
+			);
+		}
+		const terminate = this.options.terminateProcess ?? terminateOwnedPiProcess;
+		for (const target of targets) terminate(target.pid, child.sessionFile);
+		const timeoutMs = this.options.killTimeoutMs ?? 5_000;
+		const deadline = Date.now() + timeoutMs;
+		let state: boolean | string;
+		do {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			state = await stopped();
+			if (state === true) return;
+		} while (Date.now() < deadline);
+		throw new Error(
+			`Owned Pi process exit unconfirmed after ${timeoutMs}ms in retained worktree pane ${child.surface}: ${state}`,
+		);
 	}
 	async readOutput(handle: AgentHandle, lines?: number): Promise<string> {
 		return this.options.surface.readScreen(
@@ -564,5 +641,31 @@ export class PiHarnessAdapter implements HarnessAdapter {
 			throw new Error(
 				"The existing Pi launch protocol does not support per-child environment overrides",
 			);
+	}
+}
+
+function errorText(cause: unknown): string {
+	return cause instanceof Error ? cause.message : String(cause);
+}
+
+// Herdr reports the PID; on Linux, signal it only if this host's process table
+// names the same owned session, so a PID namespace mismatch never misfires.
+function terminateOwnedPiProcess(pid: number, sessionFile: string): void {
+	try {
+		if (process.platform === "linux") {
+			const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+			const index = argv.indexOf("--session");
+			if (index < 0 || argv[index + 1] !== sessionFile)
+				throw new Error(
+					`Process ${pid} on this host is not the owned Pi session; not signalled`,
+				);
+		}
+		process.kill(pid, "SIGTERM");
+	} catch (error) {
+		// SAFETY: fs and process.kill failures are Node errors with an optional code.
+		const code = (error as NodeJS.ErrnoException).code;
+		// Already gone: Herdr confirmation below decides, never this exception.
+		if (code === "ENOENT" || code === "ESRCH") return;
+		throw error;
 	}
 }

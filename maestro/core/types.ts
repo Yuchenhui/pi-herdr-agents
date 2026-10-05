@@ -119,6 +119,8 @@ export type WorktreeState =
 	| "ready_for_review"
 	| "failed"
 	| "needs_help"
+	// pi-herdr-agents extension
+	| "cancelled"
 	| "removed";
 
 export interface WorktreeOwnership {
@@ -232,6 +234,24 @@ export interface RunResult {
 	durationMs: number;
 	// pi-herdr-agents extension
 	evidence?: CompletionEvidence;
+	/** Present only for operator cancellation; the outcome is then "killed". */
+	// pi-herdr-agents extension
+	cancellation?: RunCancellation;
+}
+
+/**
+ * Operator cancellation provenance. A delivered cancellation is always
+ * confirmed: unconfirmed termination keeps the run live instead of settling.
+ */
+// pi-herdr-agents extension
+export interface RunCancellation {
+	/** When the terminal intent was recorded, before any abort or kill. */
+	requestedAt: number;
+	/** "confirmed" only after the owning adapter's kill resolved. */
+	termination: "confirmed" | "unconfirmed";
+	confirmedAt?: number;
+	/** Last kill failure while termination remains unconfirmed. */
+	error?: string;
 }
 
 // pi-herdr-agents extension

@@ -262,6 +262,7 @@ describe("PiHarnessAdapter", () => {
 			assert.deepEqual(policy.deniedTools, [
 				"subagent",
 				"subagent_interrupt",
+				"subagent_cancel",
 				"subagent_send",
 				"subagent_stop",
 				"subagents_list",
@@ -674,6 +675,170 @@ describe("PiHarnessAdapter", () => {
 				);
 				assert.equal(f.adapter.exitCode(h), undefined);
 			}));
+	for (const present of [false, true])
+		it(`kill after a close failure ${present ? "rejects while the pane is present" : "confirms an already-absent pane"}`, async () =>
+			usingFixture(async (f) => {
+				const h = await f.adapter.spawn(f.options);
+				f.surface.closeSurface = async (id) => {
+					if (!present) f.surface.removeSurface(id);
+					throw new Error("pane close failed");
+				};
+				if (present)
+					await assert.rejects(
+						f.adapter.kill(h),
+						/pane close failed; surface still present/,
+					);
+				else await f.adapter.kill(h);
+			}));
+});
+
+describe("PiHarnessAdapter retained worktree kill", () => {
+	// The real launch ownership predicate: pi, --session <file>, worktree cwd.
+	function piProcess(pid: number, sessionFile: string, cwd: string) {
+		return {
+			pid,
+			name: "pi",
+			argv: ["pi", "--session", sessionFile],
+			cwd,
+		};
+	}
+	async function worktreeChild(
+		f: ReturnType<typeof fixture>,
+		options: { signalled?: (pid: number) => void } = {},
+	) {
+		const signals: Array<[number, string]> = [];
+		const adapter = new PiHarnessAdapter({
+			surface: f.surface,
+			paneConfig,
+			operations: f.operations,
+			supervision: f.supervision,
+			modelRegistry: f.modelRegistry,
+			parent: {
+				cwd: f.root,
+				sessionFile: join(f.root, "parent", "parent.jsonl"),
+				sessionId: "parent",
+				sessionDir: join(f.root, "parent"),
+				agentDir: join(f.root, "agent"),
+			},
+			parentRuntime: { provider: "fake", modelId: "test", thinking: "off" },
+			killTimeoutMs: 150,
+			terminateProcess(pid, sessionFile) {
+				signals.push([pid, sessionFile]);
+				options.signalled?.(pid);
+			},
+		});
+		const h = await adapter.spawn(f.options);
+		const child = adapter.getRunningChild(h);
+		const path = join(f.root, "worktree");
+		// Only the adapter's ownership of a worktree child matters to kill.
+		child.worktree = {
+			path,
+			workspaceId: "owned-workspace",
+			paneId: child.surface,
+			branch: "cancel",
+			baseRef: "HEAD",
+			baseSha: "base",
+			manifestFile: join(f.root, "manifest.json"),
+		};
+		const closes: string[] = [];
+		f.surface.closeSurface = (id) => {
+			closes.push(id);
+		};
+		return { adapter, h, child, path, signals, closes };
+	}
+	it("signals only the owned Pi process, keeps the pane, and confirms the idle shell", async () =>
+		usingFixture(async (f) => {
+			let exited = false;
+			const w = await worktreeChild(f, {
+				signalled: () => {
+					exited = true;
+				},
+			});
+			const unrelated = { pid: 77, name: "vim", argv: ["vim"], cwd: w.path };
+			f.surface.getProcessInfo = () => ({
+				shellPid: 10,
+				foregroundProcessGroupId: exited ? 10 : 20,
+				pids: [10, 20],
+				foregroundProcesses: exited
+					? []
+					: [unrelated, piProcess(20, w.child.sessionFile, w.path)],
+			});
+			await w.adapter.kill(w.h);
+			assert.deepEqual(w.signals, [[20, w.child.sessionFile]]);
+			assert.deepEqual(
+				w.closes,
+				[],
+				"the retained worktree pane is never closed",
+			);
+			assert.equal(
+				(await f.surface.inspectSurface(w.child.surface)).kind,
+				"present",
+			);
+		}));
+	it("refuses to signal an unidentified foreground process and reports unconfirmed", async () =>
+		usingFixture(async (f) => {
+			const w = await worktreeChild(f);
+			f.surface.getProcessInfo = () => ({
+				shellPid: 10,
+				foregroundProcessGroupId: 30,
+				pids: [10, 30],
+				foregroundProcesses: [
+					piProcess(30, "/other/session.jsonl", w.path),
+					piProcess(31, w.child.sessionFile, "/elsewhere"),
+				],
+			});
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/Owned Pi process not identified in retained worktree pane .*still in the pane foreground/,
+			);
+			assert.deepEqual(w.signals, []);
+			assert.deepEqual(w.closes, []);
+		}));
+	it("reports unconfirmed when the signalled process does not leave the foreground", async () =>
+		usingFixture(async (f) => {
+			const w = await worktreeChild(f);
+			f.surface.getProcessInfo = () => ({
+				shellPid: 10,
+				foregroundProcessGroupId: 20,
+				pids: [10, 20],
+				foregroundProcesses: [piProcess(20, w.child.sessionFile, w.path)],
+			});
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/Owned Pi process exit unconfirmed after 150ms/,
+			);
+			assert.deepEqual(w.signals, [[20, w.child.sessionFile]]);
+			assert.deepEqual(w.closes, []);
+		}));
+	for (const state of ["idle shell", "missing pane"] as const)
+		it(`confirms an already-exited child (${state}) without signalling`, async () =>
+			usingFixture(async (f) => {
+				const w = await worktreeChild(f);
+				if (state === "missing pane") {
+					f.surface.removeSurface(w.child.surface);
+					f.surface.getProcessInfo = () => {
+						throw new Error("pane not found");
+					};
+				} else
+					f.surface.getProcessInfo = () => ({
+						shellPid: 10,
+						foregroundProcessGroupId: 10,
+						pids: [10],
+						foregroundProcesses: [],
+					});
+				await w.adapter.kill(w.h);
+				assert.deepEqual(w.signals, []);
+				assert.deepEqual(w.closes, []);
+			}));
+	it("an unreadable process state is unconfirmed, never guessed exited", async () =>
+		usingFixture(async (f) => {
+			const w = await worktreeChild(f);
+			f.surface.getProcessInfo = () => {
+				throw new Error("herdr unavailable");
+			};
+			await assert.rejects(w.adapter.kill(w.h), /herdr unavailable/);
+			assert.deepEqual(w.signals, []);
+		}));
 });
 
 function deferred() {

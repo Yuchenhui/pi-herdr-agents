@@ -170,7 +170,7 @@ function worktreeSurfaceForLaunch(
 	};
 }
 
-function isExpectedPiProcess(
+export function isExpectedPiProcess(
 	process: {
 		name?: string;
 		argv0?: string;
