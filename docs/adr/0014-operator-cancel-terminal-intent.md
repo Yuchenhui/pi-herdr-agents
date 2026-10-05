@@ -61,20 +61,33 @@ kernel producer, adapter, and finalization. It is not a second engine.
    absence through Herdr; a close error on an already-absent pane is still
    confirmed by that absence. A managed-worktree root pane is the retained
    review workspace, and Herdr refuses to close it. For that child, `kill`
-   signals SIGTERM only to the Pi process Herdr reports in the pane foreground
-   with the child's exact `--session` and worktree cwd. On Linux it also
-   re-checks `/proc/<pid>/cmdline`, so a PID-namespace mismatch cannot misfire.
-   Herdr enumerates only foreground processes, so a suspended or backgrounded
-   Pi is invisible there. Confirmation therefore requires the pane gone, or
-   Herdr to show no owned Pi in the foreground and the retained shell idle
-   **and** owned-process exit evidence from the parent host's process table
-   (`/proc` on Linux, `ps` elsewhere): no process still carries the child's
-   exact `--session` argv, and Herdr's shell PID is visible there, so the
-   table shares the pane's PID namespace. When only foreground absence is
-   known (table unreadable, shell not visible, or an owned process still
-   alive), termination is unconfirmed. Neither a non-foreground Pi nor any
-   other foreground process is ever signalled; both leave termination
-   unconfirmed. The manifest records `cancelled` only for
+   acts only on the child's **process identity**, established at launch from
+   immutable kernel facts, never from command-line text: Pi assigns
+   `process.title`, which rewrites `/proc/<pid>/cmdline` and erases
+   `--session`, and Herdr lists foreground processes only.
+   - *Capture.* The child protocol extension records its own PID, `/proc`
+     start time, boot ID, and PID-namespace link into a once-only sidecar
+     beside its session (`<session>.process.json`). In the background after
+     launch, the parent accepts the record only for this run and session,
+     only while that PID is alive with that start time on this boot in the
+     parent's own PID namespace (also proven by `/proc/self` naming the
+     parent), and only as Herdr's pane shell or a descendant of it. The
+     identity lives on the run record. A shell PID merely existing locally is
+     not namespace evidence; the recorded namespace link is.
+   - *Signal.* SIGTERM goes only to that identity, re-read (PID and start
+     time) immediately before `kill(2)`; a mismatch or read error is never
+     signalled. Node exposes no pidfd signal, so the kernel could still reuse
+     the PID between that read and the signal; this needs the Pi to exit and
+     its PID to be recycled within that window. There is no SIGKILL.
+   - *Confirm.* Confirmed only when that identity no longer exists (PID
+     absent, or a zombie), or when the pane is gone while the identity is not
+     affirmatively alive. A live identity (including a suspended Pi with
+     SIGTERM pending) stays unconfirmed. An identity not captured (no record,
+     capture still pending at the kill deadline, a non-Linux host, a handoff
+     or resumed child), unreadable, from another boot or PID namespace, or
+     whose PID now has another start time is unconfirmed and not signalled.
+
+   The manifest records `cancelled` only for
    confirmed termination, and the handoff is captured as for any completion.
    There is no Git cleanup.
 8. **Persistent specialists are rejected** before any kill; `subagent_stop`
@@ -84,9 +97,13 @@ kernel producer, adapter, and finalization. It is not a second engine.
 
 - Cancel never confirms more than its evidence: ordinary confirmation is Herdr
   pane absence, which terminates the pane's PTY, not an OS PID check. Worktree
-  confirmation combines Herdr's process-info view of the retained pane with
-  the parent host's process table; a stopped Pi keeps SIGTERM pending and
-  stays unconfirmed until it is resumed or exits.
+  confirmation is the launch-captured process identity ceasing to exist; a
+  stopped Pi keeps SIGTERM pending and stays unconfirmed until it is resumed
+  or exits. The identity is the child's own report, trusted like its other
+  sidecars and bounded by liveness, namespace, and pane-ancestry checks at
+  capture.
+- Worktree cancel is Linux-only in effect: elsewhere no identity is captured,
+  nothing is signalled, and only a gone pane confirms.
 - An unconfirmed cancel can leave a live row indefinitely until a retry, the
   child's exit, manual pane closure, or parent shutdown.
 - Late callbacks after delivery change nothing: the retired ID answers
@@ -101,5 +118,9 @@ kernel producer, adapter, and finalization. It is not a second engine.
   process may still be writing.
 - **Close the worktree root pane:** it would discard the retained review
   workspace that worktree runs promise to keep.
+- **Match the owned process by argv (`--session`):** Pi's process-title
+  rewrite erases it, so a live Pi looked exited.
+- **Treat a visible pane-shell PID as a shared PID namespace:** an unrelated
+  local process can hold the same number.
 - **Escalate to SIGKILL automatically:** an operator retry repeats the bounded
   SIGTERM check instead; forced escalation stays outside this decision.

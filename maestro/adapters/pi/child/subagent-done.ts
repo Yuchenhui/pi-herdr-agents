@@ -14,6 +14,10 @@ import {
 	readPersistentTaskEvents,
 } from "../session.ts";
 import { createSubagentActivityRecorder } from "../activity-file.ts";
+import {
+	readOwnProcessIdentity,
+	writeProcessIdentityRecord,
+} from "../process-identity.ts";
 import { isString } from "../../../core/config/type-guards.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -130,6 +134,28 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 		.filter(Boolean);
 }
 
+/**
+ * A managed worktree child names its own process at load from immutable
+ * kernel facts, which Pi's process-title rewrite cannot alter.
+ */
+export function recordProcessIdentity(
+	id: string | undefined,
+	sessionFile: string | undefined,
+	file = process.env.PI_SUBAGENT_PROCESS_FILE,
+): void {
+	if (!file || !id || !sessionFile) return;
+	try {
+		writeProcessIdentityRecord(file, {
+			version: 1,
+			id,
+			sessionFile,
+			...readOwnProcessIdentity(),
+		});
+	} catch {
+		// Unrecorded identity leaves a worktree cancel unconfirmed, never guessed.
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	let toolNames: string[] = [];
 	let denied: string[] = [];
@@ -157,6 +183,7 @@ export default function (pi: ExtensionAPI) {
 		runningChildId: process.env.PI_SUBAGENT_ID,
 		activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
 	});
+	recordProcessIdentity(process.env.PI_SUBAGENT_ID, sessionFile);
 
 	function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
 		ctx.ui.setWidget(

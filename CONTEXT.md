@@ -64,6 +64,13 @@ retry, and shutdown suppression of it is not a cancellation. A natural result
 taken first stays authoritative.
 _Avoid_: Interrupt, suppression, persistent stop, pane-close fallback
 
+**Process identity**:
+A managed worktree child's Pi process named by immutable kernel facts (PID,
+start time, boot, and PID namespace), recorded by the child at launch and
+verified by the parent against the Herdr pane. A worktree cancel signals and
+judges exit only by it.
+_Avoid_: argv match, foreground process, shell visibility
+
 **No-progress advisory**:
 An internal warning that an active child shows no durable progress in its session
 JSONL or activity snapshot. It is advisory only and never changes the child's

@@ -22,6 +22,14 @@ import type {
 	WorktreeOperations,
 } from "../../core/worktree.ts";
 import {
+	getSubagentProcessIdentityFile,
+	linuxProcessProbe,
+	readProcessIdentityRecord,
+	verifyProcessIdentityRecord,
+	type PiProcessIdentity,
+	type ProcessIdentityProbe,
+} from "./process-identity.ts";
+import {
 	createWorktreeSessionFork,
 	getNewEntries,
 	readSubagentSessionPolicy,
@@ -115,6 +123,20 @@ export interface PiRunningChild {
 	stopState?: "requested" | "pending" | "failed";
 	stopFailure?: string;
 	crashNotified?: boolean;
+	/** Managed worktree children: where the child records its own process identity. */
+	processIdentityFile?: string;
+	/** Verified at launch readiness; a worktree cancel's only signal and exit evidence. */
+	processIdentity?: PiProcessIdentity;
+	/** Settles when launch-readiness capture verifies or gives up; never rejects. */
+	processIdentityCapture?: Promise<PiProcessIdentity | undefined>;
+	processIdentityError?: string;
+}
+
+/** What a captured identity must match: this run, its session, and its pane. */
+export interface ProcessIdentityExpectation {
+	file: string;
+	id: string;
+	sessionFile: string;
 }
 
 type MaybePromise<T> = T | Promise<T>;
@@ -149,6 +171,11 @@ export interface PiLaunchOperations {
 		cwd: string,
 	): Promise<void>;
 	focusWorkspace?(workspaceId: string): MaybePromise<void>;
+	/** Bounded readiness capture of a worktree child's verified process identity. */
+	captureProcessIdentity?(
+		surface: string,
+		expected: ProcessIdentityExpectation,
+	): Promise<PiProcessIdentity>;
 }
 
 function placementFromPaneConfig(config: PaneConfig) {
@@ -222,6 +249,50 @@ async function waitForSurfacePiReady(
 	);
 }
 
+/**
+ * Wait for the child to publish its own identity, then accept it only while
+ * that process is alive in this host's namespace as the Herdr pane shell or a
+ * descendant of it. Command-line text is never consulted: Pi rewrites it.
+ */
+export async function captureSurfacePiProcessIdentity(
+	provider: Pick<SurfaceProvider, "getProcessInfo">,
+	surface: string,
+	expected: ProcessIdentityExpectation,
+	options: {
+		timeoutMs?: number;
+		intervalMs?: number;
+		probe?: ProcessIdentityProbe;
+	} = {},
+): Promise<PiProcessIdentity> {
+	const timeoutMs = options.timeoutMs ?? 15_000;
+	const intervalMs = options.intervalMs ?? 100;
+	const deadline = Date.now() + timeoutMs;
+	let lastError = "the child has not recorded its process identity";
+	for (;;) {
+		try {
+			const record = readProcessIdentityRecord(expected.file);
+			if (record) {
+				const info = await Promise.resolve(provider.getProcessInfo(surface));
+				if (info.shellPid === undefined)
+					throw new Error(`Herdr reports no shell for pane ${surface}`);
+				return verifyProcessIdentityRecord(
+					record,
+					{ ...expected, shellPid: info.shellPid },
+					options.probe ?? linuxProcessProbe,
+				);
+			}
+		} catch (error) {
+			lastError = errorMessage(error);
+		}
+		if (Date.now() >= deadline) break;
+		// Background capture must never hold the parent process open.
+		await new Promise((resolve) => setTimeout(resolve, intervalMs).unref());
+	}
+	throw new Error(
+		`Process identity not captured within ${timeoutMs}ms: ${lastError}`,
+	);
+}
+
 export function launchOperationsFromSurface(
 	provider: SurfaceProvider,
 	config: PaneConfig,
@@ -257,6 +328,9 @@ export function launchOperationsFromSurface(
 		focusWorkspace(workspaceId) {
 			return provider.focusWorkspace(workspaceId);
 		},
+		captureProcessIdentity(surface, expected) {
+			return captureSurfacePiProcessIdentity(provider, surface, expected);
+		},
 	};
 }
 
@@ -283,6 +357,7 @@ interface PreparedSurface {
 interface PreparedSession extends PreparedSurface {
 	sessionFile: string;
 	activityFile: string;
+	processIdentityFile?: string;
 }
 
 interface PreparedArtifacts extends PreparedSession {
@@ -372,7 +447,9 @@ async function launchFreshPiSubagent(
 				);
 			}
 		}
-		return createRunningChild(resolved, artifacts, launchScriptFile);
+		const running = createRunningChild(resolved, artifacts, launchScriptFile);
+		startProcessIdentityCapture(running, operations);
+		return running;
 	} catch (error) {
 		if (!surface) throw error;
 		if (!surface.worktree) {
@@ -572,7 +649,16 @@ function prepareChildSession(
 		resolved.artifactDir,
 		resolved.id,
 	);
-	return { ...surface, sessionFile, activityFile };
+	return {
+		...surface,
+		sessionFile,
+		activityFile,
+		// A handoff Pi loads no child protocol extension, so it records nothing.
+		processIdentityFile:
+			surface.worktree && !resolved.request.handoff
+				? getSubagentProcessIdentityFile(sessionFile)
+				: undefined,
+	};
 }
 
 async function confirmShellReady(
@@ -753,6 +839,10 @@ function buildPiCommand(
 		env.push(`PI_SUBAGENT_ID=${shellQuote(resolved.id)}`);
 		env.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(artifacts.activityFile)}`);
 		env.push(`PI_SUBAGENT_SURFACE=${shellQuote(artifacts.surface)}`);
+		if (artifacts.processIdentityFile)
+			env.push(
+				`PI_SUBAGENT_PROCESS_FILE=${shellQuote(artifacts.processIdentityFile)}`,
+			);
 	}
 
 	const piCommand =
@@ -810,7 +900,38 @@ function createRunningChild(
 		runtimePlan: resolved.request.runtimePlan,
 		worktree: artifacts.worktree,
 		lifecycle: createLifecycle(resolved.startTime),
+		processIdentityFile: artifacts.processIdentityFile,
 	};
+}
+
+// Capture runs beside the launch so readiness never delays the acknowledgement;
+// a cancel awaits it, and without a verified identity nothing is signalled.
+function startProcessIdentityCapture(
+	child: PiRunningChild,
+	operations: PiLaunchOperations,
+): void {
+	const file = child.processIdentityFile;
+	if (!file) return;
+	const capture = operations.captureProcessIdentity;
+	if (!capture) {
+		child.processIdentityError = "process identity capture is unavailable";
+		return;
+	}
+	child.processIdentityCapture = Promise.resolve()
+		.then(() =>
+			capture(child.surface, {
+				file,
+				id: child.id,
+				sessionFile: child.sessionFile,
+			}),
+		)
+		.then(
+			(identity) => (child.processIdentity = identity),
+			(error) => {
+				child.processIdentityError = errorMessage(error);
+				return undefined;
+			},
+		);
 }
 
 async function launchResumedPiSubagent(

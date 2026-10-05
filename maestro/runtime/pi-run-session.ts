@@ -16,10 +16,8 @@ import type {
 	SurfaceProvider,
 	WorktreeSurfaceInfo,
 } from "../core/surface-provider.ts";
-import {
-	PiHarnessAdapter,
-	type LocalProcessProbe,
-} from "../adapters/pi/pi-harness-adapter.ts";
+import { PiHarnessAdapter } from "../adapters/pi/pi-harness-adapter.ts";
+import type { ProcessIdentityProbe } from "../adapters/pi/process-identity.ts";
 import {
 	launchOperationsFromSurface,
 	launchPiWorktreeHandoff,
@@ -327,8 +325,8 @@ export interface PiRunSessionInfrastructure {
 	launchOperations: PiLaunchOperations;
 	worktreeOperations?: WorktreeOperations;
 	supervision: SupervisionCoordinator;
-	/** Host process-table probe for worktree cancel confirmation; tests inject it. */
-	localProcesses?: LocalProcessProbe;
+	/** Kernel process-identity probe for worktree cancel; tests inject it. */
+	processProbe?: ProcessIdentityProbe;
 }
 // pi-herdr-agents extension
 export interface DefaultRunSessionOptions {
@@ -412,7 +410,7 @@ interface PiSessionOwner {
 	entries: Map<string, PiEntry>;
 	infrastructure: Pick<
 		PiRunSessionInfrastructure,
-		"surfaceProvider" | "supervision" | "localProcesses"
+		"surfaceProvider" | "supervision" | "processProbe"
 	>;
 	worktreeOperations: WorktreeOperations;
 }
@@ -746,7 +744,7 @@ export function createDefaultRunSession(
 			parent: snapshot.parent,
 			parentRuntime: snapshot.parentRuntime,
 			supervision: state.infrastructure.supervision,
-			localProcesses: state.infrastructure.localProcesses,
+			processProbe: state.infrastructure.processProbe,
 			operations: launchOperations(snapshot),
 			onObservation(child, kind) {
 				const at = Date.now();

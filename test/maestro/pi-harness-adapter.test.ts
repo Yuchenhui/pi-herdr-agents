@@ -11,12 +11,16 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { PiHarnessAdapter } from "../../maestro/adapters/pi/pi-harness-adapter.ts";
 import {
-	PiHarnessAdapter,
-	inspectLocalProcesses,
-	type LocalProcessProbe,
-} from "../../maestro/adapters/pi/pi-harness-adapter.ts";
-import { launchOperationsFromSurface } from "../../maestro/adapters/pi/launch.ts";
+	captureSurfacePiProcessIdentity,
+	launchOperationsFromSurface,
+} from "../../maestro/adapters/pi/launch.ts";
+import type {
+	PiProcessIdentity,
+	ProcessIdentityProbe,
+	ProcessStat,
+} from "../../maestro/adapters/pi/process-identity.ts";
 import {
 	createWorktreeOperations,
 	readWorktreeManifest,
@@ -699,24 +703,52 @@ describe("PiHarnessAdapter", () => {
 });
 
 describe("PiHarnessAdapter retained worktree kill", () => {
-	// The real launch ownership predicate: pi, --session <file>, worktree cwd.
-	function piProcess(pid: number, sessionFile: string, cwd: string) {
-		return {
-			pid,
-			name: "pi",
-			argv: ["pi", "--session", sessionFile],
-			cwd,
+	const HOST = { bootId: "boot-a", pidNamespace: "pid:[4026531836]" };
+	const identity = (overrides: Partial<PiProcessIdentity> = {}) => ({
+		pid: 20,
+		startTime: "5000",
+		...HOST,
+		...overrides,
+	});
+	type Entry = ProcessStat | "EACCES" | undefined;
+	// A kernel process table keyed by PID. `terminate` runs `onTerminate`.
+	function fakeProbe(
+		table: Map<number, Entry>,
+		onTerminate: (pid: number) => void = (pid) => table.delete(pid),
+	) {
+		const signals: number[] = [];
+		const probe: ProcessIdentityProbe = {
+			host: () => HOST,
+			stat(pid) {
+				const entry = table.get(pid);
+				if (entry === "EACCES")
+					throw Object.assign(new Error(`EACCES: /proc/${pid}/stat`), {
+						code: "EACCES",
+					});
+				return entry;
+			},
+			terminate(pid) {
+				signals.push(pid);
+				onTerminate(pid);
+			},
 		};
+		return { probe, signals };
 	}
+	const alive = (startTime = "5000"): ProcessStat => ({
+		state: "S",
+		ppid: 10,
+		startTime,
+	});
 	async function worktreeChild(
 		f: ReturnType<typeof fixture>,
 		options: {
-			signalled?: (pid: number) => void;
-			local?: LocalProcessProbe;
+			probe?: ProcessIdentityProbe;
+			identity?: PiProcessIdentity;
+			capture?: Promise<PiProcessIdentity | undefined>;
+			captureError?: string;
+			killTimeoutMs?: number;
 		} = {},
 	) {
-		const signals: Array<[number, string]> = [];
-		const probes: Array<[string, number]> = [];
 		const adapter = new PiHarnessAdapter({
 			surface: f.surface,
 			paneConfig,
@@ -731,18 +763,8 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 				agentDir: join(f.root, "agent"),
 			},
 			parentRuntime: { provider: "fake", modelId: "test", thinking: "off" },
-			killTimeoutMs: 150,
-			terminateProcess(pid, sessionFile) {
-				signals.push([pid, sessionFile]);
-				options.signalled?.(pid);
-			},
-			// Default host view: the shell is local and no owned Pi remains.
-			localProcesses(sessionFile, shellPid) {
-				probes.push([sessionFile, shellPid]);
-				return options.local
-					? options.local(sessionFile, shellPid)
-					: { owned: [], shellVisible: true };
-			},
+			killTimeoutMs: options.killTimeoutMs ?? 150,
+			processProbe: options.probe,
 		});
 		const h = await adapter.spawn(f.options);
 		const child = adapter.getRunningChild(h);
@@ -757,31 +779,29 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 			baseSha: "base",
 			manifestFile: join(f.root, "manifest.json"),
 		};
+		child.processIdentity = options.identity;
+		child.processIdentityCapture = options.capture;
+		child.processIdentityError = options.captureError;
 		const closes: string[] = [];
 		f.surface.closeSurface = (id) => {
 			closes.push(id);
 		};
-		return { adapter, h, child, path, signals, closes, probes };
+		// Herdr's foreground list is never evidence: show an owned-looking Pi
+		// in every case so no result can depend on it.
+		f.surface.getProcessInfo = () => ({
+			shellPid: 10,
+			foregroundProcessGroupId: 10,
+			pids: [10],
+			foregroundProcesses: [],
+		});
+		return { adapter, h, child, closes };
 	}
-	it("signals only the owned Pi process, keeps the pane, and confirms the idle shell", async () =>
+	it("signals only the launch-verified identity, keeps the pane, and confirms when it exits", async () =>
 		usingFixture(async (f) => {
-			let exited = false;
-			const w = await worktreeChild(f, {
-				signalled: () => {
-					exited = true;
-				},
-			});
-			const unrelated = { pid: 77, name: "vim", argv: ["vim"], cwd: w.path };
-			f.surface.getProcessInfo = () => ({
-				shellPid: 10,
-				foregroundProcessGroupId: exited ? 10 : 20,
-				pids: [10, 20],
-				foregroundProcesses: exited
-					? []
-					: [unrelated, piProcess(20, w.child.sessionFile, w.path)],
-			});
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+			const w = await worktreeChild(f, { probe, identity: identity() });
 			await w.adapter.kill(w.h);
-			assert.deepEqual(w.signals, [[20, w.child.sessionFile]]);
+			assert.deepEqual(signals, [20]);
 			assert.deepEqual(
 				w.closes,
 				[],
@@ -792,215 +812,325 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 				"present",
 			);
 		}));
-	it("refuses to signal an unidentified foreground process and reports unconfirmed", async () =>
+	it("a signalled identity that stays alive (suspended, or ignoring SIGTERM) is unconfirmed, signalled once", async () =>
 		usingFixture(async (f) => {
-			const w = await worktreeChild(f);
-			f.surface.getProcessInfo = () => ({
-				shellPid: 10,
-				foregroundProcessGroupId: 30,
-				pids: [10, 30],
-				foregroundProcesses: [
-					piProcess(30, "/other/session.jsonl", w.path),
-					piProcess(31, w.child.sessionFile, "/elsewhere"),
-				],
+			const table = new Map<number, Entry>([[20, alive()]]);
+			const { probe, signals } = fakeProbe(table, () => {
+				table.set(20, { ...alive(), state: "T" });
 			});
+			const w = await worktreeChild(f, { probe, identity: identity() });
 			await assert.rejects(
 				w.adapter.kill(w.h),
-				/Owned Pi process not identified in retained worktree pane .*still in the pane foreground/,
+				/Owned Pi process exit unconfirmed in retained worktree pane .*process 20 \(start time 5000\) is still alive 150ms after SIGTERM/,
 			);
-			assert.deepEqual(w.signals, []);
+			assert.deepEqual(signals, [20], "no repeated signal and no SIGKILL");
 			assert.deepEqual(w.closes, []);
 		}));
-	it("reports unconfirmed when the signalled process does not leave the foreground", async () =>
+	it("a PID reused by a different start time is unconfirmed and never signalled", async () =>
 		usingFixture(async (f) => {
-			const w = await worktreeChild(f);
-			f.surface.getProcessInfo = () => ({
-				shellPid: 10,
-				foregroundProcessGroupId: 20,
-				pids: [10, 20],
-				foregroundProcesses: [piProcess(20, w.child.sessionFile, w.path)],
-			});
+			const { probe, signals } = fakeProbe(new Map([[20, alive("7777")]]));
+			const w = await worktreeChild(f, { probe, identity: identity() });
 			await assert.rejects(
 				w.adapter.kill(w.h),
-				/Owned Pi process exit unconfirmed after 150ms/,
+				/PID 20 now names a different process \(start time 7777, recorded 5000\); not signalled/,
 			);
-			assert.deepEqual(w.signals, [[20, w.child.sessionFile]]);
-			assert.deepEqual(w.closes, []);
+			assert.deepEqual(signals, []);
 		}));
-	for (const state of ["idle shell", "missing pane"] as const)
-		it(`confirms an already-exited child (${state}) without signalling`, async () =>
-			usingFixture(async (f) => {
-				const w = await worktreeChild(f);
-				if (state === "missing pane") {
-					f.surface.removeSurface(w.child.surface);
-					f.surface.getProcessInfo = () => {
-						throw new Error("pane not found");
-					};
-				} else
-					f.surface.getProcessInfo = () => ({
-						shellPid: 10,
-						foregroundProcessGroupId: 10,
-						pids: [10],
-						foregroundProcesses: [],
-					});
-				await w.adapter.kill(w.h);
-				assert.deepEqual(w.signals, []);
-				assert.deepEqual(w.closes, []);
-			}));
-	const idleShell = () => ({
-		shellPid: 10,
-		foregroundProcessGroupId: 10,
-		pids: [10],
-		foregroundProcesses: [],
-	});
-	it("a suspended Pi outside the pane foreground is unconfirmed, never confirmed by foreground absence", async () =>
+	it("the identity is re-verified immediately before SIGTERM: reuse after the first read is not signalled", async () =>
 		usingFixture(async (f) => {
-			// Herdr lists foreground processes only: a stopped/backgrounded Pi leaves
-			// the idle shell in the foreground while its process is still alive.
-			const w = await worktreeChild(f, {
-				local: () => ({ owned: [20], shellVisible: true }),
-			});
-			f.surface.getProcessInfo = idleShell;
-			await assert.rejects(
-				w.adapter.kill(w.h),
-				/owned Pi process 20 is still alive outside the pane foreground/,
-			);
-			assert.deepEqual(
-				w.signals,
-				[],
-				"a non-foreground process is not signalled",
-			);
-			assert.deepEqual(w.probes, [[w.child.sessionFile, 10]]);
-			assert.deepEqual(w.closes, []);
-		}));
-	it("negative control: the same Herdr view with host exit evidence confirms", async () =>
-		usingFixture(async (f) => {
-			const w = await worktreeChild(f, {
-				local: () => ({ owned: [], shellVisible: true }),
-			});
-			f.surface.getProcessInfo = idleShell;
-			await w.adapter.kill(w.h);
-			assert.deepEqual(w.probes, [[w.child.sessionFile, 10]]);
-		}));
-	it("a signalled Pi that leaves the foreground but stays alive is unconfirmed", async () =>
-		usingFixture(async (f) => {
-			let signalled = false;
-			const w = await worktreeChild(f, {
-				signalled: () => {
-					signalled = true;
+			const table = new Map<number, Entry>([[20, alive()]]);
+			const { probe, signals } = fakeProbe(table);
+			let reads = 0;
+			const racing: ProcessIdentityProbe = {
+				...probe,
+				stat(pid) {
+					// The first read (in terminateProcessIdentity) is the re-verification.
+					if (reads++ === 0) table.set(20, alive("7777"));
+					return probe.stat(pid);
 				},
-				// SIGTERM stays pending on a stopped process: it is still in the table.
-				local: () => ({ owned: [20], shellVisible: true }),
-			});
-			f.surface.getProcessInfo = () =>
-				signalled
-					? idleShell()
-					: {
-							shellPid: 10,
-							foregroundProcessGroupId: 20,
-							pids: [10, 20],
-							foregroundProcesses: [piProcess(20, w.child.sessionFile, w.path)],
-						};
+			};
+			const w = await worktreeChild(f, { probe: racing, identity: identity() });
 			await assert.rejects(
 				w.adapter.kill(w.h),
-				/exit unconfirmed after 150ms .*owned Pi process 20 is still alive outside the pane foreground/,
+				/now names a different process/,
 			);
-			assert.deepEqual(w.signals, [[20, w.child.sessionFile]]);
+			assert.deepEqual(signals, []);
 		}));
-	for (const [label, local, pattern] of [
+	it("a per-process read error on the identity is unconfirmed, never absence", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map([[20, "EACCES"]]));
+			const w = await worktreeChild(f, { probe, identity: identity() });
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/process 20 is unreadable: EACCES/,
+			);
+			assert.deepEqual(signals, []);
+		}));
+	for (const [label, recorded, pattern] of [
+		["another boot", { bootId: "boot-b" }, /recorded on another boot or host/],
 		[
-			"an unreadable host process table",
-			() => {
-				throw new Error("ps unavailable");
-			},
-			/only foreground absence is known; this host's process table is unreadable: ps unavailable/,
-		],
-		[
-			"a pane shell outside this host's PID namespace",
-			() => ({ owned: [], shellVisible: false }),
-			/only foreground absence is known; pane shell 10 is not visible/,
+			"another PID namespace",
+			{ pidNamespace: "pid:[1]" },
+			/recorded in another PID namespace/,
 		],
 	] as const)
-		it(`only foreground absence is known with ${label}: unconfirmed`, async () =>
+		it(`an identity from ${label} is unconfirmed and never signalled`, async () =>
 			usingFixture(async (f) => {
-				const w = await worktreeChild(f, { local });
-				f.surface.getProcessInfo = idleShell;
+				// The same PID is alive locally: a matching number is not identity.
+				const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+				const w = await worktreeChild(f, {
+					probe,
+					identity: identity(recorded),
+				});
 				await assert.rejects(w.adapter.kill(w.h), pattern);
-				assert.deepEqual(w.signals, []);
+				assert.deepEqual(signals, []);
 			}));
-	it("a missing pane confirms without consulting the host process table", async () =>
+	it("a worktree child launched without identity capture is unconfirmed", async () =>
 		usingFixture(async (f) => {
-			const w = await worktreeChild(f, {
-				local: () => ({ owned: [20], shellVisible: true }),
-			});
-			f.surface.removeSurface(w.child.surface);
-			f.surface.getProcessInfo = () => {
-				throw new Error("pane not found");
-			};
-			await w.adapter.kill(w.h);
-			assert.deepEqual(w.probes, []);
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+			const w = await worktreeChild(f, { probe });
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/nothing was signalled: no identity was recorded at launch/,
+			);
+			assert.deepEqual(signals, []);
 		}));
-	it("an unreadable process state is unconfirmed, never guessed exited", async () =>
+	it("an uncaptured identity is unconfirmed and nothing is signalled", async () =>
 		usingFixture(async (f) => {
-			const w = await worktreeChild(f);
-			f.surface.getProcessInfo = () => {
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+			const w = await worktreeChild(f, {
+				probe,
+				captureError: "Process identity not captured within 15000ms",
+			});
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/identity was not captured for retained worktree pane .*nothing was signalled: Process identity not captured within 15000ms/,
+			);
+			assert.deepEqual(signals, []);
+		}));
+	it("a capture still pending at the deadline is unconfirmed", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+			const w = await worktreeChild(f, {
+				probe,
+				capture: new Promise(() => {}),
+			});
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/identity was not captured .*identity capture is still pending/,
+			);
+			assert.deepEqual(signals, []);
+		}));
+	it("negative control: a capture that settles before the deadline is used", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+			const w = await worktreeChild(f, {
+				probe,
+				capture: new Promise((resolve) =>
+					setTimeout(() => resolve(identity()), 20),
+				),
+			});
+			await w.adapter.kill(w.h);
+			assert.deepEqual(signals, [20]);
+		}));
+	for (const state of ["absent PID", "zombie"] as const)
+		it(`confirms an already-exited identity (${state}) without signalling`, async () =>
+			usingFixture(async (f) => {
+				const { probe, signals } = fakeProbe(
+					new Map<number, Entry>(
+						state === "zombie" ? [[20, { ...alive(), state: "Z" }]] : [],
+					),
+				);
+				const w = await worktreeChild(f, { probe, identity: identity() });
+				await w.adapter.kill(w.h);
+				assert.deepEqual(signals, []);
+				assert.deepEqual(w.closes, []);
+			}));
+	for (const [label, options] of [
+		["no captured identity", {}],
+		["an unreadable identity", { entry: "EACCES" as const }],
+		["a reused PID", { entry: alive("7777") }],
+	] as const)
+		it(`a gone pane confirms with ${label}`, async () =>
+			usingFixture(async (f) => {
+				const { probe, signals } = fakeProbe(
+					new Map<number, Entry>(
+						"entry" in options ? [[20, options.entry]] : [],
+					),
+				);
+				const w = await worktreeChild(f, {
+					probe,
+					identity: "entry" in options ? identity() : undefined,
+				});
+				f.surface.removeSurface(w.child.surface);
+				await w.adapter.kill(w.h);
+				assert.deepEqual(signals, []);
+			}));
+	it("negative control: a gone pane does not confirm while the identity is alive", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]), () => {});
+			const w = await worktreeChild(f, { probe, identity: identity() });
+			f.surface.removeSurface(w.child.surface);
+			await assert.rejects(w.adapter.kill(w.h), /is still alive/);
+			assert.deepEqual(signals, [20]);
+		}));
+	it("a PID reused after SIGTERM is unconfirmed and reported as signalled", async () =>
+		usingFixture(async (f) => {
+			const table = new Map<number, Entry>([[20, alive()]]);
+			const { probe, signals } = fakeProbe(table, () =>
+				table.set(20, alive("7777")),
+			);
+			const w = await worktreeChild(f, { probe, identity: identity() });
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/PID 20 now names a different process \(start time 7777, recorded 5000\) after SIGTERM/,
+			);
+			assert.deepEqual(signals, [20], "signalled once, never the new process");
+		}));
+	it("an unavailable pane state without identity is unconfirmed", async () =>
+		usingFixture(async (f) => {
+			const w = await worktreeChild(f, { captureError: "not recorded" });
+			f.surface.inspectSurface = () => {
 				throw new Error("herdr unavailable");
 			};
-			await assert.rejects(w.adapter.kill(w.h), /herdr unavailable/);
-			assert.deepEqual(w.signals, []);
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/nothing was signalled: not recorded/,
+			);
 		}));
 });
 
-describe("inspectLocalProcesses", () => {
-	it("finds a live or suspended owned process by its exact --session argv, and not after it exits", async () => {
-		const sessionFile = join(
-			tmpdir(),
-			`pi-owned-${process.pid}-${Date.now()}.jsonl`,
+describe("PiHarnessAdapter retained worktree kill with real processes", () => {
+	async function realChild(f: ReturnType<typeof fixture>, mode: string) {
+		const sessionFile = join(f.root, `real-${mode}.jsonl`);
+		const file = `${sessionFile}.process.json`;
+		const proc = spawnIdentityChild(file, "real-run", sessionFile, mode);
+		await childReady(proc);
+		// Pi's `process.title` rewrite has removed the session from argv.
+		assert.doesNotMatch(
+			readFileSync(`/proc/${proc.pid}/cmdline`, "utf8"),
+			/--session|real-run/,
 		);
-		const child = spawn(
-			process.execPath,
-			["-e", "setInterval(() => {}, 1000)", "--", "--session", sessionFile],
-			{ stdio: "ignore" },
+		const captured = await captureSurfacePiProcessIdentity(
+			{
+				getProcessInfo: () => ({
+					shellPid: process.pid,
+					pids: [process.pid],
+					foregroundProcesses: [],
+				}),
+			},
+			"pane",
+			{ file, id: "real-run", sessionFile },
+			{ timeoutMs: 5_000, intervalMs: 20 },
 		);
-		try {
-			const pid = child.pid!;
-			let view = inspectLocalProcesses(sessionFile, process.pid);
-			for (let i = 0; i < 100 && !view.owned.includes(pid); i++) {
-				await new Promise((resolve) => setTimeout(resolve, 20));
-				view = inspectLocalProcesses(sessionFile, process.pid);
+		assert.equal(captured.pid, proc.pid);
+		const adapter = new PiHarnessAdapter({
+			surface: f.surface,
+			paneConfig,
+			operations: f.operations,
+			supervision: f.supervision,
+			modelRegistry: f.modelRegistry,
+			parent: {
+				cwd: f.root,
+				sessionFile: join(f.root, "parent", "parent.jsonl"),
+				sessionId: "parent",
+				sessionDir: join(f.root, "parent"),
+				agentDir: join(f.root, "agent"),
+			},
+			parentRuntime: { provider: "fake", modelId: "test", thinking: "off" },
+			killTimeoutMs: 300,
+		});
+		const h = await adapter.spawn(f.options);
+		const child = adapter.getRunningChild(h);
+		child.worktree = {
+			path: join(f.root, "worktree"),
+			workspaceId: "owned-workspace",
+			paneId: child.surface,
+			branch: "cancel",
+			baseRef: "HEAD",
+			baseSha: "base",
+			manifestFile: join(f.root, "manifest.json"),
+		};
+		child.processIdentity = captured;
+		return { proc, adapter, h };
+	}
+	it("a title-rewritten Pi that survives SIGTERM is unconfirmed until THAT process exits", async () =>
+		usingFixture(async (f) => {
+			if (process.platform !== "linux") return;
+			const r = await realChild(f, "ignore-term");
+			try {
+				await assert.rejects(r.adapter.kill(r.h), /is still alive/);
+				const exited = once(r.proc, "exit");
+				r.proc.kill("SIGKILL");
+				await exited;
+				await r.adapter.kill(r.h);
+			} finally {
+				r.proc.kill("SIGKILL");
 			}
-			assert.deepEqual(view, { owned: [pid], shellVisible: true });
-			// A different session, or a prefix of it, is never owned.
-			assert.deepEqual(
-				inspectLocalProcesses(`${sessionFile}.other`, process.pid).owned,
-				[],
-			);
-			assert.deepEqual(
-				inspectLocalProcesses(sessionFile.slice(0, -1), process.pid).owned,
-				[],
-			);
-			// A suspended process is alive: it stays owned.
-			process.kill(pid, "SIGSTOP");
-			assert.deepEqual(inspectLocalProcesses(sessionFile, process.pid).owned, [
-				pid,
-			]);
-			process.kill(pid, "SIGCONT");
-			const exited = once(child, "exit");
-			process.kill(pid, "SIGTERM");
-			await exited;
-			assert.deepEqual(
-				inspectLocalProcesses(sessionFile, process.pid).owned,
-				[],
-			);
-			assert.equal(
-				inspectLocalProcesses(sessionFile, 2 ** 31 - 1).shellVisible,
-				false,
-			);
-		} finally {
-			child.kill("SIGKILL");
-		}
-	});
+		}));
+	it("a suspended title-rewritten Pi is unconfirmed; resumed, SIGTERM ends it and confirms", async () =>
+		usingFixture(async (f) => {
+			if (process.platform !== "linux") return;
+			const r = await realChild(f, "default");
+			try {
+				process.kill(r.proc.pid!, "SIGSTOP");
+				await assert.rejects(r.adapter.kill(r.h), /is still alive/);
+				const exited = once(r.proc, "exit");
+				process.kill(r.proc.pid!, "SIGCONT");
+				await exited;
+				await r.adapter.kill(r.h);
+			} finally {
+				r.proc.kill("SIGKILL");
+			}
+		}));
 });
+
+// Records its identity through the real child-extension hook, rewrites its
+// title as Pi does, then idles. `ignore-term` survives SIGTERM.
+const IDENTITY_CHILD = `
+const [extension, file, id, sessionFile, mode] = process.argv.slice(1);
+const { recordProcessIdentity } = await import(extension);
+if (mode === "ignore-term") process.on("SIGTERM", () => {});
+recordProcessIdentity(id, sessionFile, file);
+process.title = "pi";
+process.stdout.write("ready\\n");
+setInterval(() => {}, 1000);
+`;
+function spawnIdentityChild(
+	file: string,
+	id: string,
+	sessionFile: string,
+	mode: string,
+) {
+	return spawn(
+		process.execPath,
+		[
+			"--experimental-strip-types",
+			"--no-warnings",
+			"--input-type=module",
+			"-e",
+			IDENTITY_CHILD,
+			"--",
+			new URL(
+				"../../maestro/adapters/pi/child/subagent-done.ts",
+				import.meta.url,
+			).href,
+			file,
+			id,
+			sessionFile,
+			mode,
+		],
+		{ stdio: ["ignore", "pipe", "inherit"] },
+	);
+}
+async function childReady(proc: ReturnType<typeof spawn>) {
+	let output = "";
+	for await (const chunk of proc.stdout!) {
+		output += String(chunk);
+		if (output.includes("ready\n")) return;
+	}
+	throw new Error("identity child exited before it was ready");
+}
 
 function deferred() {
 	let resolve!: () => void;

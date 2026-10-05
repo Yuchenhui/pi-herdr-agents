@@ -1923,6 +1923,35 @@ describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
 		return { retained, git };
 	}
 
+	// A fake kernel for worktree cancel: launch capture yields pid 4242's
+	// identity; SIGTERM removes it from the table.
+	function identityKernel(f: any) {
+		const host = { bootId: "boot", pidNamespace: "pid:[1]" };
+		const table = new Map<number, any>();
+		const signals: number[] = [];
+		f.patch(f.launchOperations, "captureProcessIdentity", async () => ({
+			pid: 4242,
+			startTime: "5000",
+			...host,
+		}));
+		f.patch(f.infrastructure, "processProbe", {
+			host: () => host,
+			stat(pid: number) {
+				const entry = table.get(pid);
+				if (entry === "EACCES")
+					throw Object.assign(new Error("EACCES: permission denied"), {
+						code: "EACCES",
+					});
+				return entry;
+			},
+			terminate(pid: number) {
+				signals.push(pid);
+				table.delete(pid);
+			},
+		});
+		return { table, signals };
+	}
+
 	it("registers a parent tool, is spawning-gated, and is denied to restricted children", () => {
 		const { api, registeredTools } = createMockExtensionApi();
 		subagentsModule.default(api);
@@ -2144,11 +2173,9 @@ describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
 	it("cancels a worktree child: stops only its process, retains workspace, commits, and handoff", async () =>
 		withAdapterHost(async (f) => {
 			const { retained, git } = await worktreeHost(f);
-			// The host process table holds the shell and no owned Pi process.
-			f.patch(f.infrastructure, "localProcesses", () => ({
-				owned: [],
-				shellVisible: true,
-			}));
+			// The launch-verified identity of the child's Pi, and the kernel's view.
+			const kernel = identityKernel(f);
+			kernel.table.set(4242, "EACCES");
 			const child = await f.launch({
 				name: "writer",
 				task: "bounded",
@@ -2158,31 +2185,23 @@ describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
 			git(retained, "add", "work");
 			git(retained, "commit", "-qm", "child work");
 			const head = git(retained, "rev-parse", "HEAD");
-			// Herdr shows a foreground that is not the owned Pi process: never signal
-			// it, and never guess that the child exited.
-			let info: any = {
-				shellPid: 10,
-				foregroundProcessGroupId: 99,
-				pids: [10, 99],
-				foregroundProcesses: [{ pid: 99, name: "vim", cwd: retained }],
-			};
-			f.patch(f.surface, "getProcessInfo", () => info);
+			// The identity is unreadable: never signal it, never guess it exited.
 			const first = await cancel(f, { id: child.id });
 			assert.equal(first.details.status, "unconfirmed");
-			assert.match(first.details.error, /Owned Pi process not identified/);
+			assert.match(
+				first.details.error,
+				/process 4242 is unreadable: EACCES.*not signalled/,
+			);
+			assert.deepEqual(kernel.signals, []);
 			assert.equal(
 				JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state,
 				"running",
 			);
 			assert.equal(results(f).length, 0);
-			// The owned process has left; Herdr shows the idle retained shell.
-			info = {
-				shellPid: 10,
-				foregroundProcessGroupId: 10,
-				pids: [10],
-				foregroundProcesses: [],
-			};
+			// The owned process is readable and alive: SIGTERM ends THAT identity.
+			kernel.table.set(4242, { state: "S", ppid: 10, startTime: "5000" });
 			const retry = await cancel(f, { id: child.id });
+			assert.deepEqual(kernel.signals, [4242]);
 			assert.equal(retry.details.status, "confirmed");
 			assert.match(
 				retry.content[0].text,
@@ -2210,16 +2229,16 @@ describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
 			);
 		}));
 
-	it("a worktree child that is only absent from the foreground stays unconfirmed; shutdown never records cancelled", async () =>
+	it("a worktree child without a captured process identity stays unconfirmed; shutdown never records cancelled", async () =>
 		withAdapterHost(async (f) => {
 			const { retained } = await worktreeHost(f);
-			// Suspended Pi: Herdr shows the idle shell; the host still has the process.
-			f.patch(f.infrastructure, "localProcesses", () => ({
-				owned: [4242],
-				shellVisible: true,
-			}));
+			// Herdr's idle shell is never exit evidence: only the identity is.
+			const kernel = identityKernel(f);
+			f.patch(f.launchOperations, "captureProcessIdentity", async () => {
+				throw new Error("Process identity not captured within 15000ms");
+			});
 			const child = await f.launch({
-				name: "suspended",
+				name: "uncaptured",
 				task: "bounded",
 				worktree: { branch: "cancel-worktree" },
 			});
@@ -2235,8 +2254,9 @@ describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
 			assert.equal(report.details.status, "unconfirmed");
 			assert.match(
 				report.details.error,
-				/owned Pi process 4242 is still alive outside the pane foreground/,
+				/identity was not captured .*nothing was signalled: Process identity not captured/,
 			);
+			assert.deepEqual(kernel.signals, []);
 			assert.equal(child.cancelState, "unconfirmed");
 			assert.equal(manifest(), "running");
 			// Parent shutdown suppresses the unconfirmed run: it is not a cancellation.

@@ -478,11 +478,16 @@ describe("Pi launch", () => {
 				async waitForShellReady(surface) {
 					assert.equal(surface, "pane-null-worktree");
 				},
-				runScript(_surface, _command, options) {
+				runScript(_surface, value, options) {
+					command = value;
 					return options.scriptPath;
 				},
 				closePane() {},
+				captureProcessIdentity() {
+					throw new Error("an ordinary pane captures no process identity");
+				},
 			};
+			let command = "";
 
 			const running = await launchPiSubagent(
 				{ ...request, worktree: null },
@@ -492,6 +497,9 @@ describe("Pi launch", () => {
 			assert.equal(worktreeCreationAttempts, 0);
 			assert.equal(running.surface, "pane-null-worktree");
 			assert.equal(running.worktree, undefined);
+			assert.doesNotMatch(command, /PI_SUBAGENT_PROCESS_FILE/);
+			assert.equal(running.processIdentityFile, undefined);
+			assert.equal(running.processIdentityCapture, undefined);
 		});
 	});
 
@@ -1156,10 +1164,21 @@ describe("Pi launch", () => {
 			);
 			const events: string[] = [];
 			let command = "";
+			const identity = {
+				pid: 4321,
+				startTime: "987",
+				bootId: "boot",
+				pidNamespace: "pid:[1]",
+			};
+			const captures: unknown[] = [];
 			const operations: PiLaunchOperations = {
 				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
+				},
+				async captureProcessIdentity(surface, expected) {
+					captures.push({ surface, ...expected });
+					return identity;
 				},
 				createWorktree(name, cwd, branch, base) {
 					assert.equal(name, "Worker");
@@ -1217,6 +1236,25 @@ describe("Pi launch", () => {
 			assert.equal(manifest.state, "running");
 			assert.equal(manifest.owner, "pi-herdr-subagents");
 			assert.equal(manifest.paneId, "root-pane-1");
+			// The child records its own identity beside its session; the parent
+			// verifies it against this run, session, and root pane at readiness.
+			const processFile = `${running.sessionFile}.process.json`;
+			assert.equal(running.processIdentityFile, processFile);
+			assert.ok(
+				command.includes(
+					`PI_SUBAGENT_PROCESS_FILE=${expectedShellQuote(processFile)}`,
+				),
+			);
+			assert.deepEqual(await running.processIdentityCapture, identity);
+			assert.deepEqual(running.processIdentity, identity);
+			assert.deepEqual(captures, [
+				{
+					surface: "root-pane-1",
+					file: processFile,
+					id: running.id,
+					sessionFile: running.sessionFile,
+				},
+			]);
 		});
 	});
 
@@ -1277,6 +1315,13 @@ describe("Pi launch", () => {
 
 			const running = await launchPiSubagent(worktreeRequest, operations);
 
+			// Without a capture operation the identity is never guessed.
+			assert.equal(running.processIdentity, undefined);
+			assert.equal(running.processIdentityCapture, undefined);
+			assert.equal(
+				running.processIdentityError,
+				"process identity capture is unavailable",
+			);
 			assert.equal(running.worktree?.baseSha, linkedSha);
 			assert.equal(running.worktree?.path, worktreePath);
 			assert.equal(

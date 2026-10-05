@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -13,10 +13,7 @@ import type {
 	AgentState,
 	CompletionEvidence,
 } from "../../core/types.ts";
-import type {
-	SurfaceProcessInfo,
-	SurfaceProvider,
-} from "../../core/surface-provider.ts";
+import type { SurfaceProvider } from "../../core/surface-provider.ts";
 import { readSubagentActivityFile } from "./activity-file.ts";
 import {
 	markCompletionDetected,
@@ -37,7 +34,14 @@ import {
 import type { FileWakeRegistry } from "../../core/wake.ts";
 import type { SupervisionCoordinator } from "../../core/supervision.ts";
 import {
-	isExpectedPiProcess,
+	judgeProcessIdentity,
+	linuxProcessProbe,
+	terminateProcessIdentity,
+	type PiProcessIdentity,
+	type ProcessIdentityProbe,
+	type ProcessIdentityState,
+} from "./process-identity.ts";
+import {
 	launchOperationsFromSurface,
 	launchPiSubagent,
 	type FreshPiLaunchRequest,
@@ -89,10 +93,8 @@ export interface PiHarnessAdapterOptions {
 	/** Optional launch-operation injection, keeping the real Pi protocol in unit tests. */
 	operations?: PiLaunchOperations;
 	worktreeOperations?: WorktreeOperations;
-	/** Signals one Herdr-identified owned Pi process; injected by tests. */
-	terminateProcess?(pid: number, sessionFile: string): void;
-	/** Host process-table evidence for a retained worktree child's exit; injected by tests. */
-	localProcesses?: LocalProcessProbe;
+	/** Kernel process facts for a retained worktree child's identity; tests inject it. */
+	processProbe?: ProcessIdentityProbe;
 	/** Bound for confirming a retained worktree child's exit. Default: 5000ms. */
 	killTimeoutMs?: number;
 	/** Explicit local evidence/lifecycle bridge. The host still owns delivery and deduplication. */
@@ -107,24 +109,6 @@ export interface PiHarnessAdapterOptions {
 			| "interrupt",
 	): void;
 }
-/**
- * This host's process table, seen from the parent. Herdr enumerates only a
- * pane's foreground processes, so a suspended or backgrounded Pi is invisible
- * there; exit is proven only when no local process still carries the child's
- * exact `--session` argv. `shellVisible` shows the pane's shell is in this PID
- * namespace, so an empty owned list is evidence rather than a blind spot.
- * Throws when the process table cannot be read.
- */
-export interface LocalProcessView {
-	/** Local PIDs whose argv carries the child's exact `--session`. */
-	owned: number[];
-	shellVisible: boolean;
-}
-export type LocalProcessProbe = (
-	sessionFile: string,
-	shellPid: number,
-) => LocalProcessView;
-
 interface CompletionWait {
 	controller: AbortController;
 	promise: Promise<CompletionEvidence>;
@@ -383,7 +367,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
 		const child = this.getRunningChild(handle);
 		// A worktree root pane is the retained review workspace (Herdr refuses to
 		// close it): stop only the owned Pi process and keep pane and checkout.
-		if (child.worktree) return this.stopRetainedPi(child, child.worktree.path);
+		if (child.worktree) return this.stopRetainedPi(child);
 		let closeError: unknown;
 		try {
 			await this.options.surface.closeSurface(child.surface);
@@ -398,74 +382,47 @@ export class PiHarnessAdapter implements HarnessAdapter {
 			throw new Error(`${errorText(closeError)}; ${errorText(error)}`);
 		}
 	}
-	private async stopRetainedPi(
-		child: PiRunningChild,
-		cwd: string,
-	): Promise<void> {
-		const owned = (info: SurfaceProcessInfo) =>
-			info.foregroundProcesses.filter((candidate) =>
-				isExpectedPiProcess(candidate, child.sessionFile, cwd),
-			);
-		// Confirmed by Herdr's pane being gone, or by Herdr showing no owned Pi in
-		// the foreground and an idle retained shell AND this host's process table
-		// holding no process with the child's session. Foreground absence alone is
-		// never exit evidence: a suspended or backgrounded Pi is still alive.
-		const stopped = async (): Promise<boolean | string> => {
-			let info: SurfaceProcessInfo;
-			try {
-				info = await this.options.surface.getProcessInfo(child.surface);
-			} catch (error) {
-				const pane = await this.options.surface
-					.inspectSurface(child.surface)
-					.catch(() => undefined);
-				return pane?.kind === "missing" || errorText(error);
-			}
-			if (
-				owned(info).length > 0 ||
-				info.shellPid === undefined ||
-				info.foregroundProcessGroupId !== info.shellPid
-			)
-				return "owned Pi process is still in the pane foreground";
-			let local: LocalProcessView;
-			try {
-				local = (this.options.localProcesses ?? inspectLocalProcesses)(
-					child.sessionFile,
-					info.shellPid,
-				);
-			} catch (error) {
-				return `only foreground absence is known; this host's process table is unreadable: ${errorText(error)}`;
-			}
-			if (!local.shellVisible)
-				return `only foreground absence is known; pane shell ${info.shellPid} is not visible in this host's process table`;
-			if (local.owned.length > 0)
-				return `owned Pi process ${local.owned.join(", ")} is still alive outside the pane foreground (suspended or backgrounded)`;
-			return true;
-		};
-		// Providers may throw synchronously or reject; both mean "unknown".
-		const info = await (async () =>
-			this.options.surface.getProcessInfo(child.surface))().catch(
-			() => undefined,
-		);
-		const targets = info ? owned(info) : [];
-		if (targets.length === 0) {
-			const state = await stopped();
-			if (state === true) return;
-			throw new Error(
-				`Owned Pi process not identified in retained worktree pane ${child.surface}: ${state}`,
-			);
-		}
-		const terminate = this.options.terminateProcess ?? terminateOwnedPiProcess;
-		for (const target of targets) terminate(target.pid, child.sessionFile);
+	/**
+	 * Exit evidence is only the launch-verified identity (PID + start time, on
+	 * this boot and PID namespace) no longer existing, or a gone pane while that
+	 * identity is not affirmatively alive. SIGTERM goes only to that identity,
+	 * re-verified first; without it nothing is signalled and the cancel stays
+	 * unconfirmed. Herdr's foreground list and argv text are never evidence.
+	 */
+	private async stopRetainedPi(child: PiRunningChild): Promise<void> {
+		const probe = this.options.processProbe ?? linuxProcessProbe;
 		const timeoutMs = this.options.killTimeoutMs ?? 5_000;
 		const deadline = Date.now() + timeoutMs;
-		let state: boolean | string;
-		do {
+		const paneGone = async () =>
+			(
+				await (async () => this.options.surface.inspectSurface(child.surface))()
+					// Providers may throw synchronously or reject; both mean "unknown".
+					.catch(() => undefined)
+			)?.kind === "missing";
+		const identity =
+			child.processIdentity ??
+			(await settleBefore(child.processIdentityCapture, deadline));
+		if (!identity) {
+			if (await paneGone()) return;
+			throw new Error(
+				`Owned Pi process identity was not captured for retained worktree pane ${child.surface}; nothing was signalled: ${child.processIdentityError ?? (child.processIdentityCapture ? "identity capture is still pending" : "no identity was recorded at launch")}`,
+			);
+		}
+		let state: ProcessIdentityState = terminateProcessIdentity(identity, probe);
+		const signalled = state.kind === "alive";
+		for (;;) {
+			if (state.kind === "exited") return;
+			// Unknown is never signalled and waiting cannot make it evidence.
+			if (state.kind === "unknown") {
+				if (await paneGone()) return;
+				break;
+			}
+			if (Date.now() >= deadline) break;
 			await new Promise((resolve) => setTimeout(resolve, 50));
-			state = await stopped();
-			if (state === true) return;
-		} while (Date.now() < deadline);
+			state = judgeProcessIdentity(identity, probe);
+		}
 		throw new Error(
-			`Owned Pi process exit unconfirmed after ${timeoutMs}ms in retained worktree pane ${child.surface}: ${state}`,
+			`Owned Pi process exit unconfirmed in retained worktree pane ${child.surface}: ${describeIdentityState(identity, state, signalled, timeoutMs)}`,
 		);
 	}
 	async readOutput(handle: AgentHandle, lines?: number): Promise<string> {
@@ -685,74 +642,31 @@ function errorText(cause: unknown): string {
 	return cause instanceof Error ? cause.message : String(cause);
 }
 
-// Herdr reports the PID; on Linux, signal it only if this host's process table
-// names the same owned session, so a PID namespace mismatch never misfires.
-function terminateOwnedPiProcess(pid: number, sessionFile: string): void {
-	try {
-		if (process.platform === "linux") {
-			const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-			const index = argv.indexOf("--session");
-			if (index < 0 || argv[index + 1] !== sessionFile)
-				throw new Error(
-					`Process ${pid} on this host is not the owned Pi session; not signalled`,
-				);
-		}
-		process.kill(pid, "SIGTERM");
-	} catch (error) {
-		// SAFETY: fs and process.kill failures are Node errors with an optional code.
-		const code = (error as NodeJS.ErrnoException).code;
-		// Already gone: the exit evidence check decides, never this exception.
-		if (code === "ENOENT" || code === "ESRCH") return;
-		throw error;
-	}
+function describeIdentityState(
+	identity: PiProcessIdentity,
+	state: ProcessIdentityState,
+	signalled: boolean,
+	timeoutMs: number,
+): string {
+	if (state.kind === "unknown")
+		return `${state.reason}${signalled ? " after SIGTERM" : "; not signalled"}`;
+	return `process ${identity.pid} (start time ${identity.startTime}) is still ${state.kind} ${timeoutMs}ms after SIGTERM`;
 }
 
-function ownsSession(argv: readonly string[], sessionFile: string): boolean {
-	const index = argv.indexOf("--session");
-	return index >= 0 && argv[index + 1] === sessionFile;
-}
-
-// Linux reads exact NUL-separated argv from /proc; zombies have an empty
-// cmdline and count as exited. Elsewhere `ps` lists space-joined commands.
-export function inspectLocalProcesses(
-	sessionFile: string,
-	shellPid: number,
-): LocalProcessView {
-	if (process.platform === "linux") {
-		const owned: number[] = [];
-		for (const name of readdirSync("/proc")) {
-			if (!/^\d+$/.test(name)) continue;
-			let argv: string[];
-			try {
-				argv = readFileSync(`/proc/${name}/cmdline`, "utf8").split("\0");
-			} catch (error) {
-				// SAFETY: fs failures are Node errors with an optional code.
-				const code = (error as NodeJS.ErrnoException).code;
-				// Exited mid-scan, or another user's process (never the owned child).
-				if (code === "ENOENT" || code === "ESRCH" || code === "EACCES")
-					continue;
-				throw error;
-			}
-			if (ownsSession(argv, sessionFile)) owned.push(Number(name));
-		}
-		return { owned, shellVisible: existsSync(`/proc/${shellPid}`) };
-	}
-	const rows = execFileSync("ps", ["-A", "-o", "pid=", "-o", "command="], {
-		encoding: "utf8",
-		timeout: 5_000,
+/** A pending capture's result if it settles before the deadline; otherwise undefined. */
+async function settleBefore<T>(
+	pending: Promise<T> | undefined,
+	deadline: number,
+): Promise<T | undefined> {
+	if (!pending) return undefined;
+	let expire!: () => void;
+	const expired = new Promise<undefined>((resolve) => {
+		expire = () => resolve(undefined);
 	});
-	const owned: number[] = [];
-	let shellVisible = false;
-	const marker = ` --session ${sessionFile}`;
-	for (const row of rows.split("\n")) {
-		const match = /^\s*(\d+)\s(.*)$/.exec(row);
-		if (!match) continue;
-		const pid = Number(match[1]);
-		if (pid === shellPid) shellVisible = true;
-		const command = match[2]!;
-		const at = command.indexOf(marker);
-		const next = command[at + marker.length];
-		if (at >= 0 && (next === undefined || next === " ")) owned.push(pid);
+	const timer = setTimeout(expire, Math.max(0, deadline - Date.now()));
+	try {
+		return await Promise.race([pending, expired]);
+	} finally {
+		clearTimeout(timer);
 	}
-	return { owned, shellVisible };
 }
