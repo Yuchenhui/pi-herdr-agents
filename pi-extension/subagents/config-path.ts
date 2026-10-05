@@ -9,8 +9,12 @@ export function getAgentConfigDir(): string {
 	return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+export function getSubagentsConfigDir(): string {
+	return join(getAgentConfigDir(), "herdr-agents");
+}
+
 export function getSubagentsConfigPath(): string {
-	return join(getAgentConfigDir(), "herdr-agents", "config.json");
+	return join(getSubagentsConfigDir(), "config.json");
 }
 
 export function getSubagentsConfigExamplePath(): string {

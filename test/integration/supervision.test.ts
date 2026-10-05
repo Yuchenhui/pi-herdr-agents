@@ -20,16 +20,16 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { waitForCompletion } from "../../pi-extension/subagents/completion.ts";
+import { waitForCompletion } from "../../maestro/adapters/pi/completion.ts";
 import {
 	POLLING_INTERVAL_MS,
 	RECONCILE_INTERVAL_MS,
 	SupervisionCoordinator,
-} from "../../pi-extension/subagents/supervision.ts";
+} from "../../maestro/core/supervision.ts";
 import {
 	appendPersistentTaskEvent,
 	readPersistentTaskEvents,
-} from "../../pi-extension/subagents/session.ts";
+} from "../../maestro/adapters/pi/session.ts";
 
 const RECONCILE_BUDGET_MS = RECONCILE_INTERVAL_MS + 700;
 

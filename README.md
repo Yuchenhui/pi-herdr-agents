@@ -1095,6 +1095,36 @@ Every sub-agent session displays a compact one-line tools widget summarizing ava
 
 ## Development
 
+### Code map
+
+The maestro seams remain inside one npm package with the same Pi extension
+entry point. Pi is the sole real harness and Herdr the sole real surface
+provider; fakes are for conformance tests only.
+
+- `pi-extension/subagents/index.ts` — Pi composition root: tools/commands,
+  role-pack event bridge, host policy, widgets, and parent delivery.
+- `pi-extension/subagents/model-registry.ts`, `config-path.ts` — permanent
+  host-local SDK capability glue and configuration-path conventions.
+- `maestro/core/` — seam interfaces/types, activity and lifecycle projection,
+  status, routing, wake-ups, and supervision.
+- `maestro/core/roles/discovery.ts`, `maestro/core/config/` — role discovery,
+  config loaders with injected directories, and task-model init prompt logic.
+- `maestro/core/worktree.ts`, `maestro/core/worktree-cleanup.ts` — manifest
+  schema/state, handoff types, and cleanup eligibility/formatting.
+- `maestro/adapters/pi/` — Pi launch, completion, session I/O, activity files,
+  model SDK glue, and registry projection behind `PiHarnessAdapter`;
+  `child/subagent-done.ts` implements the child protocol.
+- `maestro/surfaces/herdr/` — `HerdrSurfaceProvider`, Herdr CLI driver, and
+  terminal scripts/placement.
+- `maestro/runtime/` — run ownership, controls/retries, observation,
+  delivery-gated cleanup, Pi composition, worktree operations/handoff, and
+  task-model init composition.
+- `maestro/adapters/fake/`, `maestro/surfaces/fake/`, `test/maestro/` —
+  conformance fakes, seam tests, and the import dependency-rule test.
+
+See [ADR-0012](docs/adr/0012-adopt-maestro-seams-in-repo.md), the
+[glossary](CONTEXT.md), and the [documentation map](docs/README.md).
+
 Run local checks:
 
 ```bash

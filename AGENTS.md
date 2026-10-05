@@ -21,15 +21,18 @@ Bundled role prompts live in [`agents/`](agents/). The native `/skill:orchestrat
 
 ## Code map
 
-- `pi-extension/subagents/index.ts` — public tools/commands, agent discovery, launch/watch lifecycle, completion delivery, worktree manifests and handoffs
-- `pi-extension/subagents/herdr.ts` — Herdr CLI calls, response parsing, and ID-based Agents tab placement and capacity
-- `pi-extension/subagents/terminal.ts` — terminal adapter used by the lifecycle
-- `pi-extension/subagents/lifecycle.ts`, `status.ts`, `activity.ts` — process/turn state and widget projection
-- `pi-extension/subagents/wake.ts`, `supervision.ts`, `supervision-config.ts` — file wake-ups, shared pane reconciliation, polling fallback, and supervision configuration
-- `pi-extension/subagents/persistent-config.ts` — strict persistent-specialist cap configuration
-- `pi-extension/subagents/completion.ts`, `session.ts`, `subagent-done.ts` — child completion, transcript handling, `caller_ping`, and `subagent_done`
+- `pi-extension/subagents/index.ts` — Pi composition root: public tools/commands, role-pack event bridge, host policy, widgets, and parent delivery
+- `pi-extension/subagents/model-registry.ts`, `config-path.ts` — permanent host-local SDK capability glue and configuration-path conventions
+- `maestro/core/` — seam interfaces and types; activity/lifecycle/status projection, routing, wake-ups, and supervision
+- `maestro/core/roles/discovery.ts`, `maestro/core/config/` — role parsing/discovery, injected-directory config loaders, and task-model init prompt construction
+- `maestro/core/worktree.ts`, `worktree-cleanup.ts` — manifest schema/state, handoff types, and cleanup eligibility/formatting
+- `maestro/adapters/pi/` — `PiHarnessAdapter`, launch transactions, completion evidence, session I/O, activity files, SDK model glue, and task-model registry projection
+- `maestro/adapters/pi/child/subagent-done.ts` — child protocol: `caller_ping`, `subagent_done`, and activity recording
+- `maestro/surfaces/herdr/` — `HerdrSurfaceProvider`, Herdr CLI driver, and terminal scripts/placement
+- `maestro/runtime/` — `RunSession`, Pi composition, run ownership, controls/retries, observation, delivery-gated cleanup, worktree operations/handoff, and task-model init composition
+- `maestro/adapters/fake/`, `maestro/surfaces/fake/`, `test/maestro/` — conformance fakes, seam tests, and the dependency-rule test
 - `CONTEXT.md` — orchestration-domain glossary
-- `docs/adr/` — hard-to-reverse architectural decisions
+- `docs/adr/` — hard-to-reverse architectural decisions; [ADR-0012](docs/adr/0012-adopt-maestro-seams-in-repo.md) records the maestro seams decision
 - `docs/research/` — evidence and alternatives, never the shipped contract
 - `test/test.ts` — unit tests for public subagent extension seams
 - `test/package-skill.test.js` — bundled skill and package manifest contract test

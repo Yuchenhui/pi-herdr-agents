@@ -14,7 +14,6 @@ import {
 	waitForPaneReady,
 	startPi,
 	waitForFile,
-	waitForScreen,
 	uniqueId,
 	trackTempFile,
 	PI_TIMEOUT,
@@ -23,6 +22,7 @@ import {
 	type TestEnv,
 } from "./harness.ts";
 import { resetProviderRequests } from "./fake-provider.ts";
+import { isString } from "../../maestro/core/config/type-guards.ts";
 
 function workspacePanes(workspaceId: string): string[] {
 	const result = JSON.parse(
@@ -44,7 +44,12 @@ type SessionEntry = {
 		status?: string;
 		facts?: { sessionFile?: string };
 	};
-	message?: { role?: string; content?: unknown };
+	message?: {
+		role?: string;
+		content?: unknown;
+		stopReason?: string;
+		errorMessage?: string;
+	};
 };
 
 function readEntries(path: string): SessionEntry[] {
@@ -283,11 +288,43 @@ for (const backend of backends) {
 					.join("\n"),
 				new RegExp(`Persistent-${id}`),
 			);
-			await waitForScreen(
-				parent,
-				new RegExp(`PERSISTENT_LIFECYCLE_COMPLETE_${id}`),
-				PI_TIMEOUT,
-			);
+			// Verify executed output after confirmed stop, independent of pane wrapping.
+			await waitForEntries(parentSession, (entries) => {
+				const stops = entries
+					.map((entry, index) => ({ entry, index }))
+					.filter(
+						({ entry }) =>
+							entry.type === "custom_message" &&
+							entry.customType === "subagent_stop",
+					);
+				if (stops.length !== 1) return false;
+				const { entry: stop, index } = stops[0];
+				if (
+					stop.details?.status !== "stopped" ||
+					stop.details?.facts?.sessionFile !== sessionFile
+				)
+					return false;
+				const marker = `PERSISTENT_LIFECYCLE_COMPLETE_${id}`;
+				return entries.slice(index + 1).some((entry) => {
+					const message = entry.message;
+					if (
+						entry.type !== "message" ||
+						message?.role !== "assistant" ||
+						message.stopReason !== "stop" ||
+						message.errorMessage !== undefined
+					)
+						return false;
+					if (isString(message.content)) return message.content === marker;
+					if (
+						!Array.isArray(message.content) ||
+						!message.content.every(
+							(part) => part?.type === "text" && isString(part.text),
+						)
+					)
+						return false;
+					return message.content.map((part) => part.text).join("") === marker;
+				});
+			});
 		});
 	});
 }

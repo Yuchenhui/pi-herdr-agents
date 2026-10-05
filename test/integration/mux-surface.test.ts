@@ -33,12 +33,13 @@ import {
 	waitForFile,
 	waitForScreen,
 	shellQuote,
+	PI_TIMEOUT,
 	type TestEnv,
 } from "./harness.ts";
 import {
 	createSubagentPaneFactory,
 	parsePaneConfig,
-} from "../../pi-extension/subagents/pane-config.ts";
+} from "../../maestro/core/config/pane-config.ts";
 
 const backends = getAvailableBackends();
 
@@ -47,8 +48,13 @@ if (backends.length === 0) {
 	console.log("   Run inside herdr to enable these tests.");
 }
 
+const MUX_TEST_COUNT = 10;
+const MUX_SUITE_TIMEOUT = MUX_TEST_COUNT * 30_000;
+
 for (const backend of backends) {
-	describe(`herdr terminal [${backend}]`, { timeout: 60_000 }, () => {
+	describe(`herdr terminal [${backend}]`, {
+		timeout: Math.max(PI_TIMEOUT, MUX_SUITE_TIMEOUT),
+	}, () => {
 		let prevMux: string | undefined;
 		let env: TestEnv;
 
@@ -332,13 +338,19 @@ for (const backend of backends) {
 
 			const marker = uniqueId();
 			const filePath = `/tmp/pi-mux-test-${marker}.txt`;
+			trackTempFile(env, filePath);
 
-			runInPane(
+			runScriptInPane(
 				surface,
-				`echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`,
+				`echo "FILE_${marker}" > ${shellQuote(filePath)} && echo "WRITTEN_${marker}"`,
 			);
 
-			await waitForScreen(surface, new RegExp(`WRITTEN_${marker}`), 10_000, 50);
+			await waitForScreen(
+				surface,
+				new RegExp(`^WRITTEN_${marker}$`, "m"),
+				10_000,
+				50,
+			);
 			const content = await waitForFile(
 				filePath,
 				10_000,

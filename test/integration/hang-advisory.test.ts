@@ -5,11 +5,12 @@ import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as subagentsModule from "../../pi-extension/subagents/index.ts";
+import { inspectNoProgressSessionTail } from "../../maestro/adapters/pi/session.ts";
 import {
 	createLifecycle,
 	observePaneInspection,
 	projectLifecycle,
-} from "../../pi-extension/subagents/lifecycle.ts";
+} from "../../maestro/core/lifecycle.ts";
 
 function activeChild(sessionFile: string, interactive = false) {
 	return {
@@ -54,6 +55,7 @@ describe("hang advisory integration", () => {
 				projectLifecycle(child.lifecycle, now),
 				now,
 				1,
+				(record) => inspectNoProgressSessionTail(record.sessionFile),
 			);
 			assert.equal(advisory?.kind, "warning");
 			assert.equal(advisory?.classification, "blocked-tool");
@@ -68,6 +70,7 @@ describe("hang advisory integration", () => {
 					projectLifecycle(child.lifecycle, now + 1_000),
 					now + 1_000,
 					1,
+					(record) => inspectNoProgressSessionTail(record.sessionFile),
 				),
 				undefined,
 			);
@@ -79,6 +82,7 @@ describe("hang advisory integration", () => {
 					projectLifecycle(child.lifecycle, now + 2_000),
 					now + 2_000,
 					1,
+					(record) => inspectNoProgressSessionTail(record.sessionFile),
 				)?.kind,
 				"recovered",
 			);
@@ -90,6 +94,7 @@ describe("hang advisory integration", () => {
 				projectLifecycle(interactive.lifecycle, now),
 				now,
 				1,
+				(record) => inspectNoProgressSessionTail(record.sessionFile),
 			);
 			assert.equal(quiet?.kind, "warning");
 			assert.equal(quiet?.notify, false);

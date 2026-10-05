@@ -17,16 +17,26 @@ import { join } from "node:path";
 import {
 	readWorktreeManifest,
 	writeWorktreeManifest,
-} from "../pi-extension/subagents/launch.ts";
-import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
+} from "../maestro/runtime/worktree-operations.ts";
+import { __herdrTest__ } from "../maestro/surfaces/herdr/herdr.ts";
 import {
 	cleanupBlockers,
-	createWorktreeCleanupOperations,
-	__worktreeCleanupTest__,
 	listContainedWorktrees,
 	removeContainedWorktree,
 	formatWorktreeInventory,
-} from "../pi-extension/subagents/worktree-cleanup.ts";
+} from "../maestro/core/worktree-cleanup.ts";
+import {
+	createWorktreeCleanupOperations as buildCleanupOperations,
+	__worktreeCleanupTest__,
+} from "../maestro/runtime/worktree-operations.ts";
+import { HerdrSurfaceProvider } from "../maestro/surfaces/herdr/herdr-surface-provider.ts";
+
+const provider = new HerdrSurfaceProvider({
+	paneConfig: { mode: "tab", direction: "right", maxPerTab: 4 },
+});
+const createWorktreeCleanupOperations = (
+	input: Parameters<typeof buildCleanupOperations>[1],
+) => buildCleanupOperations(provider, input);
 import { cleanupFixture } from "./worktree-cleanup-fixture.ts";
 
 describe("cleanup process visibility policy", () => {
@@ -486,7 +496,7 @@ describe("cleanup operating-system probes", () => {
 				manifestDir: join(dir, "manifests"),
 				liveHolders: () => [],
 			});
-			ops.listHerdr = () => __herdrTest__.parseHerdrWorktreeList(payload);
+			ops.listWorktrees = () => __herdrTest__.parseHerdrWorktreeList(payload);
 			// Process-inspection policy is tested separately; this regression isolates Git/Herdr identity.
 			ops.holders = async () => ({ blockers: [], warnings: [] });
 			const rows = await listContainedWorktrees({
@@ -530,7 +540,7 @@ describe("cleanup operating-system probes", () => {
 				});
 				ops.resolveSource = () => dir;
 				ops.inspectGit = () => ({ ...cleanupFixture().state });
-				ops.listHerdr = () => [];
+				ops.listWorktrees = () => [];
 				ops.holders = async () => ({ blockers: [], warnings: [] });
 				const manifests = [
 					{
@@ -631,7 +641,7 @@ describe("cleanup operating-system probes", () => {
 			assert.equal(result.status, "blocked");
 			assert.match(result.message, /ETIMEDOUT/);
 			assert.deepEqual(f.calls, []);
-			assert.throws(() => ops.listHerdr("/repo"), /ETIMEDOUT/);
+			await assert.rejects(async () => ops.listWorktrees("/repo"), /ETIMEDOUT/);
 			assert.throws(() => ops.removeWorkspace("fixture"), /ETIMEDOUT/);
 			assert.deepEqual(calls, ["git", "herdr", "herdr"]);
 		} finally {
@@ -717,7 +727,7 @@ describe("cleanup operating-system probes", () => {
 			});
 			ops.resolveSource = () => join(dir, "home");
 			ops.inspectGit = () => ({ ...cleanupFixture().state });
-			ops.listHerdr = () => [];
+			ops.listWorktrees = () => [];
 			ops.holders = async () => ({ blockers: [], warnings: [] });
 			const [row] = await listContainedWorktrees({
 				cwd: join(dir, "home"),
@@ -889,7 +899,7 @@ describe("explicit worktree cleanup", () => {
 	});
 	for (const probe of [
 		"inspectGit",
-		"listHerdr",
+		"listWorktrees",
 		"holders",
 		"resolveSource",
 		"realpath",
@@ -953,7 +963,7 @@ describe("explicit worktree cleanup", () => {
 		it(`blocks ${source} identity disagreements`, async () => {
 			const f = cleanupFixture();
 			if (source === "Herdr")
-				f.operations.listHerdr = () => [
+				f.operations.listWorktrees = () => [
 					{
 						path: "/managed/repo/task",
 						branch: "other",
@@ -990,7 +1000,7 @@ describe("explicit worktree cleanup", () => {
 	});
 	it("uses Herdr for an open workspace and merges the reachable manifest", async () => {
 		const f = cleanupFixture();
-		f.operations.listHerdr = () => [
+		f.operations.listWorktrees = () => [
 			{
 				path: "/managed/repo/task",
 				branch: "task",
@@ -1038,7 +1048,7 @@ describe("explicit worktree cleanup", () => {
 				throw new Error("refused");
 			};
 			if (kind === "herdr") {
-				f.operations.listHerdr = () => [
+				f.operations.listWorktrees = () => [
 					{
 						path: "/managed/repo/task",
 						branch: "task",
