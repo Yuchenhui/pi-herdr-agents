@@ -81,11 +81,19 @@ kernel producer, adapter, and finalization. It is not a second engine.
      its PID to be recycled within that window. There is no SIGKILL.
    - *Confirm.* Confirmed only when that identity no longer exists (PID
      absent, or a zombie), or when the pane is gone while the identity is not
-     affirmatively alive. A live identity (including a suspended Pi with
+     known alive; an identity captured during that pane check is judged
+     before confirming. A live identity (including a suspended Pi with
      SIGTERM pending) stays unconfirmed. An identity not captured (no record,
      capture still pending at the kill deadline, a non-Linux host, a handoff
      or resumed child), unreadable, from another boot or PID namespace, or
-     whose PID now has another start time is unconfirmed and not signalled.
+     whose PID now has another start time is not signalled and is
+     unconfirmed unless pane absence confirms termination.
+   - *Bound.* Every provider await (Herdr process info during capture, pane
+     inspection during cancel) is bounded by the remaining capture or kill
+     deadline, so `unconfirmed` is reported on time; a late answer is
+     dropped and never flips a reported outcome. A cancel after the launch
+     capture expired starts one fresh capture bounded by that cancel's own
+     deadline, so a retry can pick up a sidecar written late.
 
    The manifest records `cancelled` only for
    confirmed termination, and the handoff is captured as for any completion.

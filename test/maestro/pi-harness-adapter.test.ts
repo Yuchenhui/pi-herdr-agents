@@ -998,6 +998,163 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 				/nothing was signalled: not recorded/,
 			);
 		}));
+	for (const settles of [true, false])
+		it(`an identity captured during the absence check is judged and signalled, never confirmed by absence (capture ${settles ? "settles" : "wait expires"})`, async () =>
+			usingFixture(async (f) => {
+				const { probe, signals } = fakeProbe(
+					new Map([[20, alive()]]),
+					() => {},
+				);
+				let resolveCapture!: (value: PiProcessIdentity) => void;
+				const w = await worktreeChild(f, {
+					probe,
+					capture: new Promise((resolve) => {
+						resolveCapture = resolve;
+					}),
+				});
+				f.surface.inspectSurface = async () => {
+					w.child.processIdentity = identity();
+					if (settles) resolveCapture(identity());
+					await new Promise((resolve) => setTimeout(resolve, 1));
+					return { kind: "missing" };
+				};
+				await assert.rejects(w.adapter.kill(w.h), /is still alive/);
+				assert.deepEqual(signals, [20]);
+			}));
+	it("an unreadable identity known alive again after the pane check is signalled, not confirmed", async () =>
+		usingFixture(async (f) => {
+			const table = new Map<number, Entry>([[20, "EACCES"]]);
+			const { probe, signals } = fakeProbe(table, () => {});
+			const w = await worktreeChild(f, { probe, identity: identity() });
+			f.surface.inspectSurface = async () => {
+				table.set(20, alive());
+				return { kind: "missing" };
+			};
+			await assert.rejects(w.adapter.kill(w.h), /is still alive/);
+			assert.deepEqual(signals, [20], "signalled once, after re-verification");
+		}));
+	it("negative control: an identity captured during the absence check that already exited confirms", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map());
+			const w = await worktreeChild(f, {
+				probe,
+				capture: new Promise(() => {}),
+			});
+			f.surface.inspectSurface = async () => {
+				w.child.processIdentity = identity();
+				return { kind: "missing" };
+			};
+			await w.adapter.kill(w.h);
+			assert.deepEqual(signals, []);
+		}));
+	for (const [label, options, pattern] of [
+		[
+			"no identity",
+			{ captureError: "not recorded" },
+			/nothing was signalled: not recorded/,
+		],
+		[
+			"an unreadable identity",
+			{ identity: identity() },
+			/process 20 is unreadable/,
+		],
+	] as const)
+		it(`a stalled pane inspection with ${label} is unconfirmed on time; the late answer changes nothing`, async () =>
+			usingFixture(async (f) => {
+				const { probe, signals } = fakeProbe(
+					new Map<number, Entry>([[20, "EACCES"]]),
+				);
+				const w = await worktreeChild(f, {
+					probe,
+					killTimeoutMs: 40,
+					...options,
+				});
+				const release: Array<() => void> = [];
+				f.surface.inspectSurface = () =>
+					new Promise((resolve) =>
+						release.push(() => resolve({ kind: "missing" })),
+					);
+				const started = Date.now();
+				// A repeated cancel is bounded by the same deadline as the first.
+				const outcomes = await Promise.allSettled([
+					w.adapter.kill(w.h),
+					w.adapter.kill(w.h),
+				]);
+				assert.ok(Date.now() - started < 1_000, "reported on time");
+				for (const outcome of outcomes) {
+					assert.ok(
+						outcome.status === "rejected" && outcome.reason instanceof Error,
+					);
+					assert.match(outcome.reason.message, pattern);
+				}
+				for (const answer of release) answer();
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				assert.deepEqual(signals, []);
+				assert.equal(w.child.processIdentity, options.identity);
+			}));
+	it("a retry after an expired capture recaptures within the cancel's own budget", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+			const w = await worktreeChild(f, {
+				probe,
+				captureError: "Process identity not captured within 15000ms",
+			});
+			w.child.processIdentityFile = join(f.root, "late.process.json");
+			const budgets: Array<number | undefined> = [];
+			f.operations.captureProcessIdentity = async (
+				surface,
+				expected,
+				options,
+			) => {
+				assert.equal(surface, w.child.surface);
+				assert.deepEqual(expected, {
+					file: w.child.processIdentityFile,
+					id: w.child.id,
+					sessionFile: w.child.sessionFile,
+				});
+				budgets.push(options?.timeoutMs);
+				return identity();
+			};
+			await w.adapter.kill(w.h);
+			assert.deepEqual(signals, [20]);
+			assert.equal(budgets.length, 1);
+			assert.ok(budgets[0]! > 0 && budgets[0]! <= 150, `budget ${budgets[0]}`);
+			assert.deepEqual(w.child.processIdentity, identity());
+		}));
+	it("a failed recapture is unconfirmed with its reason and signals nothing", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+			const w = await worktreeChild(f, { probe, captureError: "expired" });
+			w.child.processIdentityFile = join(f.root, "none.process.json");
+			f.operations.captureProcessIdentity = async () => {
+				throw new Error("still no record");
+			};
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/nothing was signalled: still no record/,
+			);
+			assert.deepEqual(signals, []);
+		}));
+	it("negative control: a capture still pending is awaited, not restarted", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]));
+			const w = await worktreeChild(f, {
+				probe,
+				capture: new Promise(() => {}),
+			});
+			w.child.processIdentityFile = join(f.root, "pending.process.json");
+			let calls = 0;
+			f.operations.captureProcessIdentity = async () => {
+				calls++;
+				return identity();
+			};
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/identity capture is still pending/,
+			);
+			assert.equal(calls, 0);
+			assert.deepEqual(signals, []);
+		}));
 });
 
 describe("PiHarnessAdapter retained worktree kill with real processes", () => {

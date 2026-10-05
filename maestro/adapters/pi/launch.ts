@@ -175,6 +175,7 @@ export interface PiLaunchOperations {
 	captureProcessIdentity?(
 		surface: string,
 		expected: ProcessIdentityExpectation,
+		options?: { timeoutMs?: number },
 	): Promise<PiProcessIdentity>;
 }
 
@@ -272,7 +273,14 @@ export async function captureSurfacePiProcessIdentity(
 		try {
 			const record = readProcessIdentityRecord(expected.file);
 			if (record) {
-				const info = await Promise.resolve(provider.getProcessInfo(surface));
+				// The deadline bounds Herdr too; a late answer is dropped, never accepted.
+				const info = await settleBefore(
+					Promise.resolve().then(() => provider.getProcessInfo(surface)),
+					deadline,
+					{ unref: true },
+				);
+				if (!info)
+					throw new Error(`Herdr process info for pane ${surface} timed out`);
 				if (info.shellPid === undefined)
 					throw new Error(`Herdr reports no shell for pane ${surface}`);
 				return verifyProcessIdentityRecord(
@@ -284,13 +292,39 @@ export async function captureSurfacePiProcessIdentity(
 		} catch (error) {
 			lastError = errorMessage(error);
 		}
-		if (Date.now() >= deadline) break;
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) break;
 		// Background capture must never hold the parent process open.
-		await new Promise((resolve) => setTimeout(resolve, intervalMs).unref());
+		await new Promise((resolve) =>
+			setTimeout(resolve, Math.min(intervalMs, remaining)).unref(),
+		);
 	}
 	throw new Error(
 		`Process identity not captured within ${timeoutMs}ms: ${lastError}`,
 	);
+}
+
+/**
+ * The pending value if it settles before the deadline; otherwise undefined.
+ * A value that arrives after the deadline is dropped, never reported.
+ */
+export async function settleBefore<T>(
+	pending: Promise<T> | undefined,
+	deadline: number,
+	options: { unref?: boolean } = {},
+): Promise<T | undefined> {
+	if (!pending) return undefined;
+	let expire!: () => void;
+	const expired = new Promise<undefined>((resolve) => {
+		expire = () => resolve(undefined);
+	});
+	const timer = setTimeout(expire, Math.max(0, deadline - Date.now()));
+	if (options.unref) timer.unref();
+	try {
+		return await Promise.race([pending, expired]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 export function launchOperationsFromSurface(
@@ -328,8 +362,13 @@ export function launchOperationsFromSurface(
 		focusWorkspace(workspaceId) {
 			return provider.focusWorkspace(workspaceId);
 		},
-		captureProcessIdentity(surface, expected) {
-			return captureSurfacePiProcessIdentity(provider, surface, expected);
+		captureProcessIdentity(surface, expected, options) {
+			return captureSurfacePiProcessIdentity(
+				provider,
+				surface,
+				expected,
+				options,
+			);
 		},
 	};
 }
@@ -905,10 +944,12 @@ function createRunningChild(
 }
 
 // Capture runs beside the launch so readiness never delays the acknowledgement;
-// a cancel awaits it, and without a verified identity nothing is signalled.
-function startProcessIdentityCapture(
+// a cancel awaits it, and without a verified identity nothing is signalled. A
+// cancel after an expired capture starts a fresh one bounded by its own budget.
+export function startProcessIdentityCapture(
 	child: PiRunningChild,
 	operations: PiLaunchOperations,
+	options?: { timeoutMs?: number },
 ): void {
 	const file = child.processIdentityFile;
 	if (!file) return;
@@ -917,13 +958,14 @@ function startProcessIdentityCapture(
 		child.processIdentityError = "process identity capture is unavailable";
 		return;
 	}
+	child.processIdentityError = undefined;
 	child.processIdentityCapture = Promise.resolve()
 		.then(() =>
-			capture(child.surface, {
-				file,
-				id: child.id,
-				sessionFile: child.sessionFile,
-			}),
+			capture(
+				child.surface,
+				{ file, id: child.id, sessionFile: child.sessionFile },
+				options,
+			),
 		)
 		.then(
 			(identity) => (child.processIdentity = identity),

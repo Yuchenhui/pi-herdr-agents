@@ -139,10 +139,13 @@ Termination follows ownership:
   or removed. SIGTERM goes only to the child's Pi process identity verified
   at launch (PID and start time, never command-line text); confirmed when
   that identity no longer exists, or when the pane is gone while it is not
-  alive. A live identity (such as a suspended Pi), or one not captured
-  (including on non-Linux hosts), unreadable, or whose PID now names another
-  process, leaves it `unconfirmed`; the last three are never signalled.
-  Cancel itself never closes the retained pane. The manifest
+  known alive. A live identity (such as a suspended Pi) leaves it
+  `unconfirmed`. One not captured (including on non-Linux hosts),
+  unreadable, or whose PID now names another process is never signalled and
+  leaves it `unconfirmed` unless pane absence confirms termination. A retry
+  re-checks, and captures again if launch capture expired; every check stays
+  within the cancel's time bound. Cancel itself never closes the retained
+  pane. The manifest
   records `cancelled` only after confirmation; the normal handoff is
   delivered. No Git cleanup; `worktree_remove` stays separate.
 - **Persistent specialist:** rejected with a pointer to `subagent_stop`.

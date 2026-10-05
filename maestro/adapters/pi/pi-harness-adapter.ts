@@ -44,6 +44,8 @@ import {
 import {
 	launchOperationsFromSurface,
 	launchPiSubagent,
+	settleBefore,
+	startProcessIdentityCapture,
 	type FreshPiLaunchRequest,
 	type PiLaunchOperations,
 	type PiRunningChild,
@@ -385,9 +387,11 @@ export class PiHarnessAdapter implements HarnessAdapter {
 	/**
 	 * Exit evidence is only the launch-verified identity (PID + start time, on
 	 * this boot and PID namespace) no longer existing, or a gone pane while that
-	 * identity is not affirmatively alive. SIGTERM goes only to that identity,
+	 * identity is not known alive. SIGTERM goes only to that identity,
 	 * re-verified first; without it nothing is signalled and the cancel stays
 	 * unconfirmed. Herdr's foreground list and argv text are never evidence.
+	 * Every provider await is bounded by the deadline, and a late answer is
+	 * dropped, so an unconfirmed outcome is reported on time and never flipped.
 	 */
 	private async stopRetainedPi(child: PiRunningChild): Promise<void> {
 		const probe = this.options.processProbe ?? linuxProcessProbe;
@@ -395,30 +399,59 @@ export class PiHarnessAdapter implements HarnessAdapter {
 		const deadline = Date.now() + timeoutMs;
 		const paneGone = async () =>
 			(
-				await (async () => this.options.surface.inspectSurface(child.surface))()
+				await settleBefore(
 					// Providers may throw synchronously or reject; both mean "unknown".
-					.catch(() => undefined)
+					Promise.resolve()
+						.then(() => this.options.surface.inspectSurface(child.surface))
+						.catch(() => undefined),
+					deadline,
+				)
 			)?.kind === "missing";
-		const identity =
-			child.processIdentity ??
-			(await settleBefore(child.processIdentityCapture, deadline));
+		let identity = child.processIdentity;
 		if (!identity) {
-			if (await paneGone()) return;
-			throw new Error(
-				`Owned Pi process identity was not captured for retained worktree pane ${child.surface}; nothing was signalled: ${child.processIdentityError ?? (child.processIdentityCapture ? "identity capture is still pending" : "no identity was recorded at launch")}`,
+			// An expired capture gets one fresh attempt within this cancel's budget.
+			if (child.processIdentityError !== undefined)
+				startProcessIdentityCapture(child, this.operations, {
+					timeoutMs: Math.max(0, deadline - Date.now()),
+				});
+			// Inspect alongside the capture wait so absence evidence is not
+			// starved by it; the identity is re-read after the inspection.
+			const absence = paneGone();
+			const captured = await settleBefore(
+				child.processIdentityCapture,
+				deadline,
 			);
+			const gone = (child.processIdentity ?? captured) ? false : await absence;
+			identity = child.processIdentity ?? captured;
+			if (!identity) {
+				if (gone) return;
+				throw new Error(
+					`Owned Pi process identity was not captured for retained worktree pane ${child.surface}; nothing was signalled: ${child.processIdentityError ?? (child.processIdentityCapture ? "identity capture is still pending" : "no identity was recorded at launch")}`,
+				);
+			}
 		}
 		let state: ProcessIdentityState = terminateProcessIdentity(identity, probe);
-		const signalled = state.kind === "alive";
+		let signalled = state.kind === "alive";
+		let paneSeenGone = false;
 		for (;;) {
 			if (state.kind === "exited") return;
 			// Unknown is never signalled and waiting cannot make it evidence.
 			if (state.kind === "unknown") {
-				if (await paneGone()) return;
-				break;
+				if (!paneSeenGone && !(await paneGone())) break;
+				paneSeenGone = true;
+				// The inspection awaited: confirm only while still not known alive.
+				state = judgeProcessIdentity(identity, probe);
+				if (state.kind === "alive" && !signalled) {
+					state = terminateProcessIdentity(identity, probe);
+					signalled = state.kind === "alive";
+				}
+				if (state.kind !== "alive") return;
 			}
-			if (Date.now() >= deadline) break;
-			await new Promise((resolve) => setTimeout(resolve, 50));
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			await new Promise((resolve) =>
+				setTimeout(resolve, Math.min(50, remaining)),
+			);
 			state = judgeProcessIdentity(identity, probe);
 		}
 		throw new Error(
@@ -651,22 +684,4 @@ function describeIdentityState(
 	if (state.kind === "unknown")
 		return `${state.reason}${signalled ? " after SIGTERM" : "; not signalled"}`;
 	return `process ${identity.pid} (start time ${identity.startTime}) is still ${state.kind} ${timeoutMs}ms after SIGTERM`;
-}
-
-/** A pending capture's result if it settles before the deadline; otherwise undefined. */
-async function settleBefore<T>(
-	pending: Promise<T> | undefined,
-	deadline: number,
-): Promise<T | undefined> {
-	if (!pending) return undefined;
-	let expire!: () => void;
-	const expired = new Promise<undefined>((resolve) => {
-		expire = () => resolve(undefined);
-	});
-	const timer = setTimeout(expire, Math.max(0, deadline - Date.now()));
-	try {
-		return await Promise.race([pending, expired]);
-	} finally {
-		clearTimeout(timer);
-	}
 }
