@@ -173,7 +173,8 @@ skills, not to this package. See
 ### Roles and role packs
 
 This package is a pack-neutral execution host: it ships no agent roles, no
-`/plan` command, and no planning or review skills. A named launch resolves
+`/plan` command, and no planning or review skills. Its one skill,
+`subagent-lifecycle`, only documents the host's control tools. A named launch resolves
 `agent` from project definitions, global definitions, and roles registered by
 installed role packs, in that precedence order (see below). An empty catalog is
 valid. A bare launch without `agent` always works. An explicitly named role that

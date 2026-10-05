@@ -68,8 +68,9 @@ diagnostic, and launch fails before Herdr creates a pane or worktree. Remove
 _Avoid_: Silent Pi reinterpretation, compatibility adapter
 
 **Pack-neutral host**:
-This package as an execution host that ships no agent roles, planning or review
-workflows, or skills. Role packs and project or global definitions supply every
+This package as an execution host that ships no agent roles and no planning or
+review workflows. Its only skill, `subagent-lifecycle`, documents its own
+control tools. Role packs and project or global definitions supply every
 named role. An empty catalog is valid, and bare launches need no role.
 _Avoid_: Default role set, privileged pack, starter workflow
 

@@ -12,8 +12,9 @@
 
 `pi-herdr-agents` is an execution host. It owns child execution, supervision,
 sessions, persistence, worktrees, model routing, role parsing and discovery, and
-parent delivery. It ships no agent roles, no planning or review workflows, and
-no Pi skills.
+parent delivery. It ships no agent roles and no planning or review workflows.
+The only Pi skill it ships is `subagent-lifecycle`, an operational guide to its
+own control tools; methodology and workflow skills stay in separate packs.
 
 - The seven formerly bundled roles move to separately installed role packs:
   `scout`, `planner`, `worker`, `reviewer`, `adversarial-reviewer`, and
