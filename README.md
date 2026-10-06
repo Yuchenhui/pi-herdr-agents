@@ -66,8 +66,8 @@ Restart or `/reload` Pi after installation. Review package source before install
 
 - Child agents are real Pi processes running with your user account's permissions, inside Herdr panes. Worktrees isolate Git checkouts, not processes or permissions.
 - The extension creates Herdr panes, tabs and managed worktrees only when a launch asks for them. It never pushes, merges, opens pull requests, deletes branches or removes worktrees on its own; cleanup is an explicit parent action ([worktree cleanup](#explicit-worktree-cleanup)).
-- It writes only `$PI_CODING_AGENT_DIR/herdr-agents/config.json` (through `/subagents-init` or the writer tool, never on startup) and per-child session and activity files beside Pi's own session store.
-- To uninstall: `pi remove npm:pi-herdr-agents`, then delete `$PI_CODING_AGENT_DIR/herdr-agents/` if you no longer want the configuration, and remove any retained worktrees you still have (`/worktree list`, then `worktree_remove`).
+- What it writes: `$PI_CODING_AGENT_DIR/herdr-agents/config.json` (only through `/subagents-init` or the writer tool, never on startup); per-launch artifacts under the parent session's `artifacts/<session-id>/` directory beside Pi's session store, which hold the child's full task text and any `systemPrompt` as Markdown files, activity snapshots and worktree manifests; and the child's own Pi session file. A managed worktree that carries its own `.pi/agent` directory receives that child's session inside the checkout. Treat task text as potentially sensitive when you share or inspect those files.
+- To uninstall: first list and remove any retained worktrees while the extension is still loaded (`/worktree list`, then `/worktree remove <target>`), because those commands leave with the package. Then run `pi remove npm:pi-herdr-agents`, and delete `$PI_CODING_AGENT_DIR/herdr-agents/` and the `artifacts/` directories above if you no longer want the configuration and launch records.
 
 ## Quick start
 
@@ -195,6 +195,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences, optionally conditional on `expectedConfigRevision` |
 
 | Skill | Description |
+| ----- | ----------- |
 | `pi-herdr-agents` | Operating guide for this host: launching, supervising, interrupting, cancelling and resuming children, worktrees, persistent specialists, model routing and configuration. Loaded by agents on demand; see `skills/pi-herdr-agents/SKILL.md` |
 
 | Pi child-only tool | Description |
