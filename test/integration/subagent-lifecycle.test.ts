@@ -73,7 +73,6 @@ it("dirty cleanup warning matcher rejects stale inventory", () => {
 	);
 });
 
-/** Poll an observable condition within the per-test timeout. */
 async function waitForObservation(
 	observe: () => boolean | Promise<boolean>,
 	what: string,
@@ -87,7 +86,6 @@ async function waitForObservation(
 	}
 }
 
-/** True once the parent answered the subagent launch result with a final turn. */
 function parentTurnSettledAfterLaunch(sessionFile: string): boolean {
 	if (!existsSync(sessionFile)) return false;
 	const messages = readFileSync(sessionFile, "utf8")

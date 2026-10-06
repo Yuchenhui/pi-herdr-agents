@@ -1950,11 +1950,6 @@ function startWidgetRefresh() {
 	writeGlobalSlot(WIDGET_INTERVAL_KEY, widgetInterval);
 }
 
-/**
- * Normalize each actual attempt against the live parent context. Role files may
- * change between attempts; the validated runtime candidates and the invocation's
- * directories do not.
- */
 function normalizePiAttempt(
 	params: typeof SubagentParams.static,
 	ctx: {

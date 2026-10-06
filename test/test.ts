@@ -1453,8 +1453,6 @@ describe("host adapter migration", () => {
 				const expectedCwd = cwd ? join(f.projectDir, cwd) : f.projectDir;
 				assert.equal(f.handle(first).cwd, expectedCwd);
 
-				// Import first: widget updates during a timer tick between invalidation
-				// and the replacement session_start are outside this regression.
 				const reloaded = await import(
 					`../pi-extension/subagents/index.ts?reload-fallback-${Date.now()}`
 				);

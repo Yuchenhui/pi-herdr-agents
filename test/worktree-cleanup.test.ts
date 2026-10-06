@@ -1283,7 +1283,6 @@ describe("submodule source repositories", () => {
 		gitIn(cwd, ["config", "user.email", "cleanup@example.invalid"]);
 		gitIn(cwd, ["config", "commit.gpgsign", "false"]);
 	};
-	/** A superproject at parent/ whose apps/sub submodule has a managed linked worktree. */
 	const submoduleFixture = (dir: string) => {
 		const origin = join(dir, "origin");
 		initRepository(origin);
@@ -1310,7 +1309,6 @@ describe("submodule source repositories", () => {
 			"--path-format=absolute",
 			"--git-common-dir",
 		]).trim();
-		// Herdr's repository key for a submodule is this Git directory, not a checkout.
 		assert.match(common, /\.git\/modules\/apps\/sub$/);
 		const operations = createWorktreeCleanupOperations({
 			managedRoot: managed,
@@ -1318,7 +1316,6 @@ describe("submodule source repositories", () => {
 			liveHolders: () => [],
 		});
 		operations.listWorktrees = () => [];
-		// Process-inspection policy is tested separately; this isolates Git identity.
 		operations.holders = async () => ({ blockers: [], warnings: [] });
 		return { origin, parent, source, worktree, common, operations };
 	};
