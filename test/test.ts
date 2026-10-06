@@ -653,11 +653,11 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 			},
 		};
 		const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
-		async function launch(params: any, api = mock) {
+		async function launch(params: any, api = mock, context: any = ctx) {
 			const signal = new AbortController();
 			const result = await api.registeredTools
 				.find((t: any) => t.name === "subagent")
-				.execute("call", params, signal.signal, undefined, ctx);
+				.execute("call", params, signal.signal, undefined, context);
 			signal.abort(); // Tool cancellation must not cancel the independent watcher.
 			return runtime.runningSubagents.get(result.details.id);
 		}
@@ -720,6 +720,59 @@ async function withAdapterHost(run: (f: any) => Promise<void>) {
 			Object.assign(runtime, previous);
 		}
 	});
+}
+
+async function until(f: any, predicate: () => boolean, what: string) {
+	const deadline = Date.now() + 8_000;
+	while (!predicate()) {
+		assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+		await f.turn();
+	}
+}
+
+/** Mirrors Pi: a context throws on every read once its session is replaced. */
+function invalidatableContext<
+	T extends {
+		cwd: string;
+		model: object;
+		modelRegistry: object;
+		sessionManager: object;
+	},
+>(ctx: T) {
+	let stale = false;
+	const assertLive = () => {
+		if (stale)
+			throw new Error(
+				"This extension ctx is stale after session replacement or reload.",
+			);
+	};
+	return {
+		ctx: {
+			get hasUI() {
+				assertLive();
+				return false;
+			},
+			get cwd() {
+				assertLive();
+				return ctx.cwd;
+			},
+			get model() {
+				assertLive();
+				return ctx.model;
+			},
+			get modelRegistry() {
+				assertLive();
+				return ctx.modelRegistry;
+			},
+			get sessionManager() {
+				assertLive();
+				return ctx.sessionManager;
+			},
+		},
+		invalidate() {
+			stale = true;
+		},
+	};
 }
 
 describe("host adapter migration", () => {
@@ -1382,6 +1435,139 @@ describe("host adapter migration", () => {
 			assert.equal(f.closed.length, 2);
 			assert.equal(f.registrations(), 2);
 		}));
+	for (const cwd of [undefined, "work"])
+		it(`launches a fallback through the replacement parent after reload in the invocation's ${cwd ? "relative tool cwd" : "parent cwd"}`, async () =>
+			withAdapterHost(async (f) => {
+				mkdirSync(join(f.projectDir, "work"));
+				const invoking = invalidatableContext(f.ctx);
+				const first = await f.launch(
+					{
+						name: "fallback",
+						task: "bounded",
+						model: "fake/first, fake/second",
+						cwd,
+					},
+					f.mock,
+					invoking.ctx,
+				);
+				const expectedCwd = cwd ? join(f.projectDir, cwd) : f.projectDir;
+				assert.equal(f.handle(first).cwd, expectedCwd);
+
+				const reloaded = await import(
+					`../pi-extension/subagents/index.ts?reload-fallback-${Date.now()}`
+				);
+				const elsewhere = join(f.projectDir, "elsewhere");
+				mkdirSync(elsewhere);
+				const sessionDir = join(f.projectDir, "replacement-sessions");
+				mkdirSync(sessionDir);
+				const sessionFile = createSessionFile(sessionDir, [
+					{ type: "session", version: 3, id: "replacement", cwd: elsewhere },
+				]);
+				let registryReads = 0;
+				const live = {
+					cwd: elsewhere,
+					model: { provider: "fake", id: "replacement" },
+					get modelRegistry() {
+						registryReads++;
+						return f.ctx.modelRegistry;
+					},
+					sessionManager: {
+						getSessionFile: () => sessionFile,
+						getSessionId: () => "replacement",
+						getSessionDir: () => sessionDir,
+					},
+					ui: { notify() {}, setWidget() {} },
+				};
+				for (const shutdown of f.mock.eventHandlers.get("session_shutdown") ??
+					[])
+					await shutdown({ reason: "reload" }, {});
+				invoking.invalidate();
+				process.chdir(elsewhere);
+				const replacement = createMockExtensionApi();
+				f.apis.push(replacement);
+				replacement.api.getThinkingLevel = () => "low";
+				reloaded.default(replacement.api, { infrastructure: f.infrastructure });
+				for (const start of replacement.eventHandlers.get("session_start") ??
+					[])
+					await start({ reason: "reload" }, live);
+				const registryReadsBeforeFallback = registryReads;
+
+				await f.finish(first, {
+					type: "error",
+					errorMessage: "first account rejected",
+				});
+				await until(f, () => f.commands.length === 2, "the fallback launch");
+				const second = f.runtime.runningSubagents.get(first.id);
+				assert.notEqual(second.sessionFile, first.sessionFile);
+				assert.ok(registryReads > registryReadsBeforeFallback);
+				assert.ok(
+					second.activityFile.startsWith(
+						join(sessionDir, "artifacts", "replacement"),
+					),
+				);
+				assert.equal(f.handle(second).cwd, expectedCwd);
+				assert.ok(f.commands[1].includes(`cd '${expectedCwd}' && `));
+				assert.deepEqual(second.runtimePlan, {
+					provider: "fake",
+					modelId: "second",
+					model: "fake/second",
+					thinking: "high",
+					modelSource: "request",
+					thinkingSource: "parent",
+					requestedModel: "fake/second",
+				});
+
+				await f.finish(second);
+				assert.equal(f.mock.sentMessages.length, 0);
+				assert.equal(replacement.sentMessages.length, 1);
+				const details = replacement.sentMessages[0].message.details;
+				assert.equal(details.errorMessage, undefined);
+				assert.deepEqual(details.fallbackAttempts, [
+					"fake/first",
+					"fake/second",
+				]);
+				assert.deepEqual(details.fallbackFailures, [
+					{ model: "fake/first", error: "first account rejected" },
+				]);
+				assert.equal(f.closed.length, 2);
+				assert.equal(f.surface.listSurfaces().length, 0);
+				assert.equal(f.runtime.runningSubagents.size, 0);
+			}));
+	it("fails a fallback explicitly without launching when no live parent context exists", async () =>
+		withAdapterHost(async (f) => {
+			const invoking = invalidatableContext(f.ctx);
+			const first = await f.launch(
+				{ name: "fallback", task: "bounded", model: "fake/first, fake/second" },
+				f.mock,
+				invoking.ctx,
+			);
+			invoking.invalidate();
+			f.runtime.latestCtx = undefined;
+			await f.finish(first, {
+				type: "error",
+				errorMessage: "first account rejected",
+			});
+			await until(
+				f,
+				() => f.mock.sentMessages.length > 0,
+				"the failed result delivery",
+			);
+			await f.turn();
+			assert.equal(f.commands.length, 1);
+			assert.equal(f.mock.sentMessages.length, 1);
+			const details = f.mock.sentMessages[0].message.details;
+			assert.deepEqual(details.fallbackAttempts, ["fake/first", "fake/second"]);
+			assert.deepEqual(details.fallbackFailures, [
+				{ model: "fake/first", error: "first account rejected" },
+				{
+					model: "fake/second",
+					error: "No live parent context for the fallback launch",
+				},
+			]);
+			assert.equal(f.closed.length, 1);
+			assert.equal(f.surface.listSurfaces().length, 0);
+			assert.equal(f.runtime.runningSubagents.size, 0);
+		}));
 	for (const accepted of [true, false])
 		it(`ordinary completion ${accepted ? "closes only after accepted delivery" : "retains the pane after rejected delivery"}`, async () =>
 			withAdapterHost(async (f) => {
@@ -1886,13 +2072,6 @@ describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
 		f.mock.sentMessages.filter(
 			(sent: any) => sent.message.customType === "subagent_result",
 		);
-	async function until(f: any, predicate: () => boolean, what: string) {
-		const deadline = Date.now() + 8_000;
-		while (!predicate()) {
-			assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
-			await f.turn();
-		}
-	}
 	async function worktreeHost(f: any) {
 		const git = (cwd: string, ...args: string[]) =>
 			execFileSync(

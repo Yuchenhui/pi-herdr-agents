@@ -80,6 +80,21 @@ export function getProviderRequests(): readonly ProviderRequest[] {
 	return providerRequests;
 }
 
+let providerFailureGate: Promise<void> | undefined;
+
+/** Holds deterministic fallback failures until the returned release runs. */
+export function pauseProviderFailures(): () => void {
+	let release = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	providerFailureGate = gate;
+	return () => {
+		if (providerFailureGate === gate) providerFailureGate = undefined;
+		release();
+	};
+}
+
 export function resetProviderRequests(): void {
 	providerRequests.length = 0;
 	resumeRestrictionStates.clear();
@@ -741,6 +756,7 @@ const server = createServer(async (request, response) => {
 				model: chatRequest.model,
 				status: 503,
 			});
+			await providerFailureGate;
 			response.writeHead(503, { "content-type": "application/json" });
 			response.end(
 				JSON.stringify({

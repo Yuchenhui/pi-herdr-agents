@@ -1950,10 +1950,6 @@ function startWidgetRefresh() {
 	writeGlobalSlot(WIDGET_INTERVAL_KEY, widgetInterval);
 }
 
-/**
- * Normalize each actual attempt against its invocation context. Role files may
- * change between attempts; the validated runtime candidates do not.
- */
 function normalizePiAttempt(
 	params: typeof SubagentParams.static,
 	ctx: {
@@ -1975,6 +1971,7 @@ function normalizePiAttempt(
 	options: {
 		id: string;
 		controlTaskId: string;
+		origin: Pick<PiLaunchSnapshot["parent"], "cwd" | "invocationCwd">;
 	},
 ): PiAttemptSnapshot {
 	const agentDefs = params.agent
@@ -1999,15 +1996,19 @@ function normalizePiAttempt(
 	const taskId = randomUUID();
 	const parentSessionFile = ctx.sessionManager.getSessionFile();
 	if (!parentSessionFile) throw new Error("No session file");
+	const snapshot = launchSnapshot(ctx, parentThinking);
 
 	return {
-		snapshot: launchSnapshot(ctx, parentThinking),
+		snapshot: {
+			...snapshot,
+			parent: { ...snapshot.parent, ...options.origin },
+		},
 		task: {
 			id: options.controlTaskId,
 			name: params.name,
 			prompt: params.task,
 			role: params.agent ?? "",
-			cwd: ctx.cwd,
+			cwd: options.origin.cwd,
 			worktree: params.worktree ?? undefined,
 			session: { mode: resolveEffectiveSessionMode(params, agentDefs) },
 			behavior: {
@@ -2792,20 +2793,24 @@ export default function subagentsExtension(
 				);
 				runtime.latestCtx = ctx;
 				const id = randomUUID();
-				const first = normalizePiAttempt(params, ctx, parentThinking, {
+				const attempt = {
 					id,
 					controlTaskId: id,
-				});
+					origin: { cwd: ctx.cwd, invocationCwd: process.cwd() },
+				};
+				const first = normalizePiAttempt(params, ctx, parentThinking, attempt);
 				const [plan, ...fallbacks] = runtimePlans;
 				if (!plan) throw new Error("No resolved runtime plans");
 				const input: PiLaunchInput = {
 					...first,
 					plans: [plan, ...fallbacks],
-					prepareAttempt: () =>
-						normalizePiAttempt(params, ctx, parentThinking, {
-							id,
-							controlTaskId: id,
-						}),
+					// Fallbacks outlive this tool call; session replacement invalidates ctx.
+					prepareAttempt: () => {
+						const live = runtime.latestCtx;
+						if (!live)
+							throw new Error("No live parent context for the fallback launch");
+						return normalizePiAttempt(params, live, parentThinking, attempt);
+					},
 				};
 				const session = runtime.session!;
 				const handle = await session.spawnPi(input);

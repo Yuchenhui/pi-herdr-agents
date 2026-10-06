@@ -11,7 +11,7 @@ import {
 	unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isRecord, type JsonObject } from "../core/config/type-guards.ts";
 import type { SurfaceProvider } from "../core/surface-provider.ts";
 import type {
@@ -245,7 +245,19 @@ function resolveSource(path: string): string {
 			"--git-common-dir",
 		]).trim(),
 	);
-	const root = realpathSync(dirname(common));
+	// A submodule's common directory lives under the superproject's
+	// .git/modules; only core.worktree, including included config, names its checkout.
+	const configured = git(common, [
+		`--git-dir=${common}`,
+		"config",
+		"--default",
+		"",
+		"--get",
+		"core.worktree",
+	]).trim();
+	const root = realpathSync(
+		configured ? resolve(common, configured) : dirname(common),
+	);
 	if (realpathSync(git(root, ["rev-parse", "--show-toplevel"]).trim()) !== root)
 		throw new Error("Cannot prove source repository root");
 	if (

@@ -1272,3 +1272,183 @@ describe("explicit worktree cleanup", () => {
 		}
 	});
 });
+
+describe("submodule source repositories", () => {
+	const gitIn = (cwd: string, args: string[]) =>
+		execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" });
+	const initRepository = (cwd: string) => {
+		mkdirSync(cwd, { recursive: true });
+		gitIn(cwd, ["init", "-q", "-b", "main"]);
+		gitIn(cwd, ["config", "user.name", "Cleanup test"]);
+		gitIn(cwd, ["config", "user.email", "cleanup@example.invalid"]);
+		gitIn(cwd, ["config", "commit.gpgsign", "false"]);
+	};
+	const submoduleFixture = (dir: string) => {
+		const origin = join(dir, "origin");
+		initRepository(origin);
+		gitIn(origin, ["commit", "--allow-empty", "-qm", "base"]);
+		const parent = join(dir, "parent");
+		initRepository(parent);
+		gitIn(parent, [
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"add",
+			"-q",
+			origin,
+			"apps/sub",
+		]);
+		gitIn(parent, ["commit", "-qm", "add submodule"]);
+		const source = join(parent, "apps", "sub");
+		const managed = join(dir, "managed");
+		const worktree = join(managed, "sub", "task");
+		mkdirSync(join(managed, "sub"), { recursive: true });
+		gitIn(source, ["worktree", "add", "-q", "-b", "task", worktree]);
+		const common = gitIn(worktree, [
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-common-dir",
+		]).trim();
+		assert.match(common, /\.git\/modules\/apps\/sub$/);
+		const operations = createWorktreeCleanupOperations({
+			managedRoot: managed,
+			manifestDir: join(dir, "manifests"),
+			liveHolders: () => [],
+		});
+		operations.listWorktrees = () => [];
+		operations.holders = async () => ({ blockers: [], warnings: [] });
+		return { origin, parent, source, worktree, common, operations };
+	};
+
+	for (const location of ["shared config", "included config"] as const) {
+		it(`resolves, inventories, and removes a submodule worktree orphan with core.worktree in ${location}`, async () => {
+			const dir = fs.realpathSync(mkdtempSync(join(tmpdir(), "cleanup-sub-")));
+			try {
+				const f = submoduleFixture(dir);
+				if (location === "included config") {
+					const shared = join(f.common, "config");
+					const included = join(dir, "included.config");
+					const configured = gitIn(f.source, [
+						"config",
+						"--get",
+						"core.worktree",
+					]).trim();
+					gitIn(dir, [
+						"config",
+						"--file",
+						included,
+						"core.worktree",
+						configured,
+					]);
+					gitIn(dir, ["config", "--file", shared, "--unset", "core.worktree"]);
+					gitIn(dir, ["config", "--file", shared, "include.path", included]);
+					assert.doesNotMatch(readFileSync(shared, "utf8"), /worktree =/);
+				}
+
+				assert.equal(f.operations.resolveSource(f.worktree), f.source);
+				const [row] = await listContainedWorktrees({
+					cwd: f.parent,
+					operations: f.operations,
+				});
+				assert.equal(row.sourceRepo, f.source);
+				assert.equal(row.branch, "task");
+				assert.equal(row.classification, "eligible", row.blockers.join("; "));
+				const [outside] = await listContainedWorktrees({
+					cwd: f.origin,
+					operations: f.operations,
+				});
+				assert.equal(outside.classification, "out-of-scope");
+
+				const result = await removeContainedWorktree({
+					cwd: f.parent,
+					operations: f.operations,
+					target: f.worktree,
+				});
+				assert.equal(result.status, "removed", result.message);
+				assert.equal(fs.existsSync(f.worktree), false);
+				assert.doesNotMatch(
+					gitIn(f.source, ["worktree", "list", "--porcelain"]),
+					/managed\/sub\/task/,
+				);
+				assert.equal(
+					gitIn(f.source, ["branch", "--list", "task"]).trim(),
+					"task",
+				);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it("fails closed when core.worktree names a checkout of another repository", async () => {
+		const dir = fs.realpathSync(mkdtempSync(join(tmpdir(), "cleanup-sub-")));
+		try {
+			const f = submoduleFixture(dir);
+			const other = join(dir, "other");
+			initRepository(other);
+			gitIn(dir, [
+				"config",
+				"--file",
+				join(f.common, "config"),
+				"core.worktree",
+				other,
+			]);
+			assert.throws(
+				() => f.operations.resolveSource(f.worktree),
+				/Source Git directory mismatch/,
+			);
+			const [row] = await listContainedWorktrees({
+				cwd: dir,
+				operations: f.operations,
+			});
+			assert.equal(row.classification, "unknown");
+			assert.match(row.blockers.join(), /Source Git directory mismatch/);
+			const result = await removeContainedWorktree({
+				cwd: dir,
+				operations: f.operations,
+				target: f.worktree,
+			});
+			assert.notEqual(result.status, "removed");
+			assert.equal(fs.existsSync(f.worktree), true);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("still blocks a superproject worktree whose submodules are initialized", async () => {
+		const dir = fs.realpathSync(mkdtempSync(join(tmpdir(), "cleanup-sub-")));
+		try {
+			const f = submoduleFixture(dir);
+			const worktree = join(dir, "managed", "parent", "task");
+			mkdirSync(join(dir, "managed", "parent"));
+			gitIn(f.parent, ["worktree", "add", "-q", "-b", "task", worktree]);
+			gitIn(worktree, [
+				"-c",
+				"protocol.file.allow=always",
+				"submodule",
+				"update",
+				"--init",
+				"-q",
+			]);
+			const row = (
+				await listContainedWorktrees({
+					cwd: f.parent,
+					operations: f.operations,
+				})
+			).find((entry) => entry.path === worktree);
+			assert.ok(row);
+			assert.equal(row.sourceRepo, f.parent);
+			assert.equal(row.classification, "blocked");
+			assert.match(row.blockers.join(), /Initialized submodules/);
+			const result = await removeContainedWorktree({
+				cwd: f.parent,
+				operations: f.operations,
+				target: worktree,
+			});
+			assert.equal(result.status, "blocked");
+			assert.equal(fs.existsSync(worktree), true);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
