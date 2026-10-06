@@ -1,4 +1,16 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	closeSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+	writeSync,
+} from "node:fs";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { isPlainObject, isString } from "./type-guards.ts";
 
@@ -213,20 +225,86 @@ export interface SavedTaskModelConfig {
 	tasks: TaskPreferences;
 	tasksMeta: TaskPreferencesMeta | undefined;
 	missingCategories: TaskCategory[];
+	/** Revision of the exact bytes this call published. */
+	configRevision: string;
 }
 
-/** Atomically replace only models.tasks and models.tasksMeta in the durable user config. */
+/** Revision of an absent config file. */
+export const MISSING_CONFIG_REVISION = "missing";
+const CONFIG_REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+/** `sha256:<lowercase hex>` over the exact file bytes, never normalized JSON. */
+export function computeConfigRevision(bytes: Uint8Array): string {
+	return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+export function isConfigRevision(value: any): value is string {
+	return (
+		value === MISSING_CONFIG_REVISION ||
+		(isString(value) && CONFIG_REVISION_PATTERN.test(value))
+	);
+}
+
+/** Read the exact-byte revision of a config file, or `missing` when absent. */
+export function readConfigRevision(configPath: string): string {
+	const bytes = readBytesIfExists(configPath);
+	return bytes == null ? MISSING_CONFIG_REVISION : computeConfigRevision(bytes);
+}
+
+export type TaskModelConfigWriteErrorCode =
+	| "invalid-revision"
+	| "stale-revision"
+	| "busy";
+
+export class TaskModelConfigWriteError extends Error {
+	readonly code: TaskModelConfigWriteErrorCode;
+	constructor(code: TaskModelConfigWriteErrorCode, message: string) {
+		super(message);
+		this.name = "TaskModelConfigWriteError";
+		this.code = code;
+	}
+}
+
+export interface WriteTaskModelConfigOptions {
+	/**
+	 * Exact-byte revision the caller proposed against. Omitted keeps the
+	 * unconditional write; `missing` requires the file to be absent.
+	 */
+	expectedConfigRevision?: string;
+	fileOperations?: Pick<
+		typeof import("node:fs"),
+		"renameSync" | "writeFileSync"
+	>;
+}
+
+/**
+ * Atomically replace only models.tasks and models.tasksMeta in the durable user config.
+ *
+ * Every call holds an exclusive sibling lock file while it reads one snapshot,
+ * checks the optional revision precondition, and renames a private temporary file
+ * into place. The lock is advisory: it serializes cooperating writers only and
+ * cannot constrain editors or processes that ignore it. Contention and stale locks
+ * fail closed without waiting or breaking another owner's lock.
+ */
 export function writeTaskModelConfig(
 	configPath: string,
 	examplePath: string,
 	tasks: TaskPreferences,
 	tasksMeta: TaskPreferencesMeta,
 	isAuthenticatedCandidate: (candidate: string) => boolean,
-	fileOperations: Pick<
-		typeof import("node:fs"),
-		"renameSync" | "writeFileSync"
-	> = { renameSync, writeFileSync },
+	options: WriteTaskModelConfigOptions = {},
 ): SavedTaskModelConfig {
+	const expected = options.expectedConfigRevision;
+	if (expected !== undefined && !isConfigRevision(expected)) {
+		throw new TaskModelConfigWriteError(
+			"invalid-revision",
+			`Invalid expectedConfigRevision: use "sha256:" followed by 64 lowercase hex digits of the exact config bytes, or "${MISSING_CONFIG_REVISION}" when the config file is absent. Omit it only for an unconditional write.`,
+		);
+	}
+	const fileOperations = options.fileOperations ?? {
+		renameSync,
+		writeFileSync,
+	};
 	const candidateConfig = parseModelConfig(
 		{ models: { tasks, tasksMeta } },
 		configPath,
@@ -241,44 +319,152 @@ export function writeTaskModelConfig(
 		}
 	}
 	mkdirSync(dirname(configPath), { recursive: true });
-	const current = readFileIfExists(configPath);
-	const source = current ?? readFileSync(examplePath, "utf8");
-	let parsed: any;
-	try {
-		parsed = JSON.parse(source);
-	} catch (error) {
-		const path = current == null ? examplePath : configPath;
-		throw new Error(
-			`Invalid JSON in subagent config ${path}: ${error instanceof Error ? error.message : String(error)}`,
+	return withConfigWriteLock(configPath, () => {
+		const currentBytes = readBytesIfExists(configPath);
+		if (expected !== undefined) {
+			const actual =
+				currentBytes == null
+					? MISSING_CONFIG_REVISION
+					: computeConfigRevision(currentBytes);
+			if (actual !== expected) {
+				let state = "the config file bytes changed since the proposal was read";
+				if (expected === MISSING_CONFIG_REVISION)
+					state = "the proposal expected no config file, but one now exists";
+				else if (currentBytes == null)
+					state =
+						"the proposal expected an existing config file, but it is now missing";
+				throw new TaskModelConfigWriteError(
+					"stale-revision",
+					`Stale task model config revision for ${configPath}: ${state}. Configuration was not replaced. Re-read the config, prepare a fresh proposal, and obtain fresh approval before writing.`,
+				);
+			}
+		}
+		const current = currentBytes?.toString("utf8");
+		const source = current ?? readFileSync(examplePath, "utf8");
+		let parsed: any;
+		try {
+			parsed = JSON.parse(source);
+		} catch (error) {
+			const path = current == null ? examplePath : configPath;
+			throw new Error(
+				`Invalid JSON in subagent config ${path}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		if (!isPlainObject(parsed))
+			throw new Error(
+				`Invalid JSON in subagent config ${configPath}: root must be an object`,
+			);
+		const models = isPlainObject(parsed.models) ? { ...parsed.models } : {};
+		models.tasks = candidateConfig.tasks;
+		models.tasksMeta = candidateConfig.tasksMeta;
+		const output = JSON.stringify({ ...parsed, models }, null, 2) + "\n";
+		const temporary = join(
+			dirname(configPath),
+			`.${Date.now()}-${process.pid}-${randomUUID()}-config.tmp`,
 		);
-	}
-	if (!isPlainObject(parsed))
-		throw new Error(
-			`Invalid JSON in subagent config ${configPath}: root must be an object`,
-		);
-	const models = isPlainObject(parsed.models) ? { ...parsed.models } : {};
-	models.tasks = candidateConfig.tasks;
-	models.tasksMeta = candidateConfig.tasksMeta;
-	const output = JSON.stringify({ ...parsed, models }, null, 2) + "\n";
-	const temporary = join(
-		dirname(configPath),
-		`.${Date.now()}-${process.pid}-config.tmp`,
-	);
-	fileOperations.writeFileSync(temporary, output, { flag: "wx" });
-	fileOperations.renameSync(temporary, configPath);
-	return {
-		configPath,
-		tasks: candidateConfig.tasks ?? {},
-		tasksMeta: candidateConfig.tasksMeta,
-		missingCategories: TASK_CATEGORIES.filter(
-			(category) => !candidateConfig.tasks?.[category],
-		),
-	};
+		let published = false;
+		try {
+			fileOperations.writeFileSync(temporary, output, { flag: "wx" });
+			fileOperations.renameSync(temporary, configPath);
+			published = true;
+		} finally {
+			if (!published) rmSync(temporary, { force: true });
+		}
+		return {
+			configPath,
+			tasks: candidateConfig.tasks ?? {},
+			tasksMeta: candidateConfig.tasksMeta,
+			missingCategories: TASK_CATEGORIES.filter(
+				(category) => !candidateConfig.tasks?.[category],
+			),
+			configRevision: computeConfigRevision(Buffer.from(output, "utf8")),
+		};
+	});
 }
 
-function readFileIfExists(path: string): string | undefined {
+/** Sibling advisory lock path shared by every cooperating config writer. */
+export function getConfigWriteLockPath(configPath: string): string {
+	return `${configPath}.lock`;
+}
+
+function withConfigWriteLock<T>(configPath: string, write: () => T): T {
+	const lockPath = getConfigWriteLockPath(configPath);
+	const token = randomUUID();
+	let descriptor: number;
 	try {
-		return readFileSync(path, "utf8");
+		descriptor = openSync(lockPath, "wx");
+	} catch (error) {
+		// SAFETY: openSync errors expose the Node errno code.
+		if ((error as NodeJS.ErrnoException).code === "EEXIST")
+			throw new TaskModelConfigWriteError("busy", describeHeldLock(lockPath));
+		throw error;
+	}
+	try {
+		try {
+			writeSync(
+				descriptor,
+				JSON.stringify({
+					pid: process.pid,
+					hostname: hostname(),
+					token,
+					createdAt: new Date().toISOString(),
+				}),
+			);
+		} finally {
+			closeSync(descriptor);
+		}
+	} catch (error) {
+		rmSync(lockPath, { force: true });
+		throw error;
+	}
+	try {
+		return write();
+	} finally {
+		releaseConfigWriteLock(lockPath, token);
+	}
+}
+
+function releaseConfigWriteLock(lockPath: string, token: string): void {
+	let owner: any;
+	try {
+		owner = JSON.parse(readFileSync(lockPath, "utf8"));
+	} catch {
+		return;
+	}
+	// Never remove a lock this invocation does not own.
+	if (isPlainObject(owner) && owner.token === token) unlinkSync(lockPath);
+}
+
+function describeHeldLock(lockPath: string): string {
+	let owner = "an unidentified owner";
+	let stale = "";
+	try {
+		const parsed = JSON.parse(readFileSync(lockPath, "utf8"));
+		if (isPlainObject(parsed) && Number.isInteger(parsed.pid)) {
+			owner = `pid ${parsed.pid}${isString(parsed.hostname) ? ` on ${parsed.hostname}` : ""}${isString(parsed.createdAt) ? ` since ${parsed.createdAt}` : ""}`;
+			if (parsed.hostname === hostname() && !isProcessAlive(parsed.pid))
+				stale =
+					" That process is no longer running, so the lock appears stale.";
+		}
+	} catch {
+		// Unreadable lock contents still mean another writer may be active.
+	}
+	return `Task model config writer busy: lock ${lockPath} is held by ${owner}. Configuration was not replaced.${stale} Retry after the other writer finishes; remove the lock manually only after confirming no writer is active. Locks are never broken automatically.`;
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// SAFETY: process.kill errors expose the Node errno code.
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function readBytesIfExists(path: string): Buffer | undefined {
+	try {
+		return readFileSync(path);
 	} catch (error) {
 		// SAFETY: readFileSync errors expose the Node errno code.
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;

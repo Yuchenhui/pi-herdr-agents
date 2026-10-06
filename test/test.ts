@@ -25,7 +25,8 @@ import {
 	getSubagentsConfigExamplePath,
 	getSubagentsPackageRoot,
 } from "../pi-extension/subagents/config-path.ts";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import childProcess, { execFileSync, spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
@@ -80,9 +81,13 @@ import {
 	__herdrTest__,
 } from "../maestro/surfaces/herdr/herdr.ts";
 import {
+	computeConfigRevision,
+	getConfigWriteLockPath,
 	loadModelConfig,
 	parseModelConfig,
+	readConfigRevision,
 	resolveModelDefault,
+	TaskModelConfigWriteError,
 	writeTaskModelConfig,
 } from "../maestro/core/config/model-config.ts";
 import {
@@ -3994,6 +3999,7 @@ describe("model configuration", () => {
 				tasks: { coding: ["fake/worker"] },
 				tasksMeta,
 				missingCategories: ["review", "recon", "qa", "architecture", "docs"],
+				configRevision: readConfigRevision(configPath),
 			});
 			const before = readFileSync(configPath, "utf8");
 			assert.throws(
@@ -4136,13 +4142,15 @@ describe("model configuration", () => {
 				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
 				(candidate) => candidate === "fake/worker",
 				{
-					writeFileSync(path, data, options) {
-						writes.push({ path: String(path), options });
-						writeFileSync(path, data, options);
-					},
-					renameSync(from, to) {
-						renames.push({ from: String(from), to: String(to) });
-						renameSync(from, to);
+					fileOperations: {
+						writeFileSync(path, data, options) {
+							writes.push({ path: String(path), options });
+							writeFileSync(path, data, options);
+						},
+						renameSync(from, to) {
+							renames.push({ from: String(from), to: String(to) });
+							renameSync(from, to);
+						},
 					},
 				},
 			);
@@ -4209,6 +4217,512 @@ describe("model configuration", () => {
 				}),
 			/models\.tasksMeta has unsupported key\(s\): extra/,
 		);
+	});
+});
+
+describe("conditional task model config writes", () => {
+	const tasksMeta = {
+		generatedAt: "2026-10-05T00:00:00Z",
+		method: "registry-only" as const,
+	};
+	const anyCandidate = () => true;
+	const write = (
+		configPath: string,
+		tasks: Record<string, string[]>,
+		options: Parameters<typeof writeTaskModelConfig>[5] = {},
+	) =>
+		writeTaskModelConfig(
+			configPath,
+			getSubagentsConfigExamplePath(),
+			tasks,
+			tasksMeta,
+			anyCandidate,
+			options,
+		);
+	const sha256 = (bytes: string | Buffer) =>
+		`sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+	const assertWriteError = (run: () => void, code: string, pattern?: RegExp) =>
+		assert.throws(run, (error: Error) => {
+			assert.ok(error instanceof TaskModelConfigWriteError);
+			assert.equal(error.code, code);
+			if (pattern) assert.match(error.message, pattern);
+			return true;
+		});
+	const siblings = (configPath: string) =>
+		readdirSync(dirname(configPath)).sort();
+
+	it("computes revisions over exact bytes, including whitespace, unrelated fields, and tasks", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			assert.equal(readConfigRevision(configPath), "missing");
+			const base = { keep: 1, models: { tasks: { coding: ["fake/a"] } } };
+			const variants = [
+				JSON.stringify(base),
+				JSON.stringify(base, null, 2),
+				JSON.stringify(base) + "\n",
+				JSON.stringify({ ...base, keep: 2 }),
+				JSON.stringify({ keep: 1, models: { tasks: { coding: ["fake/b"] } } }),
+			];
+			const revisions = variants.map((bytes) => {
+				writeFileSync(configPath, bytes);
+				const revision = readConfigRevision(configPath);
+				assert.match(revision, /^sha256:[0-9a-f]{64}$/);
+				assert.equal(revision, sha256(Buffer.from(bytes, "utf8")));
+				assert.equal(revision, computeConfigRevision(readFileSync(configPath)));
+				return revision;
+			});
+			assert.equal(new Set(revisions).size, variants.length);
+		});
+	});
+
+	it("writes when the exact-byte revision matches and returns the saved file's revision", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(
+				configPath,
+				'{"keep":{"secret":"unrelated"},  "models":{"default":"fake/default","tasks":{"qa":["fake/qa"]}}}',
+			);
+			const saved = write(
+				configPath,
+				{ coding: ["fake/worker"], qa: ["fake/qa"] },
+				{ expectedConfigRevision: readConfigRevision(configPath) },
+			);
+			const bytes = readFileSync(configPath);
+			assert.equal(saved.configRevision, sha256(bytes));
+			assert.equal(saved.configRevision, readConfigRevision(configPath));
+			assert.deepEqual(JSON.parse(bytes.toString("utf8")), {
+				keep: { secret: "unrelated" },
+				models: {
+					default: "fake/default",
+					tasks: { coding: ["fake/worker"], qa: ["fake/qa"] },
+					tasksMeta,
+				},
+			});
+			assert.deepEqual(siblings(configPath), ["config.json"]);
+			// The returned revision is a valid precondition for the next write.
+			write(
+				configPath,
+				{ coding: ["fake/next"] },
+				{ expectedConfigRevision: saved.configRevision },
+			);
+			assert.deepEqual(loadModelConfig(dir).tasks, { coding: ["fake/next"] });
+		});
+	});
+
+	it("refuses stale revisions after task, unrelated-field, or whitespace-only changes without leaking content", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			const original = JSON.stringify({
+				keep: "secret-value-1",
+				models: { tasks: { coding: ["fake/a"] } },
+			});
+			for (const changed of [
+				JSON.stringify({
+					keep: "secret-value-1",
+					models: { tasks: { coding: ["fake/a"], qa: ["fake/qa"] } },
+				}),
+				JSON.stringify({
+					keep: "secret-value-2",
+					models: { tasks: { coding: ["fake/a"] } },
+				}),
+				JSON.stringify(JSON.parse(original), null, 2),
+				original + "\n",
+			]) {
+				writeFileSync(configPath, original);
+				const proposalRevision = readConfigRevision(configPath);
+				writeFileSync(configPath, changed);
+				assertWriteError(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/new"] },
+							{ expectedConfigRevision: proposalRevision },
+						),
+					"stale-revision",
+					/bytes changed.*not replaced.*Re-read.*fresh proposal.*fresh approval/,
+				);
+				assert.throws(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/new"] },
+							{ expectedConfigRevision: proposalRevision },
+						),
+					(error: Error) => {
+						assert.doesNotMatch(
+							error.message,
+							/secret-value|fake\/qa|fake\/a\b/,
+						);
+						assert.equal(
+							error.message.includes(readConfigRevision(configPath)),
+							false,
+						);
+						return true;
+					},
+				);
+				assert.equal(readFileSync(configPath, "utf8"), changed);
+				assert.deepEqual(siblings(configPath), ["config.json"]);
+			}
+		});
+	});
+
+	it("handles created, deleted, and missing config file states", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "nested", "config.json");
+			const saved = write(
+				configPath,
+				{ coding: ["fake/worker"] },
+				{ expectedConfigRevision: "missing" },
+			);
+			// Missing-file writes keep seeding packaged defaults.
+			const written = JSON.parse(readFileSync(configPath, "utf8"));
+			const example = JSON.parse(
+				readFileSync(getSubagentsConfigExamplePath(), "utf8"),
+			);
+			for (const key of Object.keys(example).filter((key) => key !== "models"))
+				assert.deepEqual(written[key], example[key]);
+			assert.equal(saved.configRevision, readConfigRevision(configPath));
+
+			const existing = readFileSync(configPath, "utf8");
+			assertWriteError(
+				() =>
+					write(
+						configPath,
+						{ coding: ["fake/other"] },
+						{ expectedConfigRevision: "missing" },
+					),
+				"stale-revision",
+				/expected no config file, but one now exists/,
+			);
+			assert.equal(readFileSync(configPath, "utf8"), existing);
+
+			rmSync(configPath);
+			assertWriteError(
+				() =>
+					write(
+						configPath,
+						{ coding: ["fake/other"] },
+						{ expectedConfigRevision: saved.configRevision },
+					),
+				"stale-revision",
+				/expected an existing config file, but it is now missing/,
+			);
+			assert.equal(existsSync(configPath), false);
+			assert.deepEqual(readdirSync(dirname(configPath)), []);
+		});
+	});
+
+	it("rejects invalid revision strings before reading or replacing configuration", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(configPath, "{}");
+			const valid = readConfigRevision(configPath);
+			for (const invalid of [
+				"",
+				null,
+				42,
+				"MISSING",
+				" missing",
+				valid.toUpperCase(),
+				valid.replace("sha256:", "SHA256:"),
+				valid.slice(0, -1),
+				`${valid}0`,
+				`${valid} `,
+				valid.replace("sha256:", "sha1:"),
+				valid.slice("sha256:".length),
+			]) {
+				assertWriteError(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/worker"] },
+							// SAFETY: deliberately bypasses static typing to test the runtime boundary.
+							{ expectedConfigRevision: invalid as string },
+						),
+					"invalid-revision",
+					/Invalid expectedConfigRevision/,
+				);
+				assert.equal(readFileSync(configPath, "utf8"), "{}");
+				assert.deepEqual(siblings(configPath), ["config.json"]);
+			}
+		});
+	});
+
+	it("compares the revision before reporting malformed configuration and never replaces it", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			for (const malformed of ["{not json", "[]", "null"]) {
+				writeFileSync(configPath, malformed);
+				assert.throws(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/worker"] },
+							{ expectedConfigRevision: readConfigRevision(configPath) },
+						),
+					/Invalid JSON in subagent config/,
+				);
+				assertWriteError(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/worker"] },
+							{ expectedConfigRevision: sha256("other") },
+						),
+					"stale-revision",
+				);
+				assert.throws(
+					() => write(configPath, { coding: ["fake/worker"] }),
+					/Invalid JSON in subagent config/,
+				);
+				assert.equal(readFileSync(configPath, "utf8"), malformed);
+				assert.deepEqual(siblings(configPath), ["config.json"]);
+			}
+		});
+	});
+
+	it("keeps omitted revisions unconditional while preserving unrelated fields", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					keep: 1,
+					models: {
+						agents: { scout: "fake/scout" },
+						tasks: { qa: ["fake/qa"] },
+					},
+				}),
+			);
+			const saved = write(configPath, { coding: ["fake/worker"] });
+			assert.equal(saved.configRevision, readConfigRevision(configPath));
+			// Unconditional writes still replace the full task map, as before.
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+				keep: 1,
+				models: {
+					agents: { scout: "fake/scout" },
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta,
+				},
+			});
+		});
+	});
+
+	it("removes only its own temporary file and lock when publication fails", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(configPath, '{"keep":true}');
+			const foreign = join(dir, ".foreign-config.tmp");
+			writeFileSync(foreign, "not ours");
+			for (const fileOperations of [
+				{
+					writeFileSync() {
+						throw new Error("injected write failure");
+					},
+					renameSync,
+				},
+				{
+					writeFileSync(path: any, data: any, options: any) {
+						writeFileSync(path, data, options);
+						throw new Error("injected write failure");
+					},
+					renameSync,
+				},
+				{
+					writeFileSync,
+					renameSync() {
+						throw new Error("injected write failure");
+					},
+				},
+			]) {
+				assert.throws(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/worker"] },
+							{
+								expectedConfigRevision: readConfigRevision(configPath),
+								// SAFETY: test doubles implement only the injected call shape.
+								fileOperations: fileOperations as any,
+							},
+						),
+					/injected write failure/,
+				);
+				assert.equal(readFileSync(configPath, "utf8"), '{"keep":true}');
+				assert.deepEqual(siblings(configPath), [
+					".foreign-config.tmp",
+					"config.json",
+				]);
+			}
+			write(configPath, { coding: ["fake/worker"] });
+			assert.deepEqual(siblings(configPath), [
+				".foreign-config.tmp",
+				"config.json",
+			]);
+		});
+	});
+
+	it("fails closed on held or stale locks and never removes another owner's lock", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(configPath, '{"keep":true}');
+			const lockPath = getConfigWriteLockPath(configPath);
+			const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+			for (const [contents, pattern] of [
+				[
+					JSON.stringify({
+						pid: deadPid,
+						hostname: hostname(),
+						token: "other",
+						createdAt: "2026-01-01T00:00:00.000Z",
+					}),
+					new RegExp(`pid ${deadPid}.*no longer running.*appears stale`),
+				],
+				[
+					JSON.stringify({
+						pid: process.pid,
+						hostname: hostname(),
+						token: "other",
+					}),
+					new RegExp(`pid ${process.pid}`),
+				],
+				["", /unidentified owner/],
+				["{corrupt", /unidentified owner/],
+			] as const) {
+				writeFileSync(lockPath, contents);
+				for (const expectedConfigRevision of [
+					undefined,
+					readConfigRevision(configPath),
+				]) {
+					assertWriteError(
+						() =>
+							write(
+								configPath,
+								{ coding: ["fake/worker"] },
+								{ expectedConfigRevision },
+							),
+						"busy",
+						pattern,
+					);
+					assertWriteError(
+						() => write(configPath, { coding: ["fake/worker"] }),
+						"busy",
+						/never broken automatically/,
+					);
+				}
+				assert.equal(readFileSync(lockPath, "utf8"), contents);
+				assert.equal(readFileSync(configPath, "utf8"), '{"keep":true}');
+				assert.deepEqual(siblings(configPath), [
+					"config.json",
+					"config.json.lock",
+				]);
+			}
+			rmSync(lockPath);
+			write(configPath, { coding: ["fake/worker"] });
+			assert.deepEqual(siblings(configPath), ["config.json"]);
+		});
+	});
+
+	it("serializes cooperating writers across processes and rejects the loser's stale revision", async () => {
+		const dir = createTestDir();
+		try {
+			const configPath = join(dir, "config.json");
+			writeFileSync(configPath, '{"keep":true}');
+			const proposalRevision = readConfigRevision(configPath);
+			const readyPath = join(dir, "ready");
+			const releasePath = join(dir, "release");
+			const moduleUrl = new URL(
+				"../maestro/core/config/model-config.ts",
+				import.meta.url,
+			).href;
+			const script = `
+				import { existsSync, renameSync, writeFileSync } from "node:fs";
+				import { writeTaskModelConfig } from ${JSON.stringify(moduleUrl)};
+				const env = process.env;
+				const sleeper = new Int32Array(new SharedArrayBuffer(4));
+				const saved = writeTaskModelConfig(
+					env.W2_CONFIG,
+					env.W2_EXAMPLE,
+					{ coding: ["fake/child"] },
+					${JSON.stringify(tasksMeta)},
+					() => true,
+					{
+						expectedConfigRevision: env.W2_REVISION,
+						fileOperations: {
+							renameSync,
+							writeFileSync(path, data, options) {
+								writeFileSync(env.W2_READY, "");
+								const deadline = Date.now() + 20000;
+								while (!existsSync(env.W2_RELEASE)) {
+									if (Date.now() > deadline) throw new Error("release timeout");
+									Atomics.wait(sleeper, 0, 0, 10);
+								}
+								writeFileSync(path, data, options);
+							},
+						},
+					},
+				);
+				process.stdout.write(JSON.stringify(saved));
+			`;
+			const child = childProcess.spawn(
+				process.execPath,
+				["--experimental-strip-types", "--input-type=module", "-e", script],
+				{
+					env: {
+						...process.env,
+						W2_CONFIG: configPath,
+						W2_EXAMPLE: getSubagentsConfigExamplePath(),
+						W2_REVISION: proposalRevision,
+						W2_READY: readyPath,
+						W2_RELEASE: releasePath,
+					},
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			);
+			let stdout = "";
+			let stderr = "";
+			child.stdout.on("data", (chunk) => (stdout += chunk));
+			child.stderr.on("data", (chunk) => (stderr += chunk));
+			const exited = new Promise<number | null>((resolve) =>
+				child.on("close", resolve),
+			);
+			const readyDeadline = Date.now() + 20_000;
+			while (!existsSync(readyPath)) {
+				assert.ok(Date.now() < readyDeadline, `child never locked: ${stderr}`);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			// The child holds the lock mid-publication: both kinds of parent write fail fast.
+			for (const options of [{}, { expectedConfigRevision: proposalRevision }])
+				assertWriteError(
+					() => write(configPath, { qa: ["fake/parent"] }, options),
+					"busy",
+					new RegExp(`pid ${child.pid}`),
+				);
+			assert.equal(readFileSync(configPath, "utf8"), '{"keep":true}');
+			writeFileSync(releasePath, "");
+			assert.equal(await exited, 0, stderr);
+			const saved = JSON.parse(stdout);
+			assert.equal(saved.configRevision, readConfigRevision(configPath));
+			assert.deepEqual(loadModelConfig(dir).tasks, { coding: ["fake/child"] });
+			// The parent's proposal was read before the child's write; retrying it is stale.
+			assertWriteError(
+				() =>
+					write(
+						configPath,
+						{ qa: ["fake/parent"] },
+						{ expectedConfigRevision: proposalRevision },
+					),
+				"stale-revision",
+			);
+			assert.deepEqual(loadModelConfig(dir).tasks, { coding: ["fake/child"] });
+			assert.deepEqual(readdirSync(dir).sort(), [
+				"config.json",
+				"ready",
+				"release",
+			]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -7928,6 +8442,7 @@ describe("commands", () => {
 				tasks: { coding: ["fake/worker"] },
 				tasksMeta,
 				missingCategories: ["review", "recon", "qa", "architecture", "docs"],
+				configRevision: readConfigRevision(configPath),
 			});
 			assert.match(result.content[0].text, /Reload required/);
 			assert.ok(
@@ -7943,6 +8458,161 @@ describe("commands", () => {
 					tasks: { coding: ["fake/worker"] },
 					tasksMeta,
 				},
+			});
+		} finally {
+			restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("exposes an optional exact-byte expectedConfigRevision in the public writer schema", () => {
+		const { api, registeredTools } = createMockExtensionApi();
+		subagentsModule.default(api);
+		const writer = registeredTools.find(
+			(tool) => tool.name === "subagents_write_task_models",
+		)!;
+		assert.equal(
+			writer.parameters.required.includes("expectedConfigRevision"),
+			false,
+		);
+		assert.match(writer.description, /expectedConfigRevision/);
+		assert.match(writer.description, /configRevision/);
+		const base = {
+			tasks: { coding: ["fake/worker"] },
+			tasksMeta: { generatedAt: "2026-10-05T00:00:00Z", method: "research" },
+		};
+		const hex = "0123456789abcdef".repeat(4);
+		assert.equal(Value.Check(writer.parameters, base), true);
+		for (const revision of ["missing", `sha256:${hex}`])
+			assert.equal(
+				Value.Check(writer.parameters, {
+					...base,
+					expectedConfigRevision: revision,
+				}),
+				true,
+			);
+		for (const revision of [
+			"",
+			null,
+			"MISSING",
+			`sha256:${hex.toUpperCase()}`,
+			`sha256:${hex.slice(1)}`,
+			`sha256:${hex}0`,
+			hex,
+		])
+			assert.equal(
+				Value.Check(writer.parameters, {
+					...base,
+					expectedConfigRevision: revision,
+				}),
+				false,
+				String(revision),
+			);
+	});
+
+	it("refuses a conditional tool write after a later change to the approved config snapshot", async () => {
+		const dir = createTestDir();
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		try {
+			const { api, registeredTools } = createMockExtensionApi();
+			subagentsModule.default(api);
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					unrelated: { keep: 1 },
+					models: { tasks: { coding: ["fake/worker"] } },
+				}),
+			);
+			const writer = registeredTools.find(
+				(tool) => tool.name === "subagents_write_task_models",
+			)!;
+			const model = { provider: "fake", id: "worker", reasoning: false };
+			const ctx = {
+				modelRegistry: {
+					find: (provider: string, id: string) =>
+						provider === "fake" && id === "worker" ? model : undefined,
+					getAvailable: () => [model],
+					hasConfiguredAuth: () => true,
+				},
+			};
+			const tasksMeta = {
+				generatedAt: "2026-10-05T00:00:00Z",
+				method: "registry-only",
+			};
+			// Approval binds this exact snapshot; a later hook then adds qa.
+			const approvedRevision = readConfigRevision(configPath);
+			await writer.execute(
+				"later-hook",
+				{ tasks: { coding: ["fake/worker"], qa: ["fake/worker"] }, tasksMeta },
+				undefined,
+				undefined,
+				ctx,
+			);
+			const afterHook = readFileSync(configPath, "utf8");
+			await assert.rejects(
+				writer.execute(
+					"approved-write",
+					{
+						tasks: { coding: ["fake/worker"] },
+						tasksMeta,
+						expectedConfigRevision: approvedRevision,
+					},
+					undefined,
+					undefined,
+					ctx,
+				),
+				/Stale task model config revision.*not replaced/,
+			);
+			assert.equal(readFileSync(configPath, "utf8"), afterHook);
+			assert.deepEqual(loadModelConfig(dirname(configPath)).tasks, {
+				coding: ["fake/worker"],
+				qa: ["fake/worker"],
+			});
+			for (const invalid of [null, ""])
+				await assert.rejects(
+					writer.execute(
+						"invalid-write",
+						{
+							tasks: { coding: ["fake/worker"] },
+							tasksMeta,
+							expectedConfigRevision: invalid,
+						},
+						undefined,
+						undefined,
+						ctx,
+					),
+					/Invalid expectedConfigRevision/,
+				);
+			assert.equal(readFileSync(configPath, "utf8"), afterHook);
+			const fresh = await writer.execute(
+				"fresh-write",
+				{
+					tasks: {
+						coding: ["fake/worker"],
+						qa: ["fake/worker"],
+						docs: ["fake/worker"],
+					},
+					tasksMeta,
+					expectedConfigRevision: readConfigRevision(configPath),
+				},
+				undefined,
+				undefined,
+				ctx,
+			);
+			assert.equal(
+				fresh.details.configRevision,
+				readConfigRevision(configPath),
+			);
+			assert.ok(
+				fresh.content[0].text.includes(
+					`"configRevision": "${fresh.details.configRevision}"`,
+				),
+			);
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).unrelated, {
+				keep: 1,
 			});
 		} finally {
 			restoreEnvVar("PI_CODING_AGENT_DIR", previous);

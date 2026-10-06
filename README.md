@@ -138,7 +138,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
 | `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
 | `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
-| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences |
+| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences, optionally conditional on `expectedConfigRevision` |
 
 | Pi child-only tool | Description |
 | ---------------- | ------------------------------------------------------------------------- |
@@ -430,10 +430,36 @@ preserving unrelated settings. Its tool schema accepts partial nonempty
 categories (omitted categories are removed), rejects empty `tasks: {}` input,
 and rejects exact duplicate refs within a category after trimming;
 IDs remain case-sensitive. Its result includes normalized saved `tasks`,
-`tasksMeta`, `configPath`, and `missingCategories`. Init requests all six categories
+`tasksMeta`, `configPath`, `missingCategories`, and `configRevision`. Init requests all six categories
 and a before/after table based on that saved result, not the unsaved draft. It
 must explain missing categories or changed choices; with no available models,
 it must report the limitation without writing.
+
+Optional `expectedConfigRevision` makes a write conditional on the config the
+proposal was read from. A revision is `sha256:` followed by 64 lowercase hex
+digits of the SHA-256 of the exact `config.json` bytes (not normalized JSON or
+only `models.tasks`), or the literal `missing` when the file is absent. Any byte
+change, including whitespace or unrelated settings, makes the revision stale; a
+`missing` revision rejects a file that now exists, and an existing revision
+rejects a file that was removed. A stale revision fails with `Stale task model
+config revision` without replacing configuration: re-read, re-propose, and
+re-approve rather than retrying. Malformed revisions, including `null` and empty
+strings, fail closed. Omitting the field keeps the unconditional write. A write
+to a missing file still seeds from the packaged `config.json.example`.
+`configRevision` is the revision of the exact bytes written and can serve as the
+next precondition.
+
+Every writer call, conditional or not, holds an exclusive `config.json.lock`
+sibling while it reads one snapshot, checks the revision, and atomically renames
+a private temporary file into place. A held lock fails immediately with `Task
+model config writer busy`; there are no waits or retries. The lock is never
+broken automatically: after a crash, the error names the recorded owner and
+reports when that process is no longer running, and you remove the lock only
+after confirming that no writer is active. Each call removes only its own lock
+and temporary file. This lock is advisory: it serializes cooperating writers
+but cannot constrain a text editor or another process that ignores it. The
+revision check detects changes made before the snapshot is read; it is not a
+filesystem transaction against arbitrary external writers.
 
 `task:<category>` values select subagent models; they are not slash commands and
 do not change the parent model. Ordered authenticated candidate plans resolve

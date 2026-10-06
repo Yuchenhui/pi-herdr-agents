@@ -58,6 +58,7 @@ import {
 import { wrapPiModelRegistry } from "./model-registry.ts";
 import {
 	loadModelConfig,
+	MISSING_CONFIG_REVISION,
 	resolveModelDefault,
 	writeTaskModelConfig,
 } from "../../maestro/core/config/model-config.ts";
@@ -2444,7 +2445,7 @@ export default function subagentsExtension(
 		pi.registerTool({
 			name: "subagents_write_task_models",
 			label: "Write task model preferences",
-			description: `Validate and atomically replace models.tasks and models.tasksMeta in the durable Pi agent config, preserving unrelated settings. Supported categories: ${TASK_CATEGORIES.join(", ")}. Partial nonempty categories are accepted; omitted categories are removed. Rejects duplicate exact refs within a category. Review the active authenticated registry and existing preferences first. Returns normalized saved preferences and missing categories; reload required.`,
+			description: `Validate and atomically replace models.tasks and models.tasksMeta in the durable Pi agent config, preserving unrelated settings. Supported categories: ${TASK_CATEGORIES.join(", ")}. Partial nonempty categories are accepted; omitted categories are removed. Rejects duplicate exact refs within a category. Review the active authenticated registry and existing preferences first. Optional expectedConfigRevision makes the write conditional: it fails without replacing configuration when the config file no longer matches the revision the proposal was read from. Cooperating writes are serialized and fail on contention rather than waiting. Returns normalized saved preferences, missing categories, and the configRevision of the written file; reload required.`,
 			parameters: Type.Object({
 				tasks: Type.Object(
 					Object.fromEntries(
@@ -2467,6 +2468,17 @@ export default function subagentsExtension(
 						Type.Literal("registry-only"),
 					]),
 				}),
+				expectedConfigRevision: Type.Optional(
+					Type.Union(
+						[
+							Type.Literal(MISSING_CONFIG_REVISION),
+							Type.String({ pattern: "^sha256:[0-9a-f]{64}$" }),
+						],
+						{
+							description: `Revision of the config the proposal was read from: "sha256:" plus 64 lowercase hex digits of the exact file bytes, or "${MISSING_CONFIG_REVISION}" when the file is absent. A mismatch fails without writing; re-read, re-propose, and re-approve. Omit for an unconditional write.`,
+						},
+					),
+				),
 			}),
 			execute: async (_id, params, _signal, _update, ctx) => {
 				const registry = wrapPiModelRegistry(ctx.modelRegistry);
@@ -2485,6 +2497,10 @@ export default function subagentsExtension(
 							parsed && registry.find(parsed.provider, parsed.modelId);
 						return !!model && registry.hasConfiguredAuth(model);
 					},
+					// Present-but-invalid values (including null or "") reach the seam and fail closed.
+					Object.hasOwn(params, "expectedConfigRevision")
+						? { expectedConfigRevision: params.expectedConfigRevision }
+						: {},
 				);
 				return {
 					content: [
