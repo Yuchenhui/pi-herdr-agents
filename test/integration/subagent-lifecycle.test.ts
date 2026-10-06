@@ -26,7 +26,12 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { getProviderRequests, resetProviderRequests } from "./fake-provider.ts";
+import {
+	getProviderRequests,
+	pauseProviderFailures,
+	resetProviderRequests,
+} from "./fake-provider.ts";
+import { inspectPane } from "../../maestro/surfaces/herdr/terminal.ts";
 import {
 	getAvailableBackends,
 	setBackend,
@@ -67,6 +72,46 @@ it("dirty cleanup warning matcher rejects stale inventory", () => {
 		dirtyCleanupWarning,
 	);
 });
+
+/** Poll an observable condition within the per-test timeout. */
+async function waitForObservation(
+	observe: () => boolean | Promise<boolean>,
+	what: string,
+	timeout: number = PI_TIMEOUT,
+): Promise<void> {
+	const deadline = Date.now() + timeout;
+	while (!(await observe())) {
+		if (Date.now() > deadline)
+			throw new Error(`Timeout (${timeout}ms) waiting for ${what}`);
+		await sleep(250);
+	}
+}
+
+/** True once the parent answered the subagent launch result with a final turn. */
+function parentTurnSettledAfterLaunch(sessionFile: string): boolean {
+	if (!existsSync(sessionFile)) return false;
+	const messages = readFileSync(sessionFile, "utf8")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line))
+		.filter((entry) => entry.type === "message")
+		.map((entry) => entry.message);
+	const launched = messages.findIndex(
+		(message) =>
+			message.role === "toolResult" &&
+			message.toolName === "subagent" &&
+			message.details?.status === "started",
+	);
+	return (
+		launched >= 0 &&
+		messages
+			.slice(launched + 1)
+			.some(
+				(message) =>
+					message.role === "assistant" && message.stopReason === "stop",
+			)
+	);
+}
 
 const backends = getAvailableBackends();
 
@@ -1128,6 +1173,91 @@ for (const backend of backends) {
 			assert.match(
 				result.content,
 				/Model used: pi-integration\/fallback-secondary/,
+			);
+		});
+
+		it("falls back through the live parent context after a parent reload", async () => {
+			const id = uniqueId();
+			const markerFile = `/tmp/pi-integ-reload-fallback-${id}.txt`;
+			const parentSession = join(env.dir, `reload-fallback-parent-${id}.jsonl`);
+			trackTempFile(env, markerFile);
+			const surface = createTrackedSurface(env, `reload-fallback-${id}`);
+			await waitForPaneReady(surface);
+			const releaseFailures = pauseProviderFailures();
+			let reloadedAt = 0;
+			try {
+				startPi(
+					surface,
+					env.dir,
+					[
+						`Call subagent once with name: "ReloadFallback-${id}".`,
+						`agent: "test-echo".`,
+						`model: "pi-integration/fallback-primary, pi-integration/fallback-secondary".`,
+						`task: "Run: echo 'RELOAD_FALLBACK_${id}' > '${markerFile}'".`,
+					].join("\n"),
+					{ extraArgs: `--session ${shellQuote(parentSession)}` },
+				);
+				await waitForObservation(
+					() =>
+						getProviderRequests().some(
+							(request) => request.model === "fallback-primary",
+						),
+					"the held primary-model request",
+				);
+				await waitForObservation(
+					() => parentTurnSettledAfterLaunch(parentSession),
+					"the parent's final assistant turn after the launch",
+				);
+				await waitForObservation(async () => {
+					const pane = await inspectPane(surface);
+					return pane.kind === "present" && pane.agentStatus === "idle";
+				}, "an idle parent pane");
+				runInPane(surface, "/reload");
+				await waitForScreen(surface, /Reloaded keybindings/, PI_TIMEOUT);
+				reloadedAt = Date.now();
+			} finally {
+				releaseFailures();
+			}
+			await waitForFile(
+				parentSession,
+				PI_TIMEOUT,
+				/"customType":"subagent_result"/,
+			);
+			const results = readFileSync(parentSession, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line))
+				.filter(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === "subagent_result",
+				);
+			assert.equal(results.length, 1);
+			const [result] = results;
+			assert.equal(result.details.errorMessage, undefined);
+			assert.match(
+				await waitForFile(markerFile, PI_TIMEOUT),
+				new RegExp(`RELOAD_FALLBACK_${id}`),
+			);
+			assert.deepEqual(result.details.fallbackAttempts, [
+				"pi-integration/fallback-primary",
+				"pi-integration/fallback-secondary",
+			]);
+			assert.equal(
+				result.details.runtimePlan.model,
+				"pi-integration/fallback-secondary",
+			);
+			assert.match(
+				result.details.fallbackFailures[0].error,
+				/deterministic fallback provider failure/,
+			);
+			assert.ok(
+				getProviderRequests().some(
+					(request) =>
+						request.model === "fallback-secondary" &&
+						request.status === 200 &&
+						(request.at ?? 0) > reloadedAt,
+				),
 			);
 		});
 
