@@ -1,6 +1,8 @@
 # Pi Herdr Agents
 
-![Pi Herdr Agents: parallel Pi agents running asynchronously in dedicated Herdr panes and managed worktrees.](https://raw.githubusercontent.com/giuseppecrj/pi-herdr-agents/main/docs/assets/pi-herdr-agents-gallery.png)
+![Pi Herdr Agents: a parent Pi session delegating to parallel child agents in dedicated Herdr panes, an isolated worktree and a retained session, with a live status widget.](https://raw.githubusercontent.com/giuseppecrj/pi-herdr-agents/main/docs/assets/pi-herdr-agents-gallery.png)
+
+> **Agents:** the tool list is in [What's Included](#whats-included) and the operating guide is [`skills/pi-herdr-agents/SKILL.md`](skills/pi-herdr-agents/SKILL.md). Contributors: read [`AGENTS.md`](AGENTS.md).
 
 Asynchronous subagents for [Pi](https://github.com/earendil-works/pi), running exclusively in [Herdr](https://herdr.dev).
 
@@ -48,36 +50,24 @@ pi
 
 Restart or `/reload` Pi after installation. Review package source before installing any Pi package.
 
-## Release notes
+> **Upgrading from 2.x?** Bundled roles and several commands moved out. See [3.0.0 release notes](#300).
 
-[`CHANGELOG.md`](CHANGELOG.md) is generated from Git history on each release.
-Hand-written upgrade notes for breaking releases live here.
+## Contents
 
-### 3.0.0
+- [Requirements](#requirements), [Install](#install), [Safety and uninstall](#safety-and-uninstall)
+- [Quick start](#quick-start), [Release notes](#release-notes), [How it works](#how-it-works)
+- [What's Included](#whats-included): tools, commands, the operating skill, role packs
+- [Async Subagent Flow](#async-subagent-flow): status, configuration, model routing
+- [Spawning Subagents](#spawning-subagents), [Persistent specialists](#persistent-specialists), [Interrupting](#interrupting-a-running-subagent), [Cancelling](#cancelling-a-running-subagent)
+- [The `/worktree` Workflow](#the-worktree-workflow), [Custom Agents](#custom-agents), [Tool Access Control](#tool-access-control)
+- [Development](#development), [License](#license)
 
-3.0.0 makes the host pack-neutral. It also adds conditional task-model writes
-(`expectedConfigRevision`, an advisory lock, and the reported `configRevision`),
-the `pi-herdr-agents` operating skill, and `subagent_cancel`.
+## Safety and uninstall
 
-**Breaking changes.** The package no longer ships the seven former bundled roles,
-`/plan` and its plan skill, or `/skill:orchestrate`; these moved to optional role
-packs. `/iterate`, `/btw`, and `/btw-close` were removed without replacement.
-`roles.bundled` is now a deprecated no-op. A named launch of a role that no
-definition or installed pack supplies now fails before Herdr creates a pane or
-worktree.
-
-**Migration.**
-
-- Install `pi-herdr-roles` for the six generic roles (`scout`, `planner`,
-  `worker`, `reviewer`, `adversarial-reviewer`, `visual-tester`), `/plan`, and
-  `/skill:orchestrate`.
-- Install `pi-herdr-pstack` for the `poteto` role.
-- Remove `roles.bundled` from `$PI_CODING_AGENT_DIR/herdr-agents/config.json`.
-- Alternatively, copy a former role's definition into `.pi/agents/` or the
-  global agents directory to keep it without a pack.
-
-See [Migrating from bundled roles](#migrating-from-bundled-roles) for the full
-mapping and pack-compatibility notes.
+- Child agents are real Pi processes running with your user account's permissions, inside Herdr panes. Worktrees isolate Git checkouts, not processes or permissions.
+- The extension creates Herdr panes, tabs and managed worktrees only when a launch asks for them. It never pushes, merges, opens pull requests, deletes branches or removes worktrees on its own; cleanup is an explicit parent action ([worktree cleanup](#explicit-worktree-cleanup)).
+- What it writes: `$PI_CODING_AGENT_DIR/herdr-agents/config.json` (only through `/subagents-init` or the writer tool, never on startup); per-launch artifacts under the parent session's `artifacts/<session-id>/` directory beside Pi's session store, which hold the child's full task text and any `systemPrompt` as Markdown files, activity snapshots and worktree manifests; and the child's own Pi session file. A managed worktree that carries its own `.pi/agent` directory receives that child's session inside the checkout. Treat task text as potentially sensitive when you share or inspect those files.
+- To uninstall: first list and remove any retained worktrees while the extension is still loaded (`/worktree list`, then `/worktree remove <target>`), because those commands leave with the package. Then run `pi remove npm:pi-herdr-agents`, and delete `$PI_CODING_AGENT_DIR/herdr-agents/` and the `artifacts/` directories above if you no longer want the configuration and launch records.
 
 ## Quick start
 
@@ -116,6 +106,38 @@ subagent({ name: "Auth summary", model: "<provider>/<fast-tier-id>", thinking: "
 ```
 
 Use ordinary panes for read-only agents. A single or sequential writer can work in the parent checkout; give each parallel independent writing agent a unique managed worktree. The parent acts as coordinator: decompose work, give each child one bounded outcome with its goal, allowed files, verification, and commit instruction, and keep dependent writes sequential. Children are leaves by default; the parent owns integration and final verification. See [Worktree subagents](docs/worktree-subagents.md).
+
+## Release notes
+
+[`CHANGELOG.md`](CHANGELOG.md) is generated from Git history on each release.
+Hand-written upgrade notes for breaking releases live here.
+
+### 3.0.0
+
+3.0.0 makes the host pack-neutral. It also adds conditional task-model writes
+(`expectedConfigRevision`, an advisory lock, and the reported `configRevision`),
+the `pi-herdr-agents` operating skill, and `subagent_cancel`.
+
+**Breaking changes.** The package no longer ships the seven former bundled roles,
+`/plan` and its plan skill, or `/skill:orchestrate`; these moved to optional role
+packs. `/iterate`, `/btw`, and `/btw-close` were removed without replacement.
+`roles.bundled` is now a deprecated no-op. A named launch of a role that no
+definition or installed pack supplies now fails before Herdr creates a pane or
+worktree.
+
+**Migration.**
+
+- Install `pi-herdr-roles` for the six generic roles (`scout`, `planner`,
+  `worker`, `reviewer`, `adversarial-reviewer`, `visual-tester`), `/plan`, and
+  `/skill:orchestrate`.
+- Install `pi-herdr-pstack` for the `poteto-mode` methodology skill and command.
+  It ships no named roles; its delegates are bare.
+- Remove `roles.bundled` from `$PI_CODING_AGENT_DIR/herdr-agents/config.json`.
+- Alternatively, copy a former role's definition into `.pi/agents/` or the
+  global agents directory to keep it without a pack.
+
+See [Migrating from bundled roles](#migrating-from-bundled-roles) for the full
+mapping and pack-compatibility notes.
 
 ## How it works
 
@@ -171,6 +193,10 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
 | `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
 | `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences, optionally conditional on `expectedConfigRevision` |
+
+| Skill | Description |
+| ----- | ----------- |
+| `pi-herdr-agents` | Operating guide for this host: launching, supervising, interrupting, cancelling and resuming children, worktrees, persistent specialists, model routing and configuration. Loaded by agents on demand; see `skills/pi-herdr-agents/SKILL.md` |
 
 | Pi child-only tool | Description |
 | ---------------- | ------------------------------------------------------------------------- |
@@ -233,7 +259,7 @@ modified.
 | `scout`, `planner`, `worker`, `reviewer`, `adversarial-reviewer`, `visual-tester` roles | Moved | `pi-herdr-roles` role pack |
 | `/plan` command and its plan skill | Moved | `pi-herdr-roles` |
 | `/skill:orchestrate` and its adversarial-review resources | Moved | `pi-herdr-roles` |
-| `poteto` role | Moved | `pi-herdr-pstack` role pack |
+| `poteto` role | Removed; replaced by the `poteto-mode` skill and `/poteto-mode` command | `pi-herdr-pstack` |
 | `/iterate` | Removed, not relocated | Call `subagent({ name, task, fork: true, interactive: true })` directly |
 | `/btw`, `/btw-close` | Removed, not relocated | None |
 | `roles.bundled` setting | Deprecated no-op | Remove it from `config.json` |
@@ -1250,4 +1276,4 @@ This package builds on earlier open-source work by [HazAT/pi-interactive-subagen
 
 ## License
 
-MIT. Copyright notice retained from the upstream lineage (`HazAT`).
+MIT, see [LICENSE](LICENSE). Copyright notice retained from the upstream lineage (`HazAT`).

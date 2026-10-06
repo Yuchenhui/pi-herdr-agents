@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title description">
   <title id="title">Pi Herdr Agents — parallel agents for Pi</title>
-  <desc id="description">A dark terminal-inspired package banner showing a parent Pi session supervising parallel scout, worker, and review agents in Herdr.</desc>
+  <desc id="description">A dark terminal-inspired package banner showing a parent Pi session supervising parallel agents in Herdr: a read-only pane, an isolated worktree, and a retained session.</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#060b13"/>
@@ -57,9 +57,9 @@
       <text x="364" y="33" text-anchor="middle" fill="#6f7a8c" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">pi — subagents</text>
       <text x="30" y="92" fill="#dce4ec" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">╭─ Subagents ─────────────── 2 active · 1 open ─╮</text>
       <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16">
-        <text x="31" y="132" fill="#7f8a9a">│ 00:23</text><text x="120" y="132" fill="#eef2f5">Scout: Auth</text><text x="390" y="132" fill="#71ddff">active · read</text><text x="682" y="132" text-anchor="end" fill="#7f8a9a">7m │</text>
-        <text x="31" y="172" fill="#7f8a9a">│ 00:45</text><text x="120" y="172" fill="#eef2f5">Worker: API</text><text x="390" y="172" fill="#9cadff">active · bash</text><text x="682" y="172" text-anchor="end" fill="#7f8a9a">2m │</text>
-        <text x="31" y="212" fill="#7f8a9a">│ 01:08</text><text x="120" y="212" fill="#eef2f5">Reviewer</text><text x="390" y="212" fill="#ffc47f">waiting</text><text x="682" y="212" text-anchor="end" fill="#7f8a9a">1m │</text>
+        <text x="31" y="132" fill="#7f8a9a">│ 00:23</text><text x="120" y="132" fill="#eef2f5">Map: auth</text><text x="390" y="132" fill="#71ddff">active · read</text><text x="682" y="132" text-anchor="end" fill="#7f8a9a">7m │</text>
+        <text x="31" y="172" fill="#7f8a9a">│ 00:45</text><text x="120" y="172" fill="#eef2f5">Fix: api</text><text x="390" y="172" fill="#9cadff">active · bash</text><text x="682" y="172" text-anchor="end" fill="#7f8a9a">2m │</text>
+        <text x="31" y="212" fill="#7f8a9a">│ 01:08</text><text x="120" y="212" fill="#eef2f5">Verify: diff</text><text x="390" y="212" fill="#ffc47f">waiting</text><text x="682" y="212" text-anchor="end" fill="#7f8a9a">1m │</text>
       </g>
       <text x="30" y="246" fill="#dce4ec" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17">╰──────────────────────────────────────────────╯</text>
     </g>
@@ -80,17 +80,17 @@
 
       <g transform="translate(516 34)" filter="url(#shadow)">
         <rect width="204" height="126" rx="20" fill="#0c1420" stroke="#59d9ff" stroke-opacity="0.38"/>
-        <circle cx="30" cy="34" r="7" fill="#59d9ff"/><text x="50" y="40" fill="#e9eef2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700">SCOUT</text>
+        <circle cx="30" cy="34" r="7" fill="#59d9ff"/><text x="50" y="40" fill="#e9eef2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700">AGENT</text>
         <text x="29" y="76" fill="#8491a2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">read-only pane</text><text x="29" y="101" fill="#71ddff" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">● active</text>
       </g>
       <g transform="translate(542 249)" filter="url(#shadow)">
         <rect width="204" height="126" rx="20" fill="#101321" stroke="#879fff" stroke-opacity="0.42"/>
-        <circle cx="30" cy="34" r="7" fill="#879fff"/><text x="50" y="40" fill="#e9eef2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700">WORKER</text>
+        <circle cx="30" cy="34" r="7" fill="#879fff"/><text x="50" y="40" fill="#e9eef2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700">AGENT</text>
         <text x="29" y="76" fill="#8992a8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">isolated worktree</text><text x="29" y="101" fill="#aab8ff" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">● active</text>
       </g>
       <g transform="translate(516 464)" filter="url(#shadow)">
         <rect width="204" height="126" rx="20" fill="#16131b" stroke="#ffbd73" stroke-opacity="0.42"/>
-        <circle cx="30" cy="34" r="7" fill="#ffbd73"/><text x="50" y="40" fill="#e9eef2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700">REVIEW</text>
+        <circle cx="30" cy="34" r="7" fill="#ffbd73"/><text x="50" y="40" fill="#e9eef2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700">AGENT</text>
         <text x="29" y="76" fill="#968b89" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">retained session</text><text x="29" y="101" fill="#ffd09a" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">● waiting</text>
       </g>
       <text x="372" y="650" text-anchor="middle" fill="#758195" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="1.8">DEDICATED HERDR SURFACES</text>
