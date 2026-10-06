@@ -5,9 +5,6 @@
   "models": {
     "agents": {}
   },
-  "roles": {
-    "bundled": true
-  },
   "persistent": {
     "maxAgents": 3
   },

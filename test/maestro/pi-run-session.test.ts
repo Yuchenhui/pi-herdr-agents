@@ -327,10 +327,8 @@ test("Task17 discovered Role defaults reach the actual runtime launch without sy
 			"---\nname: core-worker\ndescription: Core role\nmodel: test/role-default\nthinking: low\nauto-exit: true\nspawning: false\ndeny-tools: write\nskills: first,second\nsystem-prompt: replace\n---\nCore role identity",
 		);
 		const definition = discoverAgentCatalog({
-			bundledAgentsDir: join(f.dir, "no-bundled"),
 			agentConfigDir: f.dir,
 			cwd: f.dir,
-			roleConfig: { bundled: false },
 		}).agents[0];
 		f.options.roles.push(definition.role);
 		const session = runtime.createDefaultRunSession(f.options, f.session);

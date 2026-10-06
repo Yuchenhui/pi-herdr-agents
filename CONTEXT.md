@@ -67,38 +67,39 @@ diagnostic, and launch fails before Herdr creates a pane or worktree. Remove
 `cli` and `cli-model`, then select the model through Pi provider/model routing.
 _Avoid_: Silent Pi reinterpretation, compatibility adapter
 
-**Public review fan-out**:
-A parent procedure that materializes pinned evidence, launches fresh public
-reviewer subagents, receives automatic result delivery, and synthesizes every
-outcome. Reviewers use ordinary panes and do not poll for completion.
-_Avoid_: Hidden child runner, approval gate, parentless aggregation
+**Pack-neutral host**:
+This package as an execution host that ships no agent roles, planning or review
+workflows, or skills. Role packs and project or global definitions supply every
+named role. An empty catalog is valid, and bare launches need no role.
+_Avoid_: Default role set, privileged pack, starter workflow
 
-**Pinned review evidence**:
-The parent-captured repository identity, base and head SHAs, task/spec text,
-provenance, changed-file inventory, complete diff, and deleted or base-only
-content supplied to reviewers. Dirty state is included only when explicitly
-captured and fingerprinted.
-_Avoid_: Moving-checkout inference, head-only deleted-content review
+**Role pack**:
+A separately installed Pi package that registers role definitions through the
+`pi-herdr-subagents:roles:discover:v1` event. Registered packs form the whole
+package layer below global and project definitions; duplicate names across
+packs are disabled. A pack owns its roles' workflows, skills, prerequisites, and
+workflow glossary.
+_Avoid_: Bundled layer, protected fallback, load-order winner
+
+**Child-context hint**:
+The `PI_SUBAGENT_ID` environment variable set for every fresh or resumed child
+this extension launches, and absent from `/worktree` handoff sessions. It
+distinguishes delegated children from user sessions for tool registration and
+pack state decisions. Nested processes inherit it, so it is not a security
+boundary.
+_Avoid_: Authentication token, permission check, second child protocol
+
+**Deprecated role setting**:
+A valid legacy `roles.bundled` boolean, accepted as a no-op and reported once per
+parent extension load. Malformed values remain configuration errors. The
+extension never rewrites user configuration.
+_Avoid_: Bundled-role toggle, automatic migration
 
 **Role allowlist**:
 The `tools:` inline comma-separated role-frontmatter scalar passed to Pi for a
 public child. It is the enforced capability boundary available to a reviewer.
 `read,bash` is not read-only because Bash can mutate files.
 _Avoid_: Shell-as-read-only claim, implicit capability grant
-
-**Finding record**:
-A bounded review record with a stable ID, claimed P0–P3 severity, nullable
-confirmed severity, separate provenance, evidence status (`reproduced`,
-`trace-backed`, or `unverified`), preconditions, reproduction or trace, expected
-and actual behavior, impact, and minimal fix. An unverified potential P0/P1 is
-a candidate for verification, not a certified finding.
-_Avoid_: Confidence gate, provenance-as-severity, vote count
-
-**Incomplete review**:
-A review outcome for drift, failure, missing or truncated evidence, malformed
-output, coverage gaps, or unresolved serious candidates. A child-reported
-`INCOMPLETE` propagates to the parent result.
-_Avoid_: Hidden missing coverage, certified uncertainty
 
 **Persistent specialist**:
 A logical subagent that retains one policy-bound Pi session between sequential
@@ -193,9 +194,8 @@ model family than the author. For ordinary review, prefer a different
 authenticated model family. When no other authenticated model family is
 available, ordinary review may use a same-family reviewer in a fresh standalone
 session. Disclose that this review is context-isolated, not cross-family
-independent. Cross-family verification, `/skill:orchestrate`, and
-`adversarial-reviewer` must not use this fallback. Family is the independence
-boundary; project policy may separately require a
+independent. Cross-family verification must not use this fallback. Family is
+the independence boundary; project policy may separately require a
 different provider.
 _Avoid_: Generic tier, reviewer-family enforcement, per-step routing
 

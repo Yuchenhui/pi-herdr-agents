@@ -13,8 +13,7 @@ Delegate investigation, implementation, and review without blocking the parent s
 - **Live supervision** — track process and turn state in Pi's subagent widget; interrupt one child turn without destroying its session.
 - **Managed worktrees** — isolate writing agents in retained Herdr workspaces with explicit Git ownership and recovery details.
 - **Conversation handoff** — continue the active Pi conversation in a new worktree with `/worktree` while preserving the parent session.
-- **Orchestrated reviews** — fan out fresh public reviewers and synthesize their evidence in the parent.
-- **Reusable roles** — use bundled agents, project or global definitions, and installable role packs.
+- **Pack-neutral roles** — use project or global definitions and installable role packs; this package ships no default roles or workflows.
 - **Persistent specialists** — retain one policy-bound Pi session for sequential, turn-based tasks.
 
 ## Requirements
@@ -51,6 +50,12 @@ Restart or `/reload` Pi after installation. Review package source before install
 
 ## Quick start
 
+This package is an execution host and ships no agent roles. Named roles come
+from your project or global definitions or from an installed
+[role pack](#publish-a-role-pack). The `scout` examples below assume one of
+those provides `scout`; see [Migrating from bundled roles](#migrating-from-bundled-roles).
+A bare launch without `agent` needs no role.
+
 Ask Pi to delegate naturally:
 
 ```text
@@ -74,7 +79,9 @@ Pi can also call the tool directly:
 ```typescript
 subagent({ name: "Auth scout", agent: "scout", model: "<provider>/<fast-tier-id>", thinking: "low", task: "Map the authentication flow" });
 subagent({ name: "DB scout", agent: "scout", model: "<provider>/<fast-tier-id>", thinking: "low", task: "Map the session schema" });
-// Both return immediately; each result comes back independently.
+// A bare launch needs no installed role.
+subagent({ name: "Auth summary", model: "<provider>/<fast-tier-id>", thinking: "low", task: "Summarize the authentication flow" });
+// All return immediately; each result comes back independently.
 ```
 
 Use ordinary panes for read-only agents. A single or sequential writer can work in the parent checkout; give each parallel independent writing agent a unique managed worktree. The parent acts as coordinator: decompose work, give each child one bounded outcome with its goal, allowed files, verification, and commit instruction, and keep dependent writes sequential. Children are leaves by default; the parent owns integration and final verification. See [Worktree subagents](docs/worktree-subagents.md).
@@ -119,7 +126,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 ### Extensions
 
-**Subagents** — 9 parent-session tools + 7 commands, plus 2 child-only tools:
+**Subagents** — 9 parent-session tools + 3 commands, plus 2 child-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -140,10 +147,6 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
-| `/plan`                    | Start a full planning workflow       |
-| `/iterate`                 | Fork into a subagent for quick fixes |
-| `/btw <question>`          | Open an ephemeral side-question session in a background tab |
-| `/btw-close`               | Close the current BTW session        |
 | `/worktree <name> [task]`  | Continue this session in a new managed worktree (`/worktree list` lists them) |
 | `/subagent <agent> <task>` | Spawn a named agent directly (`/subagent list` lists available agents) |
 | `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences |
@@ -154,47 +157,69 @@ This package distinguishes directly runnable **agent roles**, Pi-native
 **skills**, and authenticated Pi **runtimes**. A multi-stage user outcome may
 be a command or skill that composes roles; it is not itself an agent role.
 
-The current orchestration inventory is:
+The host's own orchestration surfaces are:
 
 | Surface | Entry point | Behavior |
 | --- | --- | --- |
-| Planning | `/plan` | Scout, interactive planner, workers, and reviewer; writes plan artifacts. |
-| Iteration | `/iterate` | Opens one interactive full-context Pi fork. |
-| Side question | `/btw`, `/btw-close` | Opens one replaceable interactive Pi side session. |
+| Delegation | `subagent`, `/subagent <agent> <task>` | Launches one bare or named child; results return automatically. |
 | Worktree handoff | `/worktree <name> [task]`, `/worktree list` | Forks the active conversation into a managed worktree. |
-| Orchestrated review | `/skill:orchestrate` | Parent materializes evidence, fans out public reviewers, and synthesizes results. |
-| Adversarial review | `/skill:orchestrate`, `adversarial-reviewer` | Risk-based public discovery, cross-family verification, and parent synthesis. |
 
-See [ADR-0002](docs/adr/0002-agent-workflow-skill-runtime-taxonomy.md) and
-[ADR-0009](docs/adr/0009-remove-workflow-subsystem.md).
+Planning, review, and other multi-stage workflows belong to role packs and
+skills, not to this package. See
+[ADR-0002](docs/adr/0002-agent-workflow-skill-runtime-taxonomy.md),
+[ADR-0009](docs/adr/0009-remove-workflow-subsystem.md), and
+[ADR-0013](docs/adr/0013-pack-neutral-execution-host.md).
 
-### Bundled visible definitions
+### Roles and role packs
 
-| Definition | Classification | Default runtime | Responsibility |
-| ---------- | -------------- | --------------- | -------------- |
-| **planner** | Coordinator agent role | Config, then parent | Clarifies requirements, explores approaches, and writes plans with ordered tasks. |
-| **scout** | Leaf agent role | Config, then parent | Maps relevant code, conventions, and verification paths. |
-| **worker** | Leaf agent role | Config, then parent | Implements bounded tasks and verifies the result. |
-| **reviewer** | Leaf agent role | Config, then parent | Reviews changes for correctness, security, and maintainability. |
-| **visual-tester** | Leaf agent role | Config, then parent | Performs visual QA through the `chrome-cdp` skill. |
-| **poteto** | Coordinator agent role | Config, then parent | Autonomously investigates, edits minimally, delegates independent work, and verifies. |
-| **adversarial-reviewer** | Coordinator role | Exact eligible authenticated Pi models selected by risk and project policy | Runs two routine or three high-risk discovery reviewers, candidate-dependent cross-family verification, and parent synthesis through public asynchronous children. |
+This package is a pack-neutral execution host: it ships no agent roles, no
+`/plan` command, and no planning or review skills. A named launch resolves
+`agent` from project definitions, global definitions, and roles registered by
+installed role packs, in that precedence order (see below). An empty catalog is
+valid. A bare launch without `agent` always works. An explicitly named role that
+is missing or invalid fails before Herdr creates a pane or worktree; it is never
+silently replaced by a bare agent.
 
 All subagents execute through Pi. Claude models remain available through normal
 Pi provider/model routing. Legacy role definitions that contain `cli` fail before
 Herdr creates a pane or worktree; remove `cli` and `cli-model`, then select an
 authenticated Pi `provider/model-id`.
 
-Optional prerequisites fail closed and are not bundled:
+Role packs own their roles' prerequisites, such as a required skill, and must
+document them. This package does not install role packs or prerequisites.
 
-- `visual-tester` needs an external `chrome-cdp` skill that provides `scripts/cdp.mjs`.
-- Adversarial review needs a resolved standalone `reviewer` role, confirmed human-only authorship or known author model families, and enough distinct exact authenticated Pi models to satisfy project author-family exclusion and cross-family verification. Routine discovery uses two distinct IDs; concrete high-risk surfaces use three distinct lenses. The parent materializes pinned evidence before public fan-out. A project-approved reduced topology must disclose omitted coverage.
-- `/plan` uses the bundled scout and planner roles and records ordered tasks in
-  `plan.md`; it does not require a researcher role, todo tool, or `write-todos` skill.
+### Migrating from bundled roles
 
-This package does not install optional prerequisites.
+Earlier versions bundled seven roles and two workflows. They have moved to
+separately installed packs or have been removed. Nothing is installed
+automatically, and your global and project role files and `config.json` are not
+modified.
 
-Bundled agents use model defaults from `config.json` when configured; otherwise
+| Former bundled surface | Status | Destination |
+| --- | --- | --- |
+| `scout`, `planner`, `worker`, `reviewer`, `adversarial-reviewer`, `visual-tester` roles | Moved | `pi-herdr-roles` role pack |
+| `/plan` command and its plan skill | Moved | `pi-herdr-roles` |
+| `/skill:orchestrate` and its adversarial-review resources | Moved | `pi-herdr-roles` |
+| `poteto` role | Moved | `pi-herdr-pstack` role pack |
+| `/iterate` | Removed, not relocated | Call `subagent({ name, task, fork: true, interactive: true })` directly |
+| `/btw`, `/btw-close` | Removed, not relocated | None |
+| `roles.bundled` setting | Deprecated no-op | Remove it from `config.json` |
+
+Both destination packs are experimental, unpublished candidates; their install
+sources and compatible host versions are not final. Install a role pack with
+`pi install` like any Pi package and enable it beside this extension; a role pack
+stays inert without it. Older versions of this package that still bundle these
+roles, `/plan`, or `orchestrate` collide with the replacement packs: a bundled
+role rejects a same-named pack role, and Pi resolves duplicate commands and
+skills by discovery order. Setting `roles.bundled: false` on an older host only
+removes its roles, not its command or skill. Upgrade the host instead of
+combining an older host with the replacement packs.
+
+Existing `models.agents` preferences keyed by role name keep applying when a
+pack or definition supplies that name. To keep a former role without installing
+a pack, copy its definition into `.pi/agents/` or the global agents directory.
+
+Roles use model defaults from `config.json` when configured; otherwise
 they inherit the parent model. Thinking defaults still come from agent
 frontmatter or the parent level. This resolution chain remains available as a
 fallback, but orchestrators should explicitly set each child's exact
@@ -207,17 +232,16 @@ different model family than the author. For ordinary review, prefer a different
 authenticated model family. When no other authenticated model family is
 available, ordinary review may use a same-family reviewer in a fresh standalone
 session. Disclose that this review is context-isolated, not cross-family
-independent. Cross-family verification, `/skill:orchestrate`, and
-`adversarial-reviewer` must not use this fallback. A stronger model in the same
-family is a quality escalation, not cross-family
+independent. Cross-family verification must not use this fallback. A stronger
+model in the same family is a quality escalation, not cross-family
 independent review. Family is the independence boundary; project policy may
 separately require a different provider.
 
 Discovery loads definitions in **package → global → project** order, so effective
 priority remains **project** (`.pi/agents/`) > **global**
 (`$PI_CODING_AGENT_DIR/agents/`, defaulting to `~/.pi/agent/agents/`) >
-**package**. Package definitions include bundled roles and roles contributed by
-installed Pi role packs. Both `subagents_list` and `/subagent list` show each
+**package**. Package definitions are the roles contributed by installed Pi role
+packs; there is no bundled layer. Both `subagents_list` and `/subagent list` show each
 visible definition's source; contributed roles include their package identity,
 for example `(package:@acme/security-roles)`. A hidden higher-priority definition
 still suppresses a visible lower-priority definition.
@@ -278,7 +302,7 @@ When `activeCount === 0` (every tracked row is open), the border uses an amber a
 
 A fixed internal watchdog marks a run as `stalled` when pane inspection fails or the pane disappears without a completion sidecar; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+**Interactive subagents stay silent.** Long-running user-driven subagents (for example, an interactive planning role or a bare `interactive: true` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and activity snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
 #### Configuration
 
@@ -297,9 +321,6 @@ or re-run `/subagents-init`.
   },
   "models": {
     "agents": {}
-  },
-  "roles": {
-    "bundled": true
   },
   "persistent": {
     "maxAgents": 3
@@ -355,8 +376,8 @@ a reviewer from a different model family than the author. For ordinary review,
 prefer a different authenticated model family. When no other authenticated
 model family is available, ordinary review may use a same-family reviewer in a
 fresh standalone session. Disclose that this review is context-isolated, not
-cross-family independent. Cross-family verification, `/skill:orchestrate`, and
-`adversarial-reviewer` must not use this fallback. Use an exact authenticated
+cross-family independent. Cross-family verification must not use this fallback.
+Use an exact authenticated
 shortlist `provider/model-id` when the
 authoring family is known; `task:review` does not establish independence. Family
 is the independence boundary; project policy may separately require a different
@@ -426,16 +447,21 @@ review requires a reviewer from a different model family than the author. For
 ordinary review, prefer a different authenticated model family. When no other
 authenticated model family is available, ordinary review may use a same-family
 reviewer in a fresh standalone session. Disclose that this review is
-context-isolated, not cross-family independent. Cross-family verification,
-`/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.
-Another route to the same family is not
+context-isolated, not cross-family independent. Cross-family verification
+must not use this fallback. Another route to the same family is not
 independent review. Family is the independence boundary; project policy may
 separately require a different provider. Run `/reload` (or start a new session)
 after writing preferences.
 
 Set `persistent.maxAgents` to the maximum concurrently retained persistent specialists. It defaults to `3`; a persistent spawn at the cap is rejected before Herdr creates a pane or workspace, and no specialist is evicted.
 
-Set `roles.bundled` to `false` to exclude this package's bundled role definitions from listing and exact-name launch. It defaults to `true`. Registered role packs remain available, and global and project definitions keep their existing precedence. A role-pack name collides with a bundled role only while that bundled layer is enabled; when it is disabled, the role pack can supply that name.
+`roles.bundled` is deprecated and has no effect because this package ships no
+roles. Existing `true` and `false` values are accepted so that current
+configuration keeps loading; a parent session reports one warning per extension
+load naming the file and asking you to remove the key. The extension never
+rewrites the file. Other values remain configuration errors, as do unknown keys
+under `roles`. Registered role packs are the entire package layer, and global and
+project definitions keep their precedence over them.
 
 ### Supervision transport
 
@@ -490,11 +516,11 @@ was 4.82 s. The benchmark measures `/proc` CPU ticks for the supervisor and
 isolated Herdr tree, not parent-model latency; raw samples are written to
 `/tmp/issue29-bench/` by `test/bench/supervision-bench.mjs`.
 
-`panes.mode` defaults to `"grouped"` when omitted. Ordinary public `subagent` and `subagent_resume` launches, including bare forks and `/iterate`, fill extension-owned `Agents`, `Agents 2`, etc. tabs in the target checkout's existing workspace. `panes.maxPerTab` is a positive safe integer, defaults to `4`, and counts all live panes in each owned tab, including user-added panes and retained shells. Overlapping launches in one parent respect this cap. It is independent of `persistent.maxAgents`.
+`panes.mode` defaults to `"grouped"` when omitted. Ordinary public `subagent` and `subagent_resume` launches, including bare forks, fill extension-owned `Agents`, `Agents 2`, etc. tabs in the target checkout's existing workspace. `panes.maxPerTab` is a positive safe integer, defaults to `4`, and counts all live panes in each owned tab, including user-added panes and retained shells. Overlapping launches in one parent respect this cap. It is independent of `persistent.maxAgents`.
 
 Checkout matching uses Herdr's canonical `worktree.checkout_path` and includes descendant directories. Shell working directories do not establish workspace ownership. If no checkout matches (including non-Git directories), placement uses the caller's workspace; overflow never creates a workspace. A reviewer with `cwd` set to a managed checkout joins that workspace without creating another worktree. Resume placement uses the saved session's cwd.
 
-Explicit `panes.mode: "tab"` preserves one new tab per ordinary child in the caller's workspace. Explicit `"split"` preserves splits of the stable parent pane. `panes.direction` is `"right"` (default) or `"down"` and applies to grouped and legacy splits. `maxPerTab` does not affect these legacy modes. Managed worktrees retain their separate workspaces, while `/btw` keeps its existing tab behavior.
+Explicit `panes.mode: "tab"` preserves one new tab per ordinary child in the caller's workspace. Explicit `"split"` preserves splits of the stable parent pane. `panes.direction` is `"right"` (default) or `"down"` and applies to grouped and legacy splits. `maxPerTab` does not affect these legacy modes. Managed worktrees retain their separate workspaces.
 
 Ownership is tracked by returned pane/tab/workspace IDs, never labels. Separate parent processes own separate groups; `/reload` preserves a parent's in-memory ownership, but a full restart does not adopt old tabs. Placement never moves existing panes or renames user tabs. Background launches preserve focus; Herdr may resize sibling panes when splitting or closing. User-added panes are never closed by automatic tab cleanup. An owned tab remains reusable while user panes remain, even after all child panes close.
 
@@ -536,12 +562,15 @@ when the extension starts. Run `/reload` after changing it. Package-root
 
 ## Spawning Subagents
 
+Examples that set `agent` assume a role pack or a project/global definition
+supplies that role; this package ships none.
+
 ```typescript
 // Explicit fast-tier runtime for bounded reconnaissance
 subagent({ name: "Scout", agent: "scout", model: "<provider>/<fast-tier-id>", thinking: "low", task: "Analyze the codebase..." });
 
 // Force a full-context fork for this spawn
-subagent({ name: "Iterate", fork: true, model: "<provider>/<mid-tier-id>", thinking: "medium", task: "Fix the bug where..." });
+subagent({ name: "Fix", fork: true, model: "<provider>/<mid-tier-id>", thinking: "medium", task: "Fix the bug where..." });
 
 // Explicit frontier-tier runtime for architecture work
 subagent({ name: "Planner", agent: "planner", model: "<provider>/<frontier-tier-id>", thinking: "high", task: "Work through the design with me" });
@@ -591,7 +620,15 @@ prompts, handoffs, and results.
 
 Use one worktree per parallel independent writing task; a single or sequential writer can work in the parent checkout, and read-only agents use ordinary panes. Omit `worktree` for an ordinary pane; clients whose generated tool schema requires every property may send `worktree: null` with the same effect. `cwd` selects the source Git repository, `branch` must be unique, and `base` is resolved to an exact commit before creation. If `cwd` is a linked checkout, Herdr provisioning uses the principal checkout while the requested checkout supplies the base SHA and manifest provenance. A successful launch from that linked checkout does not itself authorize cleanup there: cleanup checks the canonical principal/source repository under the invoking parent session's cwd, not `manifest.sourceCwd` or shared Git identity. If cleanup is needed, start the parent Pi session rooted at the principal checkout or an ancestor containing it, then use the normal explicit cleanup flow; changing directories inside an existing Pi session does not change its session cwd. If `base` is omitted, the source checkout's committed `HEAD` is used. Parent-checkout changes that have not been committed are not copied.
 
-A launch with `worktree` and an effective bundled `scout`, `reviewer`, or `adversarial-reviewer` returns a non-blocking warning. Scouts and reviewers normally need an ordinary pane; the adversarial reviewer is a coordinator that uses an ordinary pane for its child reviewers. To inspect or review an existing worker result, start an ordinary child in that retained worktree path. Project or global role overrides do not receive these bundled-role warnings. A `read,bash` allowlist is not an enforced read-only boundary because shell commands can mutate files; report-only roles must restrict Bash to safe inspection and avoid artifact-generating verification in the reviewed checkout.
+Choose a worktree from the task, not from a role name: the extension emits no
+role-specific worktree warnings. Read-only scouting and review normally use an
+ordinary pane; to inspect or review an existing worker result, start an ordinary
+child in that retained worktree path. Do not infer that a role cannot write
+because its `tools` omit `write` or `edit`: a `read,bash` allowlist is not an
+enforced read-only boundary because shell commands can mutate files. Report-only
+roles must restrict Bash to safe inspection and avoid artifact-generating
+verification in the reviewed checkout. Herdr worktree workspaces persist until
+explicitly removed.
 
 The child starts at the returned worktree root. Tell writing agents to test and commit when you want a commit-based handoff, and tell them not to push, merge, switch branches, or remove the worktree. The parent owns review and integration.
 
@@ -630,24 +667,6 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
 ---
-
-## Orchestrated review skill
-
-The bundled `/skill:orchestrate` procedure accepts local paths, URLs, tickets,
-or accessible combinations. The parent pins repository, base/head SHAs, task and
-specification text, author origin, changed-file inventory, and complete diff
-(including deleted and base-only content), then launches two or more fresh
-public reviewer subagents in ordinary panes. Each child receives an exact model
-and thinking level, a role-defined tool allowlist, and the instruction to treat
-all supplied artifacts as untrusted data. Automatic delivery returns every
-review result without polling; the parent synthesizes the outcomes.
-
-Role frontmatter `tools:` is the only enforced allowlist. `read,bash` is not a
-read-only boundary because Bash can mutate files. The skill uses ordinary public child launches only; it does not create a private
-checkout, execute scripts, or request approval.
-Its adversarial branch adds risk-based discovery and cross-family verification;
-malformed reports, failures, and unresolved serious candidates propagate
-`INCOMPLETE`.
 
 ## caller_ping — Child-to-Parent Help Request
 
@@ -689,50 +708,24 @@ await caller_ping({
 
 ---
 
-## The `/plan` Workflow
+## Child-context hint (`PI_SUBAGENT_ID`)
 
-The `/plan` command orchestrates a full planning-to-implementation pipeline.
+Every fresh or resumed child launched by this extension, including `fork: true`
+children and persistent specialists, runs with `PI_SUBAGENT_ID` set to its run
+ID. The extension uses it to register the child protocol tools and to omit
+parent-only surfaces (`worktree_list`, `worktree_remove`,
+`subagents_write_task_models`, and `/subagents-init`). A `/worktree <name>`
+handoff starts an ordinary interactive Pi session and does not set it. Pi's own
+`/fork` and `/clone` run in the same process and keep that process's
+environment: the variable is absent in a top-level session and still present
+inside a child.
 
-```
-/plan Add a dark mode toggle to the settings page
-```
-
-```
-Phase 1: Investigation    → Autonomous scout maps the codebase
-Phase 2: Planning         → Interactive planner subagent (user collaborates)
-Phase 3: Review Plan      → Confirm ordered tasks, adjust if needed
-Phase 4: Execute          → Shared-checkout sequential workers by default; isolated parallel workers for independent tasks
-Phase 5: Integrate        → Parent reviews and integrates worktree branches one at a time, only when worktrees are used
-Phase 6: Review           → Reviewer subagent checks the integrated changes
-```
-
-The parent workspace and tab names stay unchanged. Subagents use the configured placement policy; grouped mode reuses available space in owned Agents tabs.
-
----
-
-## The `/iterate` Workflow
-
-For quick, focused work without polluting the main session's context.
-
-```
-/iterate Fix the off-by-one error in the pagination logic
-```
-
-This always forks the current session into a subagent with full conversation context. It does not inherit an agent default `session-mode`. Make the fix, verify it, and exit to return. The main session gets a summary of what was done.
-
----
-
-## The `/btw` Workflow
-
-Use `/btw` for a quick side question without adding a turn to the main session:
-
-```text
-/btw What did we decide about session cleanup?
-```
-
-The extension snapshots the current active conversation branch, opens a non-focused Herdr tab, and starts an interactive Pi session with the same model and thinking level. The answer stays in that tab and is never delivered as a subagent result. A second `/btw` replaces the previous one; `/btw-close` closes it explicitly.
-
-BTW shares the current working directory. It treats inherited work as reference context and modifies the workspace only when the side question explicitly requests it. Cleanup is best effort; if closing fails, the tab remains available for manual recovery.
+Role packs may read `PI_SUBAGENT_ID` as a context hint, for example to avoid
+restoring parent-only session state inside a delegated child. It is not an
+authentication or security boundary: any process can set it, and shell commands
+and nested processes a child runs inherit it, including a `pi` process started
+from the child's Bash tool. Do not grant or deny privileges based on it. There
+is no other parent/child protocol.
 
 ---
 
@@ -765,7 +758,6 @@ not disguise a workflow as an agent definition.
 | Project | `.pi/agents/<name>.md` | The role belongs to one repository |
 | Global | `$PI_CODING_AGENT_DIR/agents/<name>.md` | The role should be available everywhere; the default root is `~/.pi/agent` |
 | Role pack | An installed Pi package's registered `roles/` directory | The role should be independently installable and shareable |
-| Bundled | This package's `agents/<name>.md` | Contributing a fallback role maintained with `pi-herdr-agents` |
 
 The filename stem is the launch key. `name` frontmatter is optional because it
 defaults to the filename stem. If supplied, keep it identical so overrides remain
@@ -886,9 +878,10 @@ the files, derives package name/version from the nearest `package.json`, and
 reports invalid paths, missing descriptions, filename/name mismatches, and
 package-layer collisions in the listing surfaces.
 
-Role packs cannot replace an enabled bundled role, and duplicate role names
-from multiple role packs are disabled rather than resolved by extension load
-order. Use a global or project definition for an intentional override.
+Registered role packs form the whole package layer and have no priority over
+one another: duplicate role names from multiple role packs are disabled with a
+diagnostic rather than resolved by extension load order. Use a global or
+project definition for an intentional override.
 
 See [ADR-0003](docs/adr/0003-installable-role-packs.md) for the registration seam,
 collision rules, and rejected alternatives.
@@ -930,7 +923,7 @@ Compare definitions against the reference below and verify them with
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set exactly `false` to deny all subagent-spawning tools under the exact unquoted key `spawning:`. Only one `true` or `false` declaration is accepted. |
 | `deny-tools`  | string  | One non-empty inline comma-separated `pi-herdr-agents` tool list to suppress under the exact unquoted key `deny-tools:`; this is not a universal cross-extension deny list. YAML lists, containers, multiline values, quotes, comments, noncanonical keys, and duplicates are rejected. |
-| `auto-exit`   | boolean | Auto-shutdown after Pi fully settles when the latest assistant turn does not end with `stopReason: "aborted"` — no `subagent_done` call needed. User input does not permanently disable auto-exit. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown after Pi fully settles when the latest assistant turn does not end with `stopReason: "aborted"` — no `subagent_done` call needed. User input does not permanently disable auto-exit. Recommended for autonomous roles; not for interactive ones the user drives. Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `persistent` | boolean | Keep this role's specialist session open between tasks. Follow-up work uses `subagent_send`; persistent specialists cannot be resumed in v1. |
 | `cwd`         | string  | Default working directory. Absolute paths are unambiguous; relative agent-frontmatter paths resolve from Pi's agent config directory (`PI_CODING_AGENT_DIR` or `~/.pi/agent`), not the project root                                                                                                                                                                                                            |
@@ -938,7 +931,7 @@ Compare definitions against the reference below and verify them with
 
 ---
 
-Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
+Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or role-pack agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
 
 ### `session-mode`
 
@@ -950,7 +943,7 @@ Choose how a subagent session starts:
 
 `lineage-only` is useful when you want session discovery and fork lineage UX to show the relationship later, but you do **not** want the child to inherit the parent's turns.
 
-`fork: true` on the tool call forces `fork` mode; `fork: false` forces `standalone` mode. Omitting `fork` inherits the agent's frontmatter `session-mode`. `/iterate` uses the explicit `true` override on purpose.
+`fork: true` on the tool call forces `fork` mode; `fork: false` forces `standalone` mode. Omitting `fork` inherits the agent's frontmatter `session-mode`.
 
 ```yaml
 ---
@@ -972,8 +965,8 @@ When set to `true`, the agent session shuts down on Pi's `agent_settled` event u
 
 **When to use:**
 
-- ✅ Autonomous agents (scout, worker, reviewer) that run to completion
-- ❌ Interactive agents (planner, iterate) where the user drives the session
+- ✅ Autonomous roles, such as scouting, implementation, or review, that run to completion
+- ❌ Interactive roles or `interactive: true` forks where the user drives the session
 
 ```yaml
 ---
@@ -986,7 +979,7 @@ auto-exit: true
 
 Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
 
-**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; named agents without `auto-exit` are interactive and stay quiet. Bare spawns have no agent definition and default to autonomous auto-exit behavior. `/iterate` is interactive because it explicitly passes `interactive: true`.
+**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; named agents without `auto-exit` are interactive and stay quiet. Bare spawns have no agent definition and default to autonomous auto-exit behavior; they become interactive only when the call passes `interactive: true`.
 
 **Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
 
@@ -1038,15 +1031,13 @@ deny-tools: subagent
 
 ### Recommended Configuration
 
-| Agent | `spawning` | Rationale |
+| Role shape | `spawning` | Rationale |
 | --- | --- | --- |
-| planner | *(default)* | Can spawn scouts for investigation. |
-| poteto | `true` | Delegates independent work. |
-| adversarial-reviewer | `true` | Compatibility coordinator; launches bounded discovery, conditional verification, and synthesis children. It sets `auto-exit: false` so automatic child-result steers can drive every wave, then calls `subagent_done`. |
-| worker | `false` | Implements bounded tasks. |
-| reviewer | `false` | Reviews without delegation. |
-| scout | `false` | Gathers context without delegation. |
-| visual-tester | `false` | Performs visual QA without delegation. |
+| Leaf (scouting, implementation, review, QA) | `false` | Performs one bounded responsibility without delegation. |
+| Coordinator | `true` | Delegates bounded children; a multi-wave coordinator sets `auto-exit: false` so automatic child-result steers drive each wave, then calls `subagent_done`. |
+| Interactive collaborator | *(default)* | May delegate factual gaps while the user drives the session. |
+
+Each role pack documents the settings of the roles it ships.
 
 ---
 

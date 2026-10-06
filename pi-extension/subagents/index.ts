@@ -12,9 +12,8 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import type { Task } from "../../maestro/core/types.ts";
@@ -74,10 +73,7 @@ import {
 	getSubagentsConfigExamplePath,
 	getSubagentsConfigPath,
 } from "./config-path.ts";
-import {
-	loadRoleConfig,
-	type RoleConfig,
-} from "../../maestro/core/config/role-config.ts";
+import { loadRoleConfig } from "../../maestro/core/config/role-config.ts";
 import {
 	loadPersistentConfig,
 	type PersistentConfig,
@@ -126,9 +122,6 @@ import type {
 	WorktreeHandoff,
 	WorktreeLaunch,
 } from "../../maestro/core/worktree.ts";
-
-/** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
-const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 // Survive /reload: replace presentation timers while keeping active completion
 // watchers and their registry alive. Old module closures continue watching the
@@ -191,7 +184,7 @@ function buildSubagentRoutingGuidelines(
 					"For orchestrated subagent work, explicitly set both model and thinking for every child: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.",
 					"Use fast tier for bounded mechanical work and recon, mid tier for ordinary implementation or review, and frontier tier for architecture, security, hard diagnosis, or adversarial review. Use minimal/low thinking for mechanical work, medium for ordinary work, and high+ for hard work.",
 				]),
-		"For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Use an exact authenticated provider/model-id from the live catalog below, never an alias or fuzzy name.",
+		"For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification must not use this fallback. Use an exact authenticated provider/model-id from the live catalog below, never an alias or fuzzy name.",
 		"Omitting model and thinking still inherits the parent runtime, but this is a discouraged fallback for orchestrated children.",
 		"Before launching a new group of subagents, choose a short task slug and name each new child <task>-<role>[-n], for example login-api or login-test2. Use only plan, research, ui, api, build, test, review, browser, security, perf, or merge as roles; leave existing names unchanged. After the final launch, print name | agent kind | role | model | worktree (if any), then use each name in prompts, handoffs, and results.",
 		catalog ??
@@ -218,7 +211,7 @@ const SubagentParams = Type.Object({
 	agent: Type.Optional(
 		Type.String({
 			description:
-				"Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Discovery precedence is project .pi/agents, global ~/.pi/agent/agents, then package-bundled agents.",
+				"Role definition name to load defaults from. Discovery precedence is project .pi/agents, global ~/.pi/agent/agents, then installed role packs; this extension ships no roles. A missing name fails before launch. Omit for a bare agent.",
 		}),
 	),
 	systemPrompt: Type.Optional(
@@ -230,7 +223,7 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Explicitly pick an exact authenticated provider/model-id, an ordered comma-separated fallback list, or task:<category> as the entire value. task: categories are case-insensitive and expand configured authenticated candidates; worktrees use only the first. For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Omitting still inherits the parent model; do not omit for orchestrated children. Fallback lists cannot be used with worktrees.",
+				"Explicitly pick an exact authenticated provider/model-id, an ordered comma-separated fallback list, or task:<category> as the entire value. task: categories are case-insensitive and expand configured authenticated candidates; worktrees use only the first. For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification must not use this fallback. Omitting still inherits the parent model; do not omit for orchestrated children. Fallback lists cannot be used with worktrees.",
 		}),
 	),
 	thinking: Type.Optional(ThinkingLevelSchema),
@@ -332,19 +325,10 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
 	return denied;
 }
 
-function getBundledAgentsDir(): string {
-	return join(SUBAGENTS_DIR, "../../agents");
-}
-
-function discoverAgentCatalog(
-	pi?: Pick<ExtensionAPI, "events">,
-	roleConfig: RoleConfig = bundledRoleConfig,
-): AgentCatalog {
+function discoverAgentCatalog(pi?: Pick<ExtensionAPI, "events">): AgentCatalog {
 	return discoverCoreAgentCatalog({
-		bundledAgentsDir: getBundledAgentsDir(),
 		agentConfigDir: getAgentConfigDir(),
 		cwd: process.cwd(),
-		roleConfig,
 		onRolePackDiscovered: pi?.events
 			? (event) => pi.events.emit(ROLE_PACK_DISCOVERY_EVENT, event)
 			: undefined,
@@ -355,6 +339,10 @@ function discoverAgentDefinitions(
 	pi?: Pick<ExtensionAPI, "events">,
 ): ListedAgentDefinition[] {
 	return discoverAgentCatalog(pi).agents;
+}
+
+function missingRoleMessage(agentName: string): string {
+	return `Agent "${agentName}" was not found. pi-herdr-agents ships no roles: define it in .pi/agents or the global agents directory, install a role pack that provides it, or omit agent for a bare launch.`;
 }
 
 function formatAgentSource(agent: ListedAgentDefinition): string {
@@ -441,14 +429,12 @@ function resolveLaunchBehavior(
  *   1. Explicit `interactive` tool parameter wins.
  *   2. Explicit `interactive` frontmatter field on the agent.
  *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
+ *      autonomous and the parent session should be woken on stall/recovery
+ *      transitions. Agents that don't auto-exit are driven by the user in
+ *      their own pane, and stall pings are noise.
  *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
- * subagent is treated as interactive — matching the intent of iterate.
+ * Bare `subagent({ name, task })` calls have no agent defs; they auto-exit
+ * unless the caller passes `interactive: true`.
  */
 function resolveEffectivePersistent(
 	params: Static<typeof SubagentParams>,
@@ -465,7 +451,7 @@ function resolveEffectiveAutoExit(
 	// Named agents preserve their declared behavior. Bare tool calls are
 	// autonomous by default, including full-context forks: `fork` controls
 	// context inheritance, not whether the child should remain open. Interactive
-	// flows such as /iterate opt out explicitly with `interactive: true`.
+	// bare launches opt out explicitly with `interactive: true`.
 	if (agentDefs) return agentDefs.autoExit ?? false;
 	return params.interactive !== true;
 }
@@ -483,12 +469,10 @@ function resolveEffectiveInteractive(
 function loadAgentDefaults(
 	agentName: string,
 	pi?: Pick<ExtensionAPI, "events">,
-	roleConfig?: RoleConfig,
 ): ListedAgentDefinition | null {
 	return (
-		discoverAgentCatalog(pi, roleConfig).agents.find(
-			(agent) => agent.name === agentName,
-		) ?? null
+		discoverAgentCatalog(pi).agents.find((agent) => agent.name === agentName) ??
+		null
 	);
 }
 
@@ -517,42 +501,12 @@ function shouldRetainSubagentSurface(
 	return !!running.worktree;
 }
 
-const BUNDLED_WORKTREE_WARNINGS = {
-	scout:
-		"The bundled scout role is read-only and normally does not need a new worktree. " +
-		"Use an ordinary pane instead; to inspect an existing worker result, start it in the retained worktree path. " +
-		"Herdr worktree workspaces persist until explicitly removed.",
-	reviewer:
-		"The bundled reviewer role is read-only and normally does not need a new worktree. " +
-		"Use an ordinary pane instead; to review an existing worker result, start it in the retained worktree path. " +
-		"Herdr worktree workspaces persist until explicitly removed.",
-	"adversarial-reviewer":
-		"The bundled adversarial-reviewer coordinates read-only reviewers and does not write artifacts in the reviewed checkout. " +
-		"It normally uses an ordinary pane, not a new worktree. " +
-		"Herdr worktree workspaces persist until explicitly removed.",
-} satisfies Readonly<Record<string, string>>;
-
-function resolveWorktreeLaunchWarning(
-	params: Pick<Static<typeof SubagentParams>, "agent" | "worktree">,
-	pi?: Pick<ExtensionAPI, "events">,
-	roleConfig?: RoleConfig,
-): string | undefined {
-	if (!params.worktree || !params.agent) return undefined;
-	const warning = Object.entries(BUNDLED_WORKTREE_WARNINGS).find(
-		([agent]) => agent === params.agent,
-	)?.[1];
-	const definition = loadAgentDefaults(params.agent, pi, roleConfig);
-	return warning && dirname(definition?.path ?? "") === getBundledAgentsDir()
-		? warning
-		: undefined;
-}
-
 const statusConfig = loadStatusConfig(
 	getSubagentsConfigPath(),
 	getSubagentsConfigExamplePath(),
 );
 const modelConfig = loadModelConfig(getSubagentsConfigDir());
-const bundledRoleConfig = loadRoleConfig(
+const roleConfig = loadRoleConfig(
 	getSubagentsConfigDir(),
 	getSubagentsConfigExamplePath(),
 );
@@ -851,7 +805,7 @@ interface RunningSubagent {
 	 * When true, status transitions (stalled/recovered) do not wake the parent
 	 * session via a steer message. The widget still updates locally. Used for
 	 * long-running agents where the user drives the conversation in the
-	 * subagent's pane (e.g. planner).
+	 * subagent's pane.
 	 */
 	interactive: boolean;
 	/** Parent-resolved model/thinking selection and provenance. */
@@ -1846,7 +1800,6 @@ export const __test__ = {
 	notifyPersistentCrash,
 	sendSubagentResult,
 	shouldRetainSubagentSurface,
-	resolveWorktreeLaunchWarning,
 	formatLivePersistentSpecialists,
 	runningSubagents,
 	formatElapsed,
@@ -1895,9 +1848,7 @@ function normalizePiAttempt(
 		const diagnostic = discoverAgentCatalog(runtime.pi).diagnostics.find(
 			(candidate) => candidate.agentName === params.agent,
 		);
-		throw new Error(
-			diagnostic?.message ?? `Agent "${params.agent}" was not found.`,
-		);
+		throw new Error(diagnostic?.message ?? missingRoleMessage(params.agent));
 	}
 	if (!ctx.model)
 		throw new Error("Subagent launch requires a resolved parent model");
@@ -1975,9 +1926,7 @@ function resolveSubagentRuntimePlans(
 		const diagnostic = discoverAgentCatalog(runtime.pi).diagnostics.find(
 			(candidate) => candidate.agentName === params.agent,
 		);
-		throw new Error(
-			diagnostic?.message ?? `Agent "${params.agent}" was not found.`,
-		);
+		throw new Error(diagnostic?.message ?? missingRoleMessage(params.agent));
 	}
 	if (!ctx.model)
 		throw new Error("Subagent launch requires a resolved parent model");
@@ -2348,6 +2297,9 @@ export default function subagentsExtension(
 		runtime.session,
 	);
 	const parentSession = !process.env.PI_SUBAGENT_ID;
+	// Report accepted no-op role settings once per parent extension load, not on
+	// every session transition, listing, or child launch.
+	let roleConfigDeprecationsReported = !parentSession;
 	const cleanupInput = (ctx: ExtensionContext) => ({
 		cwd: ctx.cwd,
 		operations:
@@ -2371,6 +2323,11 @@ export default function subagentsExtension(
 	// subagents whose watchers survived a reload.
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.latestCtx = ctx;
+		if (!roleConfigDeprecationsReported) {
+			roleConfigDeprecationsReported = true;
+			for (const message of roleConfig.deprecations)
+				ctx.ui.notify(message, "warning");
+		}
 		const registry = wrapPiModelRegistry(ctx.modelRegistry);
 		const authenticatedTaskPreferences = getAuthenticatedTaskPreferences(
 			registry,
@@ -2425,7 +2382,7 @@ export default function subagentsExtension(
 			// Do not infer ownership or reconstruct their watchers.
 			cleanupSubagentsForShutdown(event.reason, runningSubagents);
 			// The coordinator is already closed synchronously. Clear only this owner
-			// before the BTW await so another in-process host cannot adopt it.
+			// before the shutdown await so another in-process host cannot adopt it.
 			if (runtime.session === session) runtime.session = undefined;
 		}
 		await shutdown;
@@ -2572,7 +2529,7 @@ export default function subagentsExtension(
 			parameters: SubagentParams,
 
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-				// Prevent self-spawning (e.g. planner spawning another planner)
+				// Prevent a named role from spawning another instance of itself
 				const currentAgent = process.env.PI_SUBAGENT_AGENT;
 				if (params.agent && currentAgent && params.agent === currentAgent) {
 					return {
@@ -2657,10 +2614,6 @@ export default function subagentsExtension(
 					ctx,
 					parentThinking,
 				);
-				const worktreeLaunchWarning = resolveWorktreeLaunchWarning(
-					params,
-					runtime.pi,
-				);
 				runtime.latestCtx = ctx;
 				const id = randomUUID();
 				const first = normalizePiAttempt(params, ctx, parentThinking, {
@@ -2672,7 +2625,6 @@ export default function subagentsExtension(
 				const input: PiLaunchInput = {
 					...first,
 					plans: [plan, ...fallbacks],
-					warning: worktreeLaunchWarning,
 					prepareAttempt: () =>
 						normalizePiAttempt(params, ctx, parentThinking, {
 							id,
@@ -2700,9 +2652,6 @@ export default function subagentsExtension(
 								(running.worktree
 									? ` in worktree ${running.worktree.path} on branch ${running.worktree.branch}. `
 									: ". ") +
-								(worktreeLaunchWarning
-									? `Warning: ${worktreeLaunchWarning} `
-									: "") +
 								`Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
 								`The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
 								`Until then, move on to other work or tell the user you're waiting.`,
@@ -3147,72 +3096,6 @@ export default function subagentsExtension(
 			},
 		});
 
-	pi.registerCommand("btw", {
-		description:
-			"Open an ephemeral side-question session in a background Herdr tab",
-		handler: async (args, ctx) => {
-			const question = args.trim();
-			if (!question) {
-				ctx.ui.notify("Usage: /btw <question>", "warning");
-				return;
-			}
-			if (!runtime.session!.availability().available) {
-				ctx.ui.notify(runtime.session!.availability().setupHint, "error");
-				return;
-			}
-			try {
-				await ctx.waitForIdle();
-
-				const parentSessionFile = ctx.sessionManager.getSessionFile();
-				const leafId = ctx.sessionManager.getLeafId();
-				if (!parentSessionFile || !leafId) {
-					throw new Error("No completed session context is available for BTW");
-				}
-				if (!ctx.model) throw new Error("No parent model is selected");
-
-				const thinking = pi.getThinkingLevel();
-				if (!isThinkingLevel(thinking))
-					throw new Error(`Unsupported parent thinking level: ${thinking}`);
-				await runtime.session!.openBtw({
-					question,
-					parentSessionFile,
-					leafId,
-					cwd: ctx.cwd,
-					invocationCwd: process.cwd(),
-					sessionDir: ctx.sessionManager.getSessionDir(),
-					sessionId: ctx.sessionManager.getSessionId(),
-					model: `${ctx.model.provider}/${ctx.model.id}`,
-					thinking,
-					agentDir: process.env.PI_CODING_AGENT_DIR,
-				});
-				ctx.ui.notify("BTW opened in a background Herdr tab.", "info");
-			} catch (error) {
-				ctx.ui.notify(
-					`BTW failed: ${error instanceof Error ? error.message : String(error)}`,
-					"error",
-				);
-			}
-		},
-	});
-
-	pi.registerCommand("btw-close", {
-		description: "Close the current BTW side-question session",
-		handler: async (_args, ctx) => {
-			try {
-				if (!(await runtime.session!.closeBtw())) {
-					ctx.ui.notify("No BTW session is open.", "info");
-					return;
-				}
-				ctx.ui.notify("BTW session closed.", "info");
-			} catch (error) {
-				ctx.ui.notify(
-					`Could not close BTW session: ${error instanceof Error ? error.message : String(error)}`,
-					"warning",
-				);
-			}
-		},
-	});
-
 	pi.registerCommand("worktree", {
 		description: parentSession
 			? "Fork into a worktree, list retained worktrees, or explicitly remove one"
@@ -3357,19 +3240,6 @@ export default function subagentsExtension(
 		},
 	});
 
-	// /iterate command — fork the session into a subagent
-	pi.registerCommand("iterate", {
-		description:
-			"Fork session into a subagent for focused work (bugfixes, iteration)",
-		handler: async (args, _ctx) => {
-			const task = args.trim() || "";
-			const toolCall = task
-				? `Use subagent to fork an interactive session. fork: true, interactive: true, name: "Iterate", task: ${JSON.stringify(task)}`
-				: `Use subagent to fork an interactive session. fork: true, interactive: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
-			pi.sendUserMessage(toolCall);
-		},
-	});
-
 	// /subagent command — spawn a subagent by name, or list available agents
 	pi.registerCommand("subagent", {
 		description:
@@ -3407,7 +3277,7 @@ export default function subagentsExtension(
 					(candidate) => candidate.agentName === agentName,
 				);
 				ctx.ui.notify(
-					diagnostic?.message ?? `Agent "${agentName}" not found.`,
+					diagnostic?.message ?? missingRoleMessage(agentName),
 					"error",
 				);
 				return;
@@ -3606,25 +3476,5 @@ export default function subagentsExtension(
 				return ["", ...box.render(width)];
 			},
 		};
-	});
-
-	// /plan command — start the full planning workflow
-	pi.registerCommand("plan", {
-		description: "Start a planning session: /plan <what to build>",
-		handler: async (args, ctx) => {
-			const task = args.trim();
-			if (!task) {
-				ctx.ui.notify("Usage: /plan <what to build>", "warning");
-				return;
-			}
-
-			// Load the plan skill from the subagents extension directory
-			const planSkillPath = join(SUBAGENTS_DIR, "plan-skill.md");
-			let content = readFileSync(planSkillPath, "utf8");
-			content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
-			pi.sendUserMessage(
-				`<skill name="plan" location="${planSkillPath}">\n${content.trim()}\n</skill>\n\n${task}`,
-			);
-		},
 	});
 }

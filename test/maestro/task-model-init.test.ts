@@ -105,7 +105,7 @@ test("Task17 composes the complete active projection and preserves the exact acc
 	// Golden SHA-256 captured from the accepted pre-migration formatter and these complete facts.
 	assert.equal(
 		createHash("sha256").update(prompt).digest("hex"),
-		"bef2d22abaf4acec2c7b01a3c26f8408b2329027b11ebef3c6560bb7e71e9fc6",
+		"97c790122e9385f2540bfab4deafb6d2abb3e39987809b29d8a456b1d13a4079",
 	);
 	const unknown = initializeTaskModels({
 		projectActiveRegistry: (project: TaskModelRegistryProjector) =>

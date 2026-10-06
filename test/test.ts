@@ -60,7 +60,6 @@ import {
 	copySessionFile,
 	mergeNewEntries,
 	seedSubagentSessionFile,
-	createBtwSessionSnapshot,
 	createWorktreeSessionFork,
 	getSubagentSessionPolicyFile,
 	readSubagentSessionPolicy,
@@ -722,11 +721,16 @@ describe("host adapter migration", () => {
 	it("quit then a second host load creates a healthy coordinator without resetting the global session", async () =>
 		withAdapterHost(async (f) => {
 			const first = f.runtime.session;
-			let finishBtw!: () => void;
-			const btw = new Promise<boolean>((resolve) => {
-				finishBtw = () => resolve(false);
+			let finishShutdown!: () => void;
+			const shutdownGate = new Promise<void>((resolve) => {
+				finishShutdown = resolve;
 			});
-			f.patch(first, "closeBtw", () => btw);
+			const closeFirst = first.shutdown.bind(first);
+			// Hold the old owner's asynchronous shutdown open across a second load.
+			f.patch(first, "shutdown", async (reason: any) => {
+				await closeFirst(reason);
+				await shutdownGate;
+			});
 			const shutdown = f.mock.eventHandlers.get("session_shutdown")[0];
 			const quitting = shutdown({ reason: "quit" }, { ui: { setWidget() {} } });
 			const wake = new FileWakeRegistry();
@@ -763,7 +767,7 @@ describe("host adapter migration", () => {
 					watcherCount: 1,
 				});
 				const second = f.runtime.session;
-				finishBtw();
+				finishShutdown();
 				await quitting;
 				assert.equal(
 					f.runtime.session,
@@ -773,7 +777,7 @@ describe("host adapter migration", () => {
 				await f.finish(child);
 				assert.equal(next.sentMessages.length, 1);
 			} finally {
-				finishBtw();
+				finishShutdown();
 				await quitting;
 				supervision.close();
 				wake.close();
@@ -1456,6 +1460,27 @@ describe("host adapter migration", () => {
 					true,
 				);
 			}));
+	it("fails a missing named role before any pane or worktree and never launches it bare", async () =>
+		withAdapterHost(async (f) => {
+			let worktrees = 0;
+			f.patch(f.launchOperations, "createWorktree", () => {
+				worktrees++;
+				throw new Error("must not create a worktree");
+			});
+			for (const worktree of [undefined, { branch: "missing-role" }])
+				for (const agent of ["scout", "missing-fixture-role"])
+					await assert.rejects(
+						f.launch({ name: "missing", task: "bounded", agent, worktree }),
+						new RegExp(
+							`Agent "${agent}" was not found\\. pi-herdr-agents ships no roles`,
+						),
+					);
+			assert.equal(worktrees, 0);
+			assert.equal(f.commands.length, 0);
+			assert.equal(f.surface.listSurfaces().length, 0);
+			assert.equal(f.runtime.runningSubagents.size, 0);
+			assert.equal(f.registrations(), 0);
+		}));
 	it("public resume prelaunch transcript rejection acquires nothing", async () =>
 		withAdapterHost(async (f) => {
 			const path = join(f.projectDir, "unreadable.jsonl");
@@ -2617,126 +2642,6 @@ describe("session.ts", () => {
 		});
 	});
 
-	describe("createBtwSessionSnapshot", () => {
-		it("copies only the selected active branch without changing the parent", () => {
-			const timestamp = "2026-07-31T00:00:00.000Z";
-			const parentFile = createSessionFile(dir, [
-				{ type: "session", version: 3, id: "btw-parent", timestamp, cwd: dir },
-				{
-					type: "message",
-					id: "root-user",
-					parentId: null,
-					timestamp,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "root" }],
-						timestamp: 1,
-					},
-				},
-				{
-					type: "message",
-					id: "root-assistant",
-					parentId: "root-user",
-					timestamp,
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: "base" }],
-						timestamp: 2,
-					},
-				},
-				{
-					type: "message",
-					id: "abandoned-user",
-					parentId: "root-assistant",
-					timestamp,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "abandoned" }],
-						timestamp: 3,
-					},
-				},
-				{
-					type: "message",
-					id: "abandoned-assistant",
-					parentId: "abandoned-user",
-					timestamp,
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: "old" }],
-						timestamp: 4,
-					},
-				},
-				{
-					type: "message",
-					id: "active-user",
-					parentId: "root-assistant",
-					timestamp,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "active" }],
-						timestamp: 5,
-					},
-				},
-				{
-					type: "message",
-					id: "active-assistant",
-					parentId: "active-user",
-					timestamp,
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: "current" }],
-						timestamp: 6,
-					},
-				},
-			]);
-			const parentBefore = readFileSync(parentFile, "utf8");
-
-			const childFile = createBtwSessionSnapshot(
-				parentFile,
-				"active-assistant",
-			);
-			const child = SessionManager.open(childFile);
-			const childIds = child.getEntries().map((entry) => entry.id);
-
-			assert.deepEqual(childIds, [
-				"root-user",
-				"root-assistant",
-				"active-user",
-				"active-assistant",
-			]);
-			assert.equal(child.getHeader()?.parentSession, parentFile);
-			assert.equal(readFileSync(parentFile, "utf8"), parentBefore);
-		});
-
-		it("fails when Pi does not persist the child snapshot", () => {
-			// Pi 1.0.0 persists a branched session as soon as it contains any user
-			// or assistant message, so the branch must end at a non-conversation
-			// entry for createBranchedSession to return an unwritten file path.
-			const timestamp = "2026-07-31T00:00:00.000Z";
-			const parentFile = createSessionFile(dir, [
-				{
-					type: "session",
-					version: 3,
-					id: "btw-no-conversation",
-					timestamp,
-					cwd: dir,
-				},
-				{
-					type: "thinking_level_change",
-					id: "only-thinking-level",
-					parentId: null,
-					timestamp,
-					thinkingLevel: "medium",
-				},
-			]);
-
-			assert.throws(
-				() => createBtwSessionSnapshot(parentFile, "only-thinking-level"),
-				/did not persist/i,
-			);
-		});
-	});
-
 	describe("mergeNewEntries", () => {
 		it("appends new entries from source to target", () => {
 			// Source starts with same base (2 entries), then has 1 new entry
@@ -3462,12 +3367,12 @@ describe("shared subagent configuration path", () => {
 				assert.deepEqual(loadModelConfig(dirname(getSubagentsConfigPath())), {
 					agents: {},
 				});
-				assert.equal(
+				assert.deepEqual(
 					loadRoleConfig(
 						dirname(getSubagentsConfigPath()),
 						getSubagentsConfigExamplePath(),
-					).bundled,
-					true,
+					).deprecations,
+					[],
 				);
 				assert.equal(
 					loadPaneConfig(
@@ -3527,13 +3432,12 @@ describe("shared subagent configuration path", () => {
 					loadModelConfig(dirname(getSubagentsConfigPath())).default,
 					"fake/default",
 				);
-				assert.equal(
-					loadRoleConfig(
-						dirname(getSubagentsConfigPath()),
-						getSubagentsConfigExamplePath(),
-					).bundled,
-					false,
-				);
+				const [deprecation, ...extra] = loadRoleConfig(
+					dirname(getSubagentsConfigPath()),
+					getSubagentsConfigExamplePath(),
+				).deprecations;
+				assert.deepEqual(extra, []);
+				assert.ok(deprecation.includes(configPath));
 				assert.equal(
 					loadPaneConfig(
 						dirname(getSubagentsConfigPath()),
@@ -3738,6 +3642,84 @@ describe("runtime reload configuration", () => {
 			assert.ok(runtimeSlot[runtimeKey]?.session);
 		} finally {
 			runtimeSlot[runtimeKey] = beforeRuntime;
+		}
+	});
+
+	it("reports a legacy roles.bundled value once per parent load without rewriting config", async () => {
+		// SAFETY: pi-herdr-agents owns this process-local runtime symbol.
+		const runtimeSlot = globalThis as RuntimeSlot;
+		const beforeRuntime = runtimeSlot[runtimeKey];
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousId = process.env.PI_SUBAGENT_ID;
+		const dir = createTestDir();
+		const loaded: ReturnType<typeof createMockExtensionApi>[] = [];
+		const startSessions = async (
+			mock: ReturnType<typeof createMockExtensionApi>,
+			reasons: string[],
+		) => {
+			const notices: string[] = [];
+			const ctx = {
+				cwd: dir,
+				hasUI: true,
+				modelRegistry: { find: () => undefined, getAvailable: () => [] },
+				ui: {
+					notify: (text: string, level: string) =>
+						notices.push(`${level}: ${text}`),
+				},
+			};
+			for (const reason of reasons)
+				for (const handler of mock.eventHandlers.get("session_start") ?? [])
+					await handler({ reason }, ctx);
+			return notices;
+		};
+		try {
+			process.env.PI_CODING_AGENT_DIR = dir;
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			for (const bundled of [true, false]) {
+				const raw = `${JSON.stringify(
+					{
+						...JSON.parse(
+							readFileSync(getSubagentsConfigExamplePath(), "utf8"),
+						),
+						roles: { bundled },
+					},
+					null,
+					2,
+				)}\n`;
+				writeFileSync(configPath, raw);
+
+				delete process.env.PI_SUBAGENT_ID;
+				const parent = createMockExtensionApi();
+				loaded.push(parent);
+				(await importReloadedSubagents()).default(parent.api);
+				const notices = await startSessions(parent, ["startup", "new"]);
+				assert.equal(notices.length, 1, notices.join("\n"));
+				assert.match(
+					notices[0],
+					new RegExp(
+						`^warning: Deprecated setting roles\\.bundled \\(${bundled}\\)`,
+					),
+				);
+				assert.ok(notices[0].includes(configPath));
+				assert.match(notices[0], /no longer ships bundled roles/);
+				assert.match(notices[0], /remove roles\.bundled/);
+				assert.equal(readFileSync(configPath, "utf8"), raw);
+
+				process.env.PI_SUBAGENT_ID = "legacy-config-child";
+				const child = createMockExtensionApi();
+				loaded.push(child);
+				(await importReloadedSubagents()).default(child.api);
+				assert.deepEqual(await startSessions(child, ["startup"]), []);
+			}
+		} finally {
+			for (const mock of loaded)
+				for (const handler of mock.eventHandlers.get("session_shutdown") ?? [])
+					await handler({ reason: "quit" }, { ui: { setWidget() {} } });
+			restoreEnvVar("PI_SUBAGENT_ID", previousId);
+			restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+			runtimeSlot[runtimeKey] = beforeRuntime;
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });
@@ -4044,9 +4026,9 @@ describe("model configuration", () => {
 				loadModelConfig(dirname(configPath)).tasks?.coding?.[0],
 				"fake/worker",
 			);
-			assert.equal(
-				loadRoleConfig(dirname(configPath), examplePath).bundled,
-				true,
+			assert.deepEqual(
+				loadRoleConfig(dirname(configPath), examplePath).deprecations,
+				[],
 			);
 			assert.equal(
 				loadPaneConfig(dirname(configPath), examplePath).mode,
@@ -4587,9 +4569,26 @@ describe("supervision", () => {
 });
 
 describe("role configuration", () => {
-	it("defaults bundled roles to enabled when omitted", () => {
-		assert.deepEqual(parseRoleConfig({}), { bundled: true });
-		assert.deepEqual(parseRoleConfig({ roles: {} }), { bundled: true });
+	it("has no deprecations when the legacy key is omitted", () => {
+		assert.deepEqual(parseRoleConfig({}), { deprecations: [] });
+		assert.deepEqual(parseRoleConfig({ roles: {} }), { deprecations: [] });
+	});
+
+	it("accepts both legacy bundled booleans as deprecated no-ops", () => {
+		for (const bundled of [true, false]) {
+			const { deprecations } = parseRoleConfig(
+				{ roles: { bundled } },
+				"/agent/herdr-agents/config.json",
+			);
+			assert.equal(deprecations.length, 1);
+			assert.match(
+				deprecations[0],
+				new RegExp(`roles\\.bundled \\(${bundled}\\).*is ignored`),
+			);
+			assert.match(deprecations[0], /\/agent\/herdr-agents\/config\.json/);
+			assert.match(deprecations[0], /Install a role pack/);
+			assert.match(deprecations[0], /The file was not changed/);
+		}
 	});
 
 	it("rejects explicit null and non-object role settings", () => {
@@ -4599,12 +4598,16 @@ describe("role configuration", () => {
 				/roles must be an object/,
 			);
 		}
-		for (const bundled of [null, "false", []]) {
+		for (const bundled of [null, "false", [], 0]) {
 			assert.throws(
 				() => parseRoleConfig({ roles: { bundled } }),
 				/roles\.bundled must be a boolean/,
 			);
 		}
+		assert.throws(
+			() => parseRoleConfig({ roles: { bundled: true, packs: [] } }),
+			/roles has unsupported key\(s\): packs/,
+		);
 	});
 
 	it("loads the shared example when local config is absent", () => {
@@ -4612,10 +4615,17 @@ describe("role configuration", () => {
 			const examplePath = join(dir, "config.json.example");
 			writeFileSync(examplePath, JSON.stringify({ roles: { bundled: false } }));
 
-			assert.deepEqual(loadRoleConfig(dir, examplePath), {
-				bundled: false,
-			});
+			const { deprecations } = loadRoleConfig(dir, examplePath);
+			assert.equal(deprecations.length, 1);
+			assert.ok(deprecations[0].includes(examplePath));
 		});
+	});
+
+	it("ships an example configuration without the legacy key", () => {
+		const example = JSON.parse(
+			readFileSync(getSubagentsConfigExamplePath(), "utf8"),
+		);
+		assert.equal(Object.hasOwn(example, "roles"), false);
 	});
 
 	it("rejects malformed bundled-role settings without falling back", () => {
@@ -4626,16 +4636,15 @@ describe("role configuration", () => {
 		withTempDir((dir) => {
 			const configPath = join(dir, "config.json");
 			const examplePath = join(dir, "config.json.example");
-			writeFileSync(
-				configPath,
-				JSON.stringify({ roles: { bundled: "false" } }),
-			);
+			const raw = JSON.stringify({ roles: { bundled: "false" } });
+			writeFileSync(configPath, raw);
 			writeFileSync(examplePath, JSON.stringify({ roles: { bundled: false } }));
 
 			assert.throws(
 				() => loadRoleConfig(dirname(configPath), examplePath),
 				/roles\.bundled must be a boolean/,
 			);
+			assert.equal(readFileSync(configPath, "utf8"), raw);
 		});
 	});
 });
@@ -4643,33 +4652,33 @@ describe("role configuration", () => {
 describe("subagent discovery", () => {
 	const testApi = subagentsModule.__test__;
 
-	it("excludes bundled roles while retaining role-pack and override roles", async () => {
+	it("ships an empty role catalog and keeps project > global > role-pack precedence", async () => {
 		await withIsolatedAgentEnv(
 			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const emptyCatalog = testApi.discoverAgentCatalog();
+				assert.deepEqual(emptyCatalog, { agents: [], diagnostics: [] });
+				for (const name of [
+					"scout",
+					"planner",
+					"worker",
+					"reviewer",
+					"adversarial-reviewer",
+					"visual-tester",
+					"poteto",
+				])
+					assert.equal(
+						testApi.loadAgentDefaults(name),
+						null,
+						`the host must not ship ${name}`,
+					);
+
 				const rolesDir = join(projectDir, "scout-pack", "roles");
 				mkdirSync(rolesDir, { recursive: true });
 				writeFileSync(
 					join(rolesDir, "..", "package.json"),
 					JSON.stringify({ name: "@acme/scout-pack", version: "1.0.0" }),
 				);
-				writeAgentFile(
-					rolesDir,
-					"scout",
-					"description: Role-pack scout enabled without bundled roles",
-				);
-
-				const disabled = { bundled: false };
-				const emptyCatalog = testApi.discoverAgentCatalog(undefined, disabled);
-				assert.equal(
-					emptyCatalog.agents.some((agent) => agent.name === "scout"),
-					false,
-					"listing excludes bundled scouts when disabled",
-				);
-				assert.equal(
-					testApi.loadAgentDefaults("scout", undefined, disabled),
-					null,
-					"exact-name lookup cannot launch an omitted bundled scout",
-				);
+				writeAgentFile(rolesDir, "scout", "description: Role-pack scout");
 
 				const { api } = createMockExtensionApi();
 				api.events.on(
@@ -4677,32 +4686,15 @@ describe("subagent discovery", () => {
 					(request: { register(path: string): void }) =>
 						request.register(rolesDir),
 				);
-				const catalog = testApi.discoverAgentCatalog(api, disabled);
-				assert.equal(
-					catalog.agents.find((agent) => agent.name === "scout")?.provider,
-					"@acme/scout-pack",
-					"a role pack may supply a name that no enabled bundled role owns",
-				);
-				assert.equal(
-					catalog.diagnostics.some(
-						(diagnostic) => diagnostic.code === "bundled-role-collision",
-					),
-					false,
-				);
-				assert.equal(
-					testApi.loadAgentDefaults("worker", api, disabled),
-					null,
-					"exact-name lookup cannot launch an omitted bundled role",
-				);
-
-				writeAgentFile(
-					globalAgentsDir,
-					"global-scout",
-					"description: Global scout",
-				);
-				assert.equal(
-					testApi.loadAgentDefaults("global-scout", api, disabled)?.source,
-					"global",
+				const catalog = testApi.discoverAgentCatalog(api);
+				assert.deepEqual(catalog.diagnostics, []);
+				assert.deepEqual(
+					catalog.agents.map((agent) => [
+						agent.name,
+						agent.source,
+						agent.provider,
+					]),
+					[["scout", "package", "@acme/scout-pack"]],
 				);
 
 				writeAgentFile(
@@ -4711,9 +4703,9 @@ describe("subagent discovery", () => {
 					"description: Global scout override",
 				);
 				assert.equal(
-					testApi.loadAgentDefaults("scout", api, disabled)?.source,
+					testApi.loadAgentDefaults("scout", api)?.source,
 					"global",
-					"a global definition can supply a disabled bundled name",
+					"a global definition overrides a role-pack definition",
 				);
 				writeAgentFile(
 					projectAgentsDir,
@@ -4721,7 +4713,7 @@ describe("subagent discovery", () => {
 					"description: Project scout override",
 				);
 				assert.equal(
-					testApi.loadAgentDefaults("scout", api, disabled)?.source,
+					testApi.loadAgentDefaults("scout", api)?.source,
 					"project",
 					"a project definition retains precedence over a global definition",
 				);
@@ -4881,7 +4873,7 @@ describe("subagent discovery", () => {
 			false,
 		);
 
-		// Interactive fork workflows such as /iterate opt out explicitly.
+		// Interactive bare forks opt out explicitly.
 		assert.equal(
 			testApi.resolveEffectiveAutoExit(
 				{ name: "A", task: "T", fork: true, interactive: true },
@@ -4934,42 +4926,31 @@ describe("subagent discovery", () => {
 		);
 	});
 
-	it("bundled agents inherit the parent runtime and preserve interaction modes", async () => {
-		await withIsolatedAgentEnv(async () => {
-			const expectedInteraction = {
-				scout: false,
-				worker: false,
-				reviewer: false,
-				planner: true,
-				"visual-tester": false,
-			} as const;
-
-			for (const [name, interactive] of Object.entries(expectedInteraction)) {
+	it("lets model-neutral fixture roles inherit the parent runtime and keep interaction modes", async () => {
+		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+			writeAgentFile(
+				projectAgentsDir,
+				"fixture-leaf",
+				["description: Autonomous fixture leaf", "auto-exit: true"].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"fixture-interactive",
+				"description: Interactive fixture role",
+			);
+			for (const [name, interactive] of [
+				["fixture-leaf", false],
+				["fixture-interactive", true],
+			] as const) {
 				const defs = testApi.loadAgentDefaults(name);
-				assert.ok(defs, `expected bundled agent ${name} to load`);
-				assert.equal(
-					defs.model,
-					undefined,
-					`${name} should inherit the parent model`,
-				);
-				assert.equal(
-					defs.thinking,
-					undefined,
-					`${name} should inherit the parent thinking level`,
-				);
+				assert.ok(defs, `expected fixture role ${name} to load`);
+				assert.equal(defs.model, undefined);
+				assert.equal(defs.thinking, undefined);
 				assert.equal(
 					testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
 					interactive,
-					`${name} should preserve its interaction mode`,
 				);
 			}
-
-			assert.equal(
-				testApi.loadAgentDefaults("visual-tester")?.skills,
-				"chrome-cdp",
-			);
-
-			assert.equal(testApi.loadAgentDefaults("claude-reviewer"), null);
 		});
 	});
 
@@ -4988,106 +4969,52 @@ describe("subagent discovery", () => {
 		});
 	});
 
-	it("gives bundled orchestrators the subagent tool they require", () => {
-		const poteto = testApi.loadAgentDefaults("poteto");
-		assert.ok(poteto, "expected bundled poteto agent to be discoverable");
-		assert.equal(poteto.spawning, true);
-		assert.ok(
-			new Set(
-				(poteto.tools ?? "").split(",").map((tool: string) => tool.trim()),
-			).has("subagent"),
-			"poteto must expose the subagent tool used by its workflow",
-		);
-
-		const adversarial = testApi.loadAgentDefaults("adversarial-reviewer");
-		assert.ok(
-			adversarial,
-			"expected bundled adversarial reviewer to be discoverable",
-		);
-
-		assert.equal(adversarial.spawning, true);
-		assert.equal(
-			adversarial.autoExit,
-			false,
-			"multi-wave coordinator must remain open after each child-result steer",
-		);
-		assert.equal(
-			adversarial.interactive,
-			false,
-			"automatic completion steers must wake the multi-wave coordinator",
-		);
-		assert.equal(
-			testApi.resolveEffectiveAutoExit(
-				{ name: "Adversarial review", task: "Review" },
-				adversarial,
-			),
-			false,
-		);
-		assert.equal(
-			testApi.resolveEffectiveInteractive(
-				{ name: "Adversarial review", task: "Review" },
-				adversarial,
-			),
-			false,
-		);
-		const adversarialTools = new Set(
-			(adversarial.tools ?? "").split(",").map((tool: string) => tool.trim()),
-		);
-		assert.equal(adversarialTools.has("subagent"), true);
-		for (const tool of ["read", "bash", "grep", "find", "ls"]) {
-			assert.equal(
-				adversarialTools.has(tool),
-				true,
-				`adversarial reviewer must expose ${tool}`,
+	it("keeps a non-auto-exit fixture coordinator open for completion steers", async () => {
+		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+			writeAgentFile(
+				projectAgentsDir,
+				"fixture-coordinator",
+				[
+					"description: Multi-wave fixture coordinator",
+					"tools: read, bash, subagent",
+					"spawning: true",
+					"auto-exit: false",
+					"interactive: false",
+					"session-mode: fork",
+				].join("\n"),
 			);
-		}
-		assert.equal(
-			testApi.resolveEffectiveSessionMode(
-				{ name: "Adversarial review", task: "Review", fork: false },
-				adversarial,
-			),
-			"standalone",
-		);
-
-		const instructions = adversarial.body ?? "";
-		assert.match(instructions, /model-catalog source/i);
-		assert.match(instructions, /how authentication was\s+confirmed/i);
-		assert.doesNotMatch(
-			instructions,
-			/model:\s*["'][^"']+\/[^"']+["']/,
-			"adversarial reviewer must not hard-code provider model IDs",
-		);
-		assert.match(instructions, /project review rules/i);
-		assert.match(
-			instructions,
-			/Routine\s+risk uses two distinct eligible\s+exact model IDs/i,
-		);
-		assert.match(
-			instructions,
-			/High risk uses three distinct eligible IDs with lenses/i,
-		);
-		assert.match(instructions, /candidate-dependent/i);
-		assert.match(instructions, /different provider\/model family/i);
-		assert.doesNotMatch(
-			instructions,
-			/same-family.*fallback/i,
-			"adversarial reviewer must not allow same-family fallback",
-		);
-		assert.match(instructions, /fresh reviewer carrying alias\s+`S1`/i);
-		assert.match(instructions, /subagent_ping.*not a review report/is);
-		assert.match(instructions, /nonzero exit, provider error, launch error/i);
-		assert.match(instructions, /Never silently replace a\s+runtime/i);
-		assert.match(instructions, /16,000 characters/i);
-		assert.match(instructions, /call\s+`subagent_done`/i);
-		assert.match(
-			instructions,
-			/Never call it[\s\S]*lacks a terminal envelope/i,
-		);
-		assert.match(
-			instructions,
-			/Do not run verification that can generate\s+artifacts/i,
-		);
-		assert.doesNotMatch(instructions, /tools:\s*["']read,bash,write["']/);
+			const coordinator = testApi.loadAgentDefaults("fixture-coordinator");
+			assert.ok(coordinator);
+			assert.equal(coordinator.spawning, true);
+			assert.equal(
+				testApi.resolveEffectiveAutoExit(
+					{ name: "Coordinator", task: "Review" },
+					coordinator,
+				),
+				false,
+				"a multi-wave coordinator must remain open after each child-result steer",
+			);
+			assert.equal(
+				testApi.resolveEffectiveInteractive(
+					{ name: "Coordinator", task: "Review" },
+					coordinator,
+				),
+				false,
+				"automatic completion steers must wake the coordinator",
+			);
+			assert.equal(
+				testApi.resolveDenyTools(coordinator).has("subagent"),
+				false,
+			);
+			assert.equal(
+				testApi.resolveEffectiveSessionMode(
+					{ name: "Coordinator", task: "Review", fork: false },
+					coordinator,
+				),
+				"standalone",
+				"fork:false overrides a role's non-standalone session mode",
+			);
+		});
 	});
 
 	it("ignores invalid session-mode values", async () => {
@@ -5383,7 +5310,7 @@ describe("subagent discovery", () => {
 			writeAgentFile(
 				firstRoles,
 				"scout",
-				"description: Attempts to replace the bundled scout",
+				"description: Single-pack scout with no host-owned competitor",
 			);
 
 			const { api, registeredTools, registeredCommands } =
@@ -5410,16 +5337,22 @@ describe("subagent discovery", () => {
 			assert.equal(
 				result.details.agents.find((agent: any) => agent.name === "scout")
 					?.provider,
-				undefined,
+				"@acme/first-roles",
+				"no host-shipped role protects a pack-contributed name",
 			);
 			assert.deepEqual(
-				new Set(
-					result.details.diagnostics.map((diagnostic: any) => diagnostic.code),
-				),
-				new Set(["duplicate-package-role", "bundled-role-collision"]),
+				result.details.diagnostics.map((diagnostic: any) => diagnostic.code),
+				["duplicate-package-role"],
 			);
 			assert.match(result.content[0].text, /multiple role packs/i);
-			assert.match(result.content[0].text, /cannot replace bundled role/i);
+			assert.match(
+				result.content[0].text,
+				/@acme\/first-roles, @acme\/second-roles/,
+			);
+			assert.match(
+				result.content[0].text,
+				/unavailable until only one pack provides it; use a global or project definition/,
+			);
 
 			const notifications: string[] = [];
 			const command = registeredCommands.find(
@@ -5485,7 +5418,14 @@ describe("subagent discovery", () => {
 
 	it("labels visible package, global, and project agents by source", async () => {
 		await withIsolatedAgentEnv(
-			async ({ projectAgentsDir, globalAgentsDir }) => {
+			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const rolesDir = join(projectDir, "list-pack", "roles");
+				mkdirSync(rolesDir, { recursive: true });
+				writeFileSync(
+					join(rolesDir, "..", "package.json"),
+					JSON.stringify({ name: "@acme/list-roles", version: "1.0.0" }),
+				);
+				writeAgentFile(rolesDir, "scout", "description: Pack scout");
 				writeAgentFile(
 					globalAgentsDir,
 					"global-discovery-test-agent",
@@ -5504,6 +5444,11 @@ describe("subagent discovery", () => {
 				);
 
 				const { api, registeredTools } = createMockExtensionApi();
+				api.events.on(
+					"pi-herdr-subagents:roles:discover:v1",
+					(request: { register(path: string): void }) =>
+						request.register(rolesDir),
+				);
 				subagentsModule.default(api);
 
 				const tool = registeredTools.find(
@@ -5523,7 +5468,10 @@ describe("subagent discovery", () => {
 					sourceByName.get("project-discovery-test-agent"),
 					"project",
 				);
-				assert.match(result.content[0].text, /scout \(package\)/);
+				assert.match(
+					result.content[0].text,
+					/scout \(package:@acme\/list-roles\)/,
+				);
 				assert.match(
 					result.content[0].text,
 					/global-discovery-test-agent \(global\)/,
@@ -5619,10 +5567,13 @@ describe("subagent discovery", () => {
 			] as const) {
 				writeAgentFile(projectAgentsDir, name, frontmatter);
 			}
+			// An invalid higher-precedence override fails closed instead of
+			// falling through to the valid lower-precedence role-pack definition.
+			writeAgentFile(rolesDir, "scout", "description: Valid pack scout");
 			writeAgentFile(
 				projectAgentsDir,
 				"scout",
-				["description: Invalid bundled override", "tools: []"].join("\n"),
+				["description: Invalid project override", "tools: []"].join("\n"),
 			);
 			writeAgentFile(
 				projectAgentsDir,
@@ -7520,7 +7471,14 @@ describe("completion.ts", () => {
 describe("commands", () => {
 	it("/subagent list labels every visible agent source without spawning one", async () => {
 		await withIsolatedAgentEnv(
-			async ({ projectAgentsDir, globalAgentsDir }) => {
+			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const rolesDir = join(projectDir, "command-list-pack", "roles");
+				mkdirSync(rolesDir, { recursive: true });
+				writeFileSync(
+					join(rolesDir, "..", "package.json"),
+					JSON.stringify({ name: "@acme/command-roles", version: "1.0.0" }),
+				);
+				writeAgentFile(rolesDir, "scout", "description: Pack scout");
 				writeAgentFile(
 					globalAgentsDir,
 					"global-command-list-test-agent",
@@ -7540,6 +7498,11 @@ describe("commands", () => {
 
 				const { api, registeredCommands, sentUserMessages } =
 					createMockExtensionApi();
+				api.events.on(
+					"pi-herdr-subagents:roles:discover:v1",
+					(request: { register(path: string): void }) =>
+						request.register(rolesDir),
+				);
 				subagentsModule.default(api);
 				const subagent = registeredCommands.find(
 					(command) => command.name === "subagent",
@@ -7556,7 +7519,10 @@ describe("commands", () => {
 
 				assert.equal(notifications.length, 1);
 				assert.equal(notifications[0].level, "info");
-				assert.match(notifications[0].message, /scout \(package\)/);
+				assert.match(
+					notifications[0].message,
+					/scout \(package:@acme\/command-roles\)/,
+				);
 				assert.match(
 					notifications[0].message,
 					/global-command-list-test-agent \(global\)/,
@@ -7792,7 +7758,7 @@ describe("commands", () => {
 				"For ordinary review, prefer a different authenticated model family.",
 				"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 				"Disclose that this review is context-isolated, not cross-family independent.",
-				"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+				"Cross-family verification must not use this fallback.",
 			])
 				assert.ok(
 					normalizedPrompt.includes(clause),
@@ -7984,104 +7950,52 @@ describe("commands", () => {
 		}
 	});
 
-	it("registers direct BTW commands without steering the parent", async () => {
-		const { api, registeredCommands, sentUserMessages } =
-			createMockExtensionApi();
-		subagentsModule.default(api);
-
-		const btw = registeredCommands.find((command) => command.name === "btw");
-		const close = registeredCommands.find(
-			(command) => command.name === "btw-close",
-		);
-		assert.ok(btw, "expected /btw to be registered");
-		assert.ok(close, "expected /btw-close to be registered");
-
-		const notifications: Array<{ message: string; level: string }> = [];
-		const ctx = {
-			ui: {
-				notify: (message: string, level: string) =>
-					notifications.push({ message, level }),
-			},
-		};
-		await btw.handler("  ", ctx);
-		await close.handler("", ctx);
-
-		assert.deepEqual(notifications, [
-			{ message: "Usage: /btw <question>", level: "warning" },
-			{ message: "No BTW session is open.", level: "info" },
-		]);
-		assert.equal(sentUserMessages.length, 0);
+	it("registers only generic commands and no retired workflow commands", () => {
+		const previousId = process.env.PI_SUBAGENT_ID;
+		try {
+			for (const [childId, expected] of [
+				[undefined, ["subagent", "subagents-init", "worktree"]],
+				["command-inventory-child", ["subagent", "worktree"]],
+			] as const) {
+				restoreEnvVar("PI_SUBAGENT_ID", childId);
+				const { api, registeredCommands, sentUserMessages } =
+					createMockExtensionApi();
+				subagentsModule.default(api);
+				const names = registeredCommands.map((command) => command.name);
+				assert.deepEqual([...names].sort(), expected);
+				for (const retired of ["plan", "iterate", "btw", "btw-close"])
+					assert.equal(names.includes(retired), false, `/${retired}`);
+				assert.equal(sentUserMessages.length, 0);
+			}
+		} finally {
+			restoreEnvVar("PI_SUBAGENT_ID", previousId);
+		}
 	});
 
-	it("runs BTW through the production composition's script-backed unwatched surface", () =>
-		withAdapterHost(async (f) => {
-			const file = f.ctx.sessionManager.getSessionFile();
-			writeFileSync(
-				file,
-				JSON.stringify({
-					type: "session",
-					version: 3,
-					id: "parent",
-					cwd: f.projectDir,
-				}) +
-					"\n" +
-					JSON.stringify({
-						type: "message",
-						id: "leaf",
-						parentId: null,
-						message: {
-							role: "assistant",
-							content: [{ type: "text", text: "context" }],
-						},
-					}) +
-					"\n",
-			);
-			const btw = await f.runtime.session.openBtw({
-				cwd: f.projectDir,
-				invocationCwd: f.projectDir,
-				parentSessionFile: file,
-				leafId: "leaf",
-				sessionDir: f.ctx.sessionManager.getSessionDir(),
-				sessionId: "parent",
-				question: "What does that API do?",
-				model: "openai-codex/gpt-5.6-sol",
-				thinking: "high",
-				agentDir: f.globalDir,
-			});
-			const command = f.commands.at(-1);
-			assert.match(command, /--session/);
-			assert.match(command, /--no-extensions/);
-			assert.match(command, /openai-codex\/gpt-5\.6-sol/);
-			assert.match(command, /BTW question:/);
-			assert.match(command, /What does that API do\?/);
-			assert.match(command, /PI_CODING_AGENT_DIR=/);
-			assert.doesNotMatch(
-				command,
-				/subagent-done|PI_SUBAGENT_|subagent_result/,
-			);
-			assert.equal(f.registrations(), 0);
-			assert.equal(f.mock.sentMessages.length, 0);
-			assert.equal(await f.runtime.session.closeBtw(), true);
-			assert.equal(existsSync(btw.sessionFile), false);
-		}));
-
-	it("/iterate always emits a full-context fork tool call", () => {
-		const { api, registeredCommands, sentUserMessages } =
-			createMockExtensionApi();
-
-		subagentsModule.default(api);
-
-		const iterate = registeredCommands.find(
-			(command) => command.name === "iterate",
+	it("keeps direct interactive full-context forks available without /iterate", () => {
+		const testApi = subagentsModule.__test__;
+		const params = {
+			name: "Fork",
+			task: "Fix the bug",
+			fork: true,
+			interactive: true,
+		};
+		assert.deepEqual(testApi.resolveLaunchBehavior(params, null), {
+			sessionMode: "fork",
+			seededSessionMode: "fork",
+			inheritsConversationContext: true,
+			taskDelivery: "direct",
+		});
+		assert.equal(testApi.resolveEffectiveAutoExit(params, null), false);
+		assert.equal(testApi.resolveEffectiveInteractive(params, null), true);
+		assert.equal(
+			testApi.resolveEffectiveAutoExit(
+				{ ...params, interactive: undefined },
+				null,
+			),
+			true,
+			"bare forks without interactive remain autonomous",
 		);
-		assert.ok(iterate, "expected /iterate to be registered");
-
-		iterate.handler("Fix the bug", {});
-
-		assert.equal(sentUserMessages.length, 1);
-		assert.match(sentUserMessages[0], /fork: true/);
-		assert.match(sentUserMessages[0], /interactive: true/);
-		assert.match(sentUserMessages[0], /name: "Iterate"/);
 	});
 });
 
@@ -8476,7 +8390,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification must not use this fallback.",
 		];
 		for (const [label, taskPreferences] of [
 			["shortlist", { coding: ["fake/worker"] }],
@@ -8520,7 +8434,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification must not use this fallback.",
 		])
 			assert.ok(
 				guidelines.includes(clause),
@@ -8643,7 +8557,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification must not use this fallback.",
 		])
 			assert.ok(
 				modelDesc.includes(clause),
@@ -8653,204 +8567,6 @@ describe("tool registration", () => {
 			modelDesc,
 			/when unavailable/i,
 			"model description must use the authenticated-family availability gate",
-		);
-	});
-
-	it("strict surfaces never permit same-family fallback", () => {
-		const orchestrateSkill = readFileSync(
-			join(getSubagentsPackageRoot(), "skills/orchestrate/SKILL.md"),
-			"utf8",
-		);
-		const adversarialProcedure = readFileSync(
-			join(
-				getSubagentsPackageRoot(),
-				"skills/orchestrate/adversarial-review.md",
-			),
-			"utf8",
-		);
-		const adversarialAgent = readFileSync(
-			join(getSubagentsPackageRoot(), "agents/adversarial-reviewer.md"),
-			"utf8",
-		);
-		const forbiddenOrdinaryReviewClauses = [
-			"For ordinary review, prefer a different authenticated model family.",
-			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
-			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
-		];
-		for (const [label, content] of [
-			["skills/orchestrate/SKILL.md", orchestrateSkill],
-			["skills/orchestrate/adversarial-review.md", adversarialProcedure],
-			["agents/adversarial-reviewer.md", adversarialAgent],
-		] as const) {
-			assert.doesNotMatch(
-				content,
-				/same-family[\s\S]{0,100}fallback/i,
-				`${label} must not contain same-family fallback language`,
-			);
-			assert.doesNotMatch(
-				content,
-				/context-isolated[\s\S]{0,60}review/i,
-				`${label} must not describe context-isolated review`,
-			);
-			assert.match(
-				content,
-				/different.*family/i,
-				`${label} must require different-family review`,
-			);
-			const compact = content.replace(/\s+/g, " ").trim();
-			for (const clause of forbiddenOrdinaryReviewClauses)
-				assert.ok(
-					!compact.includes(clause),
-					`${label} must not contain ordinary-review fallback clause: ${clause}`,
-				);
-		}
-	});
-
-	it("adversarial reviewer agent rejects multiline same-family fallback bypass", () => {
-		const agent = readFileSync(
-			join(getSubagentsPackageRoot(), "agents/adversarial-reviewer.md"),
-			"utf8",
-		);
-		assert.doesNotMatch(
-			agent,
-			/ordinary[\s\S]{0,200}same-family[\s\S]{0,200}fallback/i,
-			"adversarial reviewer must not contain any ordinary same-family fallback path",
-		);
-		assert.doesNotMatch(
-			agent,
-			/[Ww]hen no other.*family[\s\S]{0,200}same-family/,
-			"adversarial reviewer must not contain same-family availability gate",
-		);
-		assert.match(
-			agent,
-			/no model or tool fallback/,
-			"adversarial reviewer must explicitly state no fallback",
-		);
-	});
-
-	it("warns only when the resolved role is bundled", async () => {
-		const testApi = subagentsModule.__test__;
-		const worktree = { branch: "review/unneeded-worktree" };
-
-		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-			for (const [agent, expected] of [
-				["scout", /bundled scout role is read-only/i],
-				["reviewer", /bundled reviewer role is read-only/i],
-				[
-					"adversarial-reviewer",
-					/bundled adversarial-reviewer coordinates read-only reviewers/i,
-				],
-			] as const) {
-				assert.match(
-					testApi.resolveWorktreeLaunchWarning({ agent, worktree }) ?? "",
-					expected,
-				);
-			}
-
-			writeAgentFile(
-				projectAgentsDir,
-				"reviewer",
-				"description: Project-specific reviewer\ntools: read, bash",
-			);
-			assert.equal(
-				testApi.resolveWorktreeLaunchWarning({
-					agent: "reviewer",
-					worktree,
-				}),
-				undefined,
-			);
-		});
-
-		await withIsolatedAgentEnv(
-			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
-				const namedRolesDir = join(projectDir, "named-pack", "roles");
-				const namelessRolesDir = join(projectDir, "nameless-pack", "roles");
-				mkdirSync(namedRolesDir, { recursive: true });
-				mkdirSync(namelessRolesDir, { recursive: true });
-				writeFileSync(
-					join(namedRolesDir, "..", "package.json"),
-					JSON.stringify({ name: "@acme/writing-roles" }),
-				);
-				writeAgentFile(
-					namedRolesDir,
-					"scout",
-					"description: Writing scout\ntools: write",
-				);
-				writeAgentFile(
-					namelessRolesDir,
-					"reviewer",
-					"description: Writing reviewer\ntools: write",
-				);
-				writeAgentFile(
-					namelessRolesDir,
-					"adversarial-reviewer",
-					"description: Writing adversarial reviewer\ntools: write",
-				);
-
-				const { api } = createMockExtensionApi();
-				api.events.on(
-					"pi-herdr-subagents:roles:discover:v1",
-					(request: { register(path: string): void }) => {
-						request.register(namedRolesDir);
-						request.register(namelessRolesDir);
-					},
-				);
-				const disabled = { bundled: false };
-				for (const agent of ["scout", "reviewer", "adversarial-reviewer"]) {
-					assert.equal(
-						testApi.resolveWorktreeLaunchWarning(
-							{ agent, worktree },
-							api,
-							disabled,
-						),
-						undefined,
-					);
-				}
-
-				writeAgentFile(
-					globalAgentsDir,
-					"scout",
-					"description: Global writing scout\ntools: write",
-				);
-				writeAgentFile(
-					projectAgentsDir,
-					"reviewer",
-					"description: Project writing reviewer\ntools: write",
-				);
-				assert.equal(
-					testApi.resolveWorktreeLaunchWarning(
-						{ agent: "scout", worktree },
-						api,
-						disabled,
-					),
-					undefined,
-				);
-				assert.equal(
-					testApi.resolveWorktreeLaunchWarning(
-						{ agent: "reviewer", worktree },
-						api,
-						disabled,
-					),
-					undefined,
-				);
-				assert.equal(
-					testApi.resolveWorktreeLaunchWarning(
-						{ agent: "unknown", worktree },
-						api,
-						disabled,
-					),
-					undefined,
-				);
-				assert.equal(
-					testApi.resolveWorktreeLaunchWarning(
-						{ agent: "scout" },
-						api,
-						disabled,
-					),
-					undefined,
-				);
-			},
 		);
 	});
 

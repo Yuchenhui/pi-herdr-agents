@@ -107,7 +107,7 @@ export interface Role {
 		skills?: string[];
 		cwd?: string;
 	};
-	/** Where the definition came from: bundled, project, global, or role pack. */
+	/** Where the definition came from: project, global, or role pack. */
 	// pi-herdr-agents extension
 	source?: string;
 }

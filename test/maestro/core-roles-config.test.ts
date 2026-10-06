@@ -13,12 +13,10 @@ import { loadSupervisionConfig } from "../../maestro/core/config/supervision-con
 test("Task17 core discovery consumes the injected role-pack protocol and preserves order, diagnostics, raw defaults and provenance", () => {
 	const root = mkdtempSync(join(tmpdir(), "core-role-discovery-"));
 	try {
-		const bundled = join(root, "bundled");
 		const agentDir = join(root, "agent");
 		const cwd = join(root, "project");
 		const pack = join(root, "pack", "roles");
 		for (const dir of [
-			bundled,
 			join(agentDir, "agents"),
 			join(cwd, ".pi", "agents"),
 			pack,
@@ -29,7 +27,6 @@ test("Task17 core discovery consumes the injected role-pack protocol and preserv
 				join(dir, `${name}.md`),
 				`---\nname: ${name}\ndescription: ${dir}\n${fields}\n---\n${name} body`,
 			);
-		role(bundled, "alpha");
 		role(pack, "alpha");
 		role(
 			pack,
@@ -45,10 +42,8 @@ test("Task17 core discovery consumes the injected role-pack protocol and preserv
 		);
 		let projections = 0;
 		const catalog = discoverAgentCatalog({
-			bundledAgentsDir: bundled,
 			agentConfigDir: agentDir,
 			cwd,
-			roleConfig: { bundled: true },
 			onRolePackDiscovered(event) {
 				projections++;
 				assert.equal(event.apiVersion, 1);
@@ -64,7 +59,7 @@ test("Task17 core discovery consumes the injected role-pack protocol and preserv
 		);
 		assert.deepEqual(
 			catalog.diagnostics.map((diagnostic) => diagnostic.code),
-			["invalid-role-pack-path", "bundled-role-collision"],
+			["invalid-role-pack-path"],
 		);
 		assert.equal(catalog.agents[0].source, "project");
 		assert.equal(catalog.agents[0].disableModelInvocation, true);
@@ -99,10 +94,8 @@ test("Task17 core discovery consumes the injected role-pack protocol and preserv
 			},
 		});
 		const failed = discoverAgentCatalog({
-			bundledAgentsDir: bundled,
 			agentConfigDir: agentDir,
 			cwd,
-			roleConfig: { bundled: false },
 			onRolePackDiscovered() {
 				throw new Error("discovery error");
 			},
@@ -139,7 +132,7 @@ test("Task17 all five config owners use only the explicit config directory and e
 			JSON.stringify({ models: { default: "decoy/model" } }),
 		);
 		assert.deepEqual(loadModelConfig(configDir), { agents: {} });
-		assert.equal(loadRoleConfig(configDir, example).bundled, false);
+		assert.equal(loadRoleConfig(configDir, example).deprecations.length, 1);
 		assert.equal(loadPaneConfig(configDir, example).mode, "split");
 		assert.equal(loadPersistentConfig(configDir, example).maxAgents, 9);
 		assert.equal(loadSupervisionConfig(configDir, example).forcePolling, true);
@@ -175,7 +168,9 @@ test("Task17 all five config owners use only the explicit config directory and e
 			}),
 		);
 		assert.equal(loadModelConfig(configDir).default, "saved/model");
-		assert.equal(loadRoleConfig(configDir, example).bundled, true);
+		const [deprecation] = loadRoleConfig(configDir, example).deprecations;
+		assert.ok(deprecation.includes(configPath));
+		assert.match(deprecation, /roles\.bundled \(true\)/);
 		rmSync(configPath);
 		mkdirSync(configPath);
 		for (const read of [loadModelConfig, ...fallbackReaders])
