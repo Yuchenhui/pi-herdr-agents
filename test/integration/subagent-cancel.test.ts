@@ -77,14 +77,16 @@ function workspaceIds(): string[] {
 	);
 }
 
-/** Every pane outside the given fixture workspace, keyed by id. */
-function outsidePanes(fixtureWorkspace: string): Set<string> {
-	const panes = new Set<string>();
-	for (const workspace of workspaceIds()) {
-		if (workspace === fixtureWorkspace) continue;
-		for (const pane of workspacePanes(workspace)) panes.add(pane);
-	}
-	return panes;
+/**
+ * Panes in the runner's own workspace: the only panes outside the fixture
+ * that this test may require to survive. Other workspaces belong to other
+ * sessions whose panes open and close on their own (a finishing subagent
+ * closes its pane), so their disappearance is not attributable to cancel.
+ */
+function runnerPanes(env: { previousWorkspaceId?: string }): Set<string> {
+	const workspace = env.previousWorkspaceId;
+	if (!workspace || !workspaceIds().includes(workspace)) return new Set();
+	return new Set(workspacePanes(workspace));
 }
 
 function paneExists(paneId: string): boolean {
@@ -221,7 +223,7 @@ for (const backend of backends) {
 			await waitForPaneReady(bystander);
 			runInPane(bystander, `echo BYSTANDER_ALIVE_${id}`);
 			const baselinePanes = new Set(workspacePanes(env.workspaceId));
-			const outsideBefore = outsidePanes(env.workspaceId);
+			const outsideBefore = runnerPanes(env);
 			const lines = [
 				`INTEGRATION_CANCEL:${id}:${mode}`,
 				`CANCEL_START_FILE: ${startFile}`,
@@ -289,9 +291,9 @@ for (const backend of backends) {
 				readPane(s.bystander, 50),
 				new RegExp(`BYSTANDER_ALIVE_${s.id}`),
 			);
-			const after = outsidePanes(env.workspaceId);
+			const after = runnerPanes(env);
 			for (const pane of s.outsideBefore)
-				assert.ok(after.has(pane), `outer pane ${pane} must be untouched`);
+				assert.ok(after.has(pane), `runner pane ${pane} must be untouched`);
 		}
 
 		// (a) ordinary pane child: cancel suppresses fallback
