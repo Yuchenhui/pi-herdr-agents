@@ -48,6 +48,37 @@ pi
 
 Restart or `/reload` Pi after installation. Review package source before installing any Pi package.
 
+## Release notes
+
+[`CHANGELOG.md`](CHANGELOG.md) is generated from Git history on each release.
+Hand-written upgrade notes for breaking releases live here.
+
+### 3.0.0
+
+3.0.0 makes the host pack-neutral. It also adds conditional task-model writes
+(`expectedConfigRevision`, an advisory lock, and the reported `configRevision`),
+the `pi-herdr-agents` operating skill, and `subagent_cancel`.
+
+**Breaking changes.** The package no longer ships the seven former bundled roles,
+`/plan` and its plan skill, or `/skill:orchestrate`; these moved to optional role
+packs. `/iterate`, `/btw`, and `/btw-close` were removed without replacement.
+`roles.bundled` is now a deprecated no-op. A named launch of a role that no
+definition or installed pack supplies now fails before Herdr creates a pane or
+worktree.
+
+**Migration.**
+
+- Install `pi-herdr-roles` for the six generic roles (`scout`, `planner`,
+  `worker`, `reviewer`, `adversarial-reviewer`, `visual-tester`), `/plan`, and
+  `/skill:orchestrate`.
+- Install `pi-herdr-pstack` for the `poteto` role.
+- Remove `roles.bundled` from `$PI_CODING_AGENT_DIR/herdr-agents/config.json`.
+- Alternatively, copy a former role's definition into `.pi/agents/` or the
+  global agents directory to keep it without a pack.
+
+See [Migrating from bundled roles](#migrating-from-bundled-roles) for the full
+mapping and pack-compatibility notes.
+
 ## Quick start
 
 This package is an execution host and ships no agent roles. Named roles come
@@ -631,11 +662,18 @@ subagent({
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, ordered fallback list, or whole-value `task:<category>` (coding, review, recon, qa, architecture, docs). Task routing is tool-only; worktrees use its first authenticated candidate. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | parent level   | Pick the model tier first, then set thinking within that model's range: minimal/low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, or hard diagnosis. Omitting still inherits the parent level; this is a discouraged fallback for orchestrated children. |
-| `systemPrompt`         | string  | —              | Role/system-prompt text for a bare spawn; named agents keep their definition body                  |
+| `systemPrompt`         | string  | —              | Role text for a bare spawn, delivered as a role block at the top of the child's first message (not the system prompt); dropped for `fork: true` children. Named agents keep their definition body |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory, or source repository when `worktree` is set (see [Role Folders](#role-folders)) |
 | `worktree`             | object \| null | —          | Isolated Herdr-managed Git worktree; requires `branch`, with optional `base` (committed `HEAD` by default). Omit or pass `null` to use an ordinary pane in `cwd` when a client requires the property. |
+
+A bare spawn's `systemPrompt` is not passed to Pi as a system prompt. The host
+prepends it as a role block to the child's first message, which is delivered
+through a task artifact file referenced with `@path`. A full-context fork
+(`fork: true`) receives only the raw task, so its `systemPrompt` is dropped. Set
+`fork: false` when a bare child must receive reference or role text through
+`systemPrompt`.
 
 ### Naming coordinated children
 
