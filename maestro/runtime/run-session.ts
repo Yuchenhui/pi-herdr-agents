@@ -10,6 +10,7 @@ import type {
 	CompletionEvidence,
 	LifecycleProjection,
 	Role,
+	RunCancellation,
 	RunResult,
 	SubagentActivityState,
 	SubagentLifecycle,
@@ -49,6 +50,16 @@ export interface RunSessionHooks {
 		handle: AgentHandle,
 		projection: LifecycleProjection,
 		observation: RunObservation,
+	): void;
+	/**
+	 * Operator cancel state of the run's current owner: "requested" when intent is
+	 * recorded or a cancelled owner is transferred, then each owned kill's
+	 * outcome, including kills the run starts itself. Presentation only.
+	 */
+	onCancelState?(
+		handle: AgentHandle,
+		task: Task,
+		state: "requested" | "confirmed" | "unconfirmed",
 	): void;
 	/** Successful void/delivered/suppressed permits cleanup; rejection retains panes. */
 	onSettled?(
@@ -99,6 +110,19 @@ export interface RunSessionOptions {
 	operations?: RunSessionOperations;
 	retainSurface?: (result: RunResult, task: Task) => boolean;
 }
+/**
+ * Operator cancel report. `requested` means the intent is recorded but an
+ * in-flight acquisition still owns the next attempt; that owner is terminated
+ * when it is transferred. `unconfirmed` keeps the run live and retryable.
+ */
+// pi-herdr-agents extension
+export interface CancelReport {
+	status: "requested" | "confirmed" | "unconfirmed" | "already-terminal";
+	requestedAt?: number;
+	error?: string;
+	/** An earlier cancel already recorded this run's intent. */
+	repeated?: boolean;
+}
 // pi-herdr-agents extension
 export interface RunSession {
 	spawn(task: Task, prepared?: PreparedRun): Promise<AgentHandle>;
@@ -118,6 +142,19 @@ export interface RunSession {
 	observe(taskId: string, at?: number): RunObservation | undefined;
 	/** Gates delivery before owned abort; a retired ID is an idempotent no-op. */
 	suppress(taskId: string): void;
+	/**
+	 * Records terminal operator intent synchronously, then terminates the owned
+	 * attempt through its adapter. Prevents fallback and delivers one cancelled
+	 * result once termination is confirmed. Persistent runs are rejected.
+	 */
+	cancel(taskId: string): Promise<CancelReport>;
+}
+// pi-herdr-agents extension
+interface CancelState extends RunCancellation {
+	/** In-flight owned kill; concurrent cancels and the producer join it. */
+	kill?: Promise<void>;
+	/** Producer wake-ups after a kill settles or the run is suppressed. */
+	waiters: Set<() => void>;
 }
 // pi-herdr-agents extension
 interface RunEntry {
@@ -131,9 +168,15 @@ interface RunEntry {
 	producer?: Promise<RunResult>;
 	suppressed: boolean;
 	released: boolean;
+	/** An acquisition is in flight; its owner is not yet registered. */
+	acquiring: boolean;
+	/** The producer took a natural terminal result; cancel arrives too late. */
+	settled: boolean;
+	cancel?: CancelState;
 }
 
 const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
+const CANCELLED_BEFORE_LAUNCH = "Subagent was cancelled before launch.";
 
 // pi-herdr-agents extension
 export function createRunSession(options: RunSessionOptions): RunSession {
@@ -155,6 +198,8 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 			controller: new AbortController(),
 			suppressed: false,
 			released: false,
+			acquiring: false,
+			settled: false,
 		};
 		entries.set(task.id, entry);
 		return entry;
@@ -279,9 +324,10 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 			throw new Error(`Task "${entry.task.id}" has no prepared launch.`);
 		const failures: { model: string; error: string }[] = [];
 		const count = Math.max(1, prepared.candidates.length);
-		while (!entry.suppressed && entry.nextCandidate < count) {
+		while (!entry.suppressed && !entry.cancel && entry.nextCandidate < count) {
 			const index = entry.nextCandidate++;
 			let owner: OwnedRunAttempt;
+			entry.acquiring = true;
 			try {
 				owner = await prepared.spawnAttempt(
 					spawnOptions(entry, prepared, index),
@@ -293,12 +339,85 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 					error: errorText(error),
 				});
 				continue;
+			} finally {
+				entry.acquiring = false;
 			}
-			// Even a suppressed in-flight acquisition must transfer its real owner.
+			// Even a suppressed or cancelled in-flight acquisition must transfer its
+			// real owner; a cancelled one is terminated as soon as it is registered.
 			register(entry, owner);
+			terminateTransferred(entry);
 			return { owner, failures };
 		}
 		return { owner: undefined, failures };
+	}
+
+	function notifyCancel(
+		entry: RunEntry,
+		state: "requested" | "confirmed" | "unconfirmed",
+		owner = entry.active,
+	) {
+		if (!owner) return;
+		try {
+			options.hooks?.onCancelState?.(owner.handle, entry.task, state);
+		} catch {
+			/* presentation only; never affects termination */
+		}
+	}
+
+	function terminateTransferred(entry: RunEntry) {
+		if (!entry.cancel) return;
+		notifyCancel(entry, "requested");
+		void terminate(entry);
+	}
+
+	// One owned kill at a time. Only a resolved kill confirms termination; only
+	// then is the producer's wait aborted, so a failed kill leaves it supervised.
+	function terminate(entry: RunEntry): Promise<void> {
+		const state = entry.cancel;
+		const owner = entry.active;
+		if (!state || !owner || state.termination === "confirmed")
+			return Promise.resolve();
+		if (state.kill) return state.kill;
+		const kill = (async () => {
+			try {
+				await owner.adapter.kill(owner.handle);
+				state.termination = "confirmed";
+				state.confirmedAt = Date.now();
+				state.error = undefined;
+				entry.controller.abort();
+			} catch (error) {
+				state.termination = "unconfirmed";
+				state.error = errorText(error);
+			} finally {
+				state.kill = undefined;
+				notifyCancel(entry, state.termination, owner);
+				wake(state);
+			}
+		})();
+		state.kill = kill;
+		return kill;
+	}
+
+	function wake(state: CancelState) {
+		const waiters = [...state.waiters];
+		state.waiters.clear();
+		for (const resolve of waiters) resolve();
+	}
+
+	// The producer settles a cancelled run only after confirmed termination. It
+	// makes one kill itself when its wait ended without one (late acquisition or
+	// natural exit evidence); otherwise it waits for an operator retry or shutdown.
+	async function confirmTermination(entry: RunEntry): Promise<void> {
+		const state = entry.cancel!;
+		let attempted = false;
+		for (;;) {
+			if (state.termination === "confirmed" || entry.suppressed) return;
+			if (state.kill) await state.kill;
+			else if (!attempted) {
+				attempted = true;
+				await terminate(entry);
+			} else await new Promise<void>((resolve) => state.waiters.add(resolve));
+		}
 	}
 
 	function refresh(entry: RunEntry, at: number): RunObservation | undefined {
@@ -328,6 +447,21 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 		}
 	}
 
+	function retryable(
+		entry: RunEntry,
+		owner: OwnedRunAttempt,
+		result: RunResult,
+	): boolean {
+		const prepared = entry.prepared;
+		return (
+			!entry.suppressed &&
+			!(owner.persistent ?? entry.persistent) &&
+			result.evidence?.errorMessage !== undefined &&
+			!!prepared &&
+			entry.nextCandidate < prepared.candidates.length
+		);
+	}
+
 	async function produce(entry: RunEntry): Promise<RunResult> {
 		for (;;) {
 			const owner = entry.active;
@@ -343,28 +477,38 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 			} catch (error) {
 				result = rejectedResult(owner.handle, error);
 			}
+			// Settle point: intent recorded before this synchronous check wins, and a
+			// natural result that cannot start a fallback makes later cancels too late.
+			if (entry.cancel) {
+				await confirmTermination(entry);
+				result = cancelledResult(owner.handle, entry.cancel);
+			} else if (!retryable(entry, owner, result)) entry.settled = true;
 			try {
 				if (owner.finalize) result = await owner.finalize(result, entry.task);
 			} catch (error) {
 				retire(entry);
 				throw error;
 			}
-			const prepared = entry.prepared;
-			if (
-				!entry.suppressed &&
-				!(owner.persistent ?? entry.persistent) &&
-				result.evidence?.errorMessage !== undefined &&
-				prepared &&
-				entry.nextCandidate < prepared.candidates.length
-			) {
+			// A cancel recorded while finalizing a retryable error lands below: the
+			// acquisition gate starts nothing and the settled owner is terminated.
+			if (retryable(entry, owner, result)) {
+				entry.settled = false;
 				const next = await acquireNext(entry);
 				if (next.owner && !entry.suppressed) {
 					try {
 						await acquiredHook(entry, next.owner);
 					} catch (error) {
-						if (!entry.suppressed) throw error;
+						if (!entry.suppressed && !entry.cancel) throw error;
 					}
+					// A cancelled transferred owner is already being terminated; its
+					// own wait and finalization produce the single cancelled result.
 					if (!entry.suppressed) continue;
+				}
+				if (entry.cancel && !entry.suppressed) {
+					// Cancelled before or while acquiring and nothing was transferred: the
+					// settled previous attempt is still owned; terminate it, then deliver.
+					await confirmTermination(entry);
+					return deliver(entry, cancelledResult(owner.handle, entry.cancel));
 				}
 				if (!entry.suppressed && next.failures.length && result.evidence) {
 					const message = `${result.evidence.errorMessage}\n\nFallback launch failures: ${formatFailures(next.failures)}`;
@@ -374,6 +518,9 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 						evidence: { ...result.evidence, errorMessage: message },
 					};
 				}
+				// Every fallback failed: this natural failure is now terminal, so a
+				// cancel during its delivery is too late, never a second outcome.
+				entry.settled = true;
 			}
 			return deliver(entry, result);
 		}
@@ -398,6 +545,7 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 						? await options.operations.prepare(task, resolveRole(task))
 						: defaultPreparation(task, resolveRole(task)));
 				if (entry.suppressed) throw new Error(ABORT_MESSAGE);
+				if (entry.cancel) throw new Error(CANCELLED_BEFORE_LAUNCH);
 				if (task.worktree && prepared.candidates.length > 1) {
 					throw new Error(
 						"Model fallbacks are not supported for worktree subagents.",
@@ -411,6 +559,7 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 					throw new Error(ABORT_MESSAGE);
 				}
 				if (!acquired.owner) {
+					if (entry.cancel) throw new Error(CANCELLED_BEFORE_LAUNCH);
 					throw new Error(
 						`Subagent could not launch with any configured model. Attempted: ${prepared.candidates.map((candidate) => candidate.model).join(", ")}. ${formatFailures(acquired.failures)}`,
 					);
@@ -431,10 +580,17 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 					options.roles.find((role) => role.name === task.role)?.defaults
 						?.persistent ??
 					false;
-				const owner = options.operations?.resume
-					? await options.operations.resume(resumeOptions, task)
-					: wrap(await options.adapter.resume(resumeOptions));
+				entry.acquiring = true;
+				let owner: OwnedRunAttempt;
+				try {
+					owner = options.operations?.resume
+						? await options.operations.resume(resumeOptions, task)
+						: wrap(await options.adapter.resume(resumeOptions));
+				} finally {
+					entry.acquiring = false;
+				}
 				register(entry, owner);
+				terminateTransferred(entry);
 				if (entry.suppressed) {
 					suppressedBeforeSupervision(entry);
 					throw new Error(ABORT_MESSAGE);
@@ -524,7 +680,39 @@ export function createRunSession(options: RunSessionOptions): RunSession {
 			if (!entry || entry.suppressed) return;
 			entry.suppressed = true;
 			entry.controller.abort();
+			if (entry.cancel) wake(entry.cancel);
 			if (!entry.producer) suppressedBeforeSupervision(entry);
+		},
+		async cancel(taskId) {
+			const entry = entries.get(taskId);
+			if (!entry) {
+				if (consumed.has(taskId)) return { status: "already-terminal" };
+				throw new Error(`Task "${taskId}" was not found.`);
+			}
+			if (entry.active?.persistent ?? entry.persistent)
+				throw new Error(
+					`Task "${taskId}" is persistent; use its graceful stop instead of cancel.`,
+				);
+			if (entry.suppressed || (entry.settled && !entry.cancel))
+				return { status: "already-terminal" };
+			const repeated = !!entry.cancel;
+			// Terminal intent is recorded synchronously, before any abort, kill or await.
+			const state = (entry.cancel ??= {
+				requestedAt: Date.now(),
+				termination: "unconfirmed",
+				waiters: new Set(),
+			});
+			if (state.termination !== "confirmed") notifyCancel(entry, "requested");
+			const report = (status: CancelReport["status"]): CancelReport => {
+				const value: CancelReport = { status, requestedAt: state.requestedAt };
+				if (status === "unconfirmed" && state.error) value.error = state.error;
+				if (repeated) value.repeated = true;
+				return value;
+			};
+			// No owner yet: the in-flight acquisition transfers it, then it is killed.
+			if (!entry.active || entry.acquiring) return report("requested");
+			await terminate(entry);
+			return report(state.termination);
 		},
 	};
 }
@@ -554,6 +742,26 @@ function evidenceResult(
 		output: evidence.finalMessage?.text,
 		durationMs: Date.now() - handle.startedAt,
 		evidence,
+	};
+}
+
+function cancelledResult(
+	handle: AgentHandle,
+	state: RunCancellation,
+): RunResult {
+	const cancellation: RunCancellation = {
+		requestedAt: state.requestedAt,
+		termination: state.termination,
+	};
+	if (state.confirmedAt !== undefined)
+		cancellation.confirmedAt = state.confirmedAt;
+	if (state.error !== undefined) cancellation.error = state.error;
+	return {
+		handle,
+		outcome: "killed",
+		error: "Cancelled by operator",
+		durationMs: Date.now() - handle.startedAt,
+		cancellation,
 	};
 }
 

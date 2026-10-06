@@ -63,6 +63,7 @@ real implementations; in-memory fakes are conformance fixtures only.
 | [`0011`](adr/0011-explicit-worktree-cleanup.md) | Accepted | Authorize explicit worktree cleanup by cwd containment; retain branches and reject automatic reaping. |
 | [`0012`](adr/0012-adopt-maestro-seams-in-repo.md) | Accepted | Adopt in-repo seams and conformance fakes; keep one package, Pi-only execution, and Herdr-only surfaces. |
 | [`0013`](adr/0013-pack-neutral-execution-host.md) | Accepted | Ship a pack-neutral execution host; roles and workflows move to optional packs, and `/iterate` and `/btw` are removed. |
+| [`0014`](adr/0014-operator-cancel-terminal-intent.md) | Accepted | Operator cancel records terminal intent before owned termination: no fallback, one confirmed cancelled result, unconfirmed runs stay live. |
 
 ## Historical material
 

@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
-import type { Task } from "../../maestro/core/types.ts";
+import type { RunCancellation, Task } from "../../maestro/core/types.ts";
 import {
 	createDefaultRunSession,
 	initializeTaskModels,
@@ -33,6 +33,7 @@ import {
 	type PiPersistentEvent,
 	type PiLedgerEntry,
 	type PiProgressEvidence,
+	type CancelReport,
 } from "../../maestro/runtime/index.ts";
 import { loadSupervisionConfig } from "../../maestro/core/config/supervision-config.ts";
 import {
@@ -292,6 +293,7 @@ const SubagentParams = Type.Object({
 const SPAWNING_TOOLS = new Set([
 	"subagent",
 	"subagent_interrupt",
+	"subagent_cancel",
 	"subagents_list",
 	"subagent_resume",
 	"subagent_send",
@@ -602,6 +604,7 @@ interface SubagentResultDetails {
 	fallbackFailures?: ModelFailure[];
 	worktree?: WorktreeHandoff;
 	runtimePlan?: ResolvedRuntimePlan;
+	cancellation?: RunCancellation;
 }
 
 interface SubagentPingDetails {
@@ -744,6 +747,29 @@ function resolveResultPresentation(
 	return boundResultPresentation(body, sessionRef + runtimeWarning);
 }
 
+function resolveCancelledPresentation(
+	result: Pick<
+		SubagentResult,
+		"elapsed" | "sessionFile" | "fallbackAttempts" | "worktree"
+	>,
+	name: string,
+	cancellation: RunCancellation,
+): string {
+	let body =
+		`Sub-agent "${name}" was cancelled by the parent after ${formatElapsed(result.elapsed)}. ` +
+		(cancellation.termination === "confirmed"
+			? "Termination was confirmed before this result"
+			: `Termination is unconfirmed (${cancellation.error ?? "unknown"})`) +
+		"; no model fallback, retry, or recovery was started.";
+	if (result.fallbackAttempts?.length)
+		body += `\n\nModels attempted: ${result.fallbackAttempts.join(", ")}`;
+	if (result.worktree) body += `\n\n${formatWorktreeHandoff(result.worktree)}`;
+	return boundResultPresentation(
+		body,
+		formatSessionReference(result.sessionFile),
+	);
+}
+
 /**
  * Result from running a single subagent.
  */
@@ -827,6 +853,7 @@ interface RunningSubagent {
 	stopTimeout?: ReturnType<typeof setTimeout>;
 	stopTimeoutMs?: number;
 	crashNotified?: boolean;
+	cancelState?: "requested" | "confirmed" | "unconfirmed";
 }
 
 const paneConfig = loadPaneConfig(
@@ -1044,9 +1071,17 @@ function renderSubagentWidgetLines(
 		const runtimeTag = agent.runtimePlan
 			? `${agent.runtimePlan.modelId}|${agent.runtimePlan.thinking} · `
 			: "";
-		const right = statusConfig.enabled
-			? ` ${runtimeTag}${formatLifecycleWidgetLabel(projection, now).trim()} `
-			: ` ${runtimeTag}starting… `;
+		const label =
+			agent.cancelState === "unconfirmed"
+				? "cancel unconfirmed"
+				: agent.cancelState
+					? "cancelling…"
+					: undefined;
+		const right = label
+			? ` ${runtimeTag}${label} `
+			: statusConfig.enabled
+				? ` ${runtimeTag}${formatLifecycleWidgetLabel(projection, now).trim()} `
+				: ` ${runtimeTag}starting… `;
 
 		lines.push(borderLine(left, right, width, accent));
 	}
@@ -1686,6 +1721,105 @@ async function handleSubagentInterrupt(
 	};
 }
 
+const SUBAGENT_CANCEL_DESCRIPTION =
+	"Cancel a running ordinary (non-persistent) Pi-backed subagent, including an interrupted one: " +
+	"records terminal intent first, terminates its owned process, and delivers exactly one cancelled result. " +
+	"No model fallback, retry, or recovery starts after a cancel. " +
+	"An ordinary pane is closed; a managed-worktree child stops only its Pi process and keeps the workspace, checkout, commits, and manifest. " +
+	"Returns confirmed, requested (launch still in flight), unconfirmed (the run stays live; call again to retry), or already-terminal. " +
+	"Persistent specialists are rejected; use subagent_stop. Do not poll: the cancelled result arrives automatically.";
+
+interface SubagentCancelDetails {
+	error?: string;
+	id?: string;
+	name?: string;
+	status?: CancelReport["status"];
+	requestedAt?: number;
+	repeated?: boolean;
+}
+
+function cancelStatusText(
+	name: string,
+	report: CancelReport,
+	worktree: boolean,
+): string {
+	const noRetry = "No model fallback, retry, or recovery will start.";
+	switch (report.status) {
+		case "confirmed":
+			return worktree
+				? `Cancelled subagent "${name}": its Pi process exit is confirmed; the worktree workspace, checkout, commits, and manifest are retained. ${noRetry} One cancelled result will be delivered automatically.`
+				: `Cancelled subagent "${name}": its pane was closed and Herdr confirmed it is gone. ${noRetry} One cancelled result will be delivered automatically.`;
+		case "requested":
+			return `Cancel recorded for subagent "${name}"; its in-flight launch is terminated as soon as it is acquired. ${noRetry} One cancelled result will be delivered after termination is confirmed.`;
+		case "unconfirmed":
+			return `Cancel recorded for subagent "${name}", but termination is unconfirmed: ${report.error ?? "unknown error"}. The run stays live and owned. ${noRetry} Call subagent_cancel again to retry termination.`;
+		case "already-terminal":
+			return `Subagent "${name}" already reached a terminal result; nothing was cancelled.`;
+	}
+}
+
+async function handleSubagentCancel(
+	params: { id?: string; name?: string },
+	session: Pick<PiRunSession, "cancel" | "getControlTaskId"> = runtime.session!,
+): Promise<AgentToolResult<SubagentCancelDetails>> {
+	const fail = (error: string, extra: SubagentCancelDetails = {}) => ({
+		content: [{ type: "text" as const, text: error }],
+		details: { error, ...extra },
+	});
+	const resolved = resolveInterruptTarget(params);
+	if ("error" in resolved) {
+		// No live row: a retired run keeps only its consumed control ID, and a run
+		// still in its initial launch has no row yet. Report the kernel's answer.
+		const id = params.id?.trim();
+		const report = id
+			? await session.cancel(id).catch(() => undefined)
+			: undefined;
+		if (!id || !report) return fail(resolved.error);
+		updateWidget();
+		return {
+			content: [
+				{ type: "text" as const, text: cancelStatusText(id, report, false) },
+			],
+			details: { id, status: report.status },
+		};
+	}
+	const running = resolved.running;
+	const target = { id: running.id, name: running.name };
+	if (running.persistent)
+		return fail(
+			`Subagent "${running.name}" is a persistent specialist; subagent_cancel does not stop it. Use subagent_stop({ id: "${running.id}" }) for the graceful v1 stop.`,
+			target,
+		);
+	const control = session.getControlTaskId(running.id);
+	if (!control)
+		return fail(
+			`Subagent "${running.name}" has no live owner in this session; nothing was cancelled.`,
+			target,
+		);
+	let report: CancelReport;
+	try {
+		report = await session.cancel(control);
+	} catch (error) {
+		return fail(error instanceof Error ? error.message : String(error), target);
+	} finally {
+		updateWidget();
+	}
+	const details: SubagentCancelDetails = { ...target, status: report.status };
+	if (report.requestedAt !== undefined)
+		details.requestedAt = report.requestedAt;
+	if (report.error) details.error = report.error;
+	if (report.repeated) details.repeated = true;
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: cancelStatusText(running.name, report, !!running.worktree),
+			},
+		],
+		details,
+	};
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
 	if (!statusConfig.enabled || statusInterval) return;
 
@@ -1789,6 +1923,7 @@ export const __test__ = {
 	resolveInterruptTarget,
 	requestSubagentInterrupt,
 	handleSubagentInterrupt,
+	handleSubagentCancel,
 	handleSubagentSend,
 	handleSubagentStop,
 	persistentSpecialistState,
@@ -2146,6 +2281,31 @@ function deliverPiCompletion(
 	running.lifecycle = markDelivery(running.lifecycle, "delivered");
 	runningSubagents.delete(running.id);
 	updateWidget();
+	const cancellation = result.run.cancellation;
+	if (cancellation) {
+		const details: SubagentResultDetails = {
+			name: running.name,
+			task: task.prompt,
+			exitCode: result.exitCode,
+			elapsed: result.elapsed,
+			sessionFile: result.sessionFile,
+			error: "cancelled",
+			cancellation,
+		};
+		if (!io.readResumeResult) details.agent = running.agent;
+		if (result.fallbackAttempts)
+			details.fallbackAttempts = result.fallbackAttempts;
+		if (result.fallbackFailures)
+			details.fallbackFailures = result.fallbackFailures;
+		if (result.worktree) details.worktree = result.worktree;
+		if (running.runtimePlan) details.runtimePlan = running.runtimePlan;
+		sendSubagentResult(
+			api,
+			resolveCancelledPresentation(result, running.name, cancellation),
+			details,
+		);
+		return "delivered";
+	}
 	if (result.ping) {
 		const worktreeRef = result.worktree
 			? `\n\n${formatWorktreeHandoff(result.worktree)}`
@@ -2896,6 +3056,61 @@ export default function subagentsExtension(
 			},
 		});
 
+	// ── subagent_cancel tool ──
+	if (shouldRegister("subagent_cancel"))
+		pi.registerTool({
+			name: "subagent_cancel",
+			label: "Cancel Subagent",
+			description: SUBAGENT_CANCEL_DESCRIPTION,
+			promptSnippet: SUBAGENT_CANCEL_DESCRIPTION,
+			parameters: Type.Object({
+				id: Type.Optional(
+					Type.String({ description: "Exact running subagent id" }),
+				),
+				name: Type.Optional(
+					Type.String({
+						description: "Exact unambiguous running subagent display name",
+					}),
+				),
+			}),
+
+			async execute(_toolCallId, params) {
+				return handleSubagentCancel(params);
+			},
+
+			renderCall(args, theme) {
+				const target = args.id ? `${args.id}` : (args.name ?? "(unknown)");
+				return new Text(
+					theme.fg("accent", "▸") +
+						" " +
+						theme.fg("toolTitle", theme.bold(target)) +
+						theme.fg("dim", " — cancel run"),
+					0,
+					0,
+				);
+			},
+
+			renderResult(result, _opts, theme) {
+				// SAFETY: renderResult only ever receives the details this tool's own
+				// execute() above returned; the framework's TDetails type isn't threaded
+				// through this callback precisely enough for TypeScript to see that.
+				const details = result.details as SubagentCancelDetails | undefined;
+				if (details?.status)
+					return new Text(
+						theme.fg("accent", "▸") +
+							" " +
+							theme.fg(
+								"toolTitle",
+								theme.bold(details.name ?? details.id ?? "subagent"),
+							) +
+							theme.fg("dim", ` — cancel ${details.status}`),
+						0,
+						0,
+					);
+				return new Text(theme.fg("dim", getFirstText(result.content)), 0, 0);
+			},
+		});
+
 	// ── subagents_list tool ──
 	if (shouldRegister("subagents_list"))
 		pi.registerTool({
@@ -3329,12 +3544,19 @@ export default function subagentsExtension(
 				const bgFn = failed
 					? (text: string) => theme.bg("toolErrorBg", text)
 					: (text: string) => theme.bg("toolSuccessBg", text);
-				const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
-				const status = errorMessage
-					? "failed (provider/agent error)"
+				const cancelled = details.error === "cancelled";
+				const icon = cancelled
+					? theme.fg("warning", "■")
 					: failed
-						? `failed (exit ${exitCode})`
-						: "completed";
+						? theme.fg("error", "✗")
+						: theme.fg("success", "✓");
+				const status = cancelled
+					? "cancelled"
+					: errorMessage
+						? "failed (provider/agent error)"
+						: failed
+							? `failed (exit ${exitCode})`
+							: "completed";
 				const agentTag = details.agent
 					? theme.fg("dim", ` (${details.agent})`)
 					: "";
@@ -3350,6 +3572,10 @@ export default function subagentsExtension(
 				const summary = rawContent
 					.replace(/\n\nSession: .+\nResume: .+$/, "")
 					.replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
+					.replace(
+						`Sub-agent "${name}" was cancelled by the parent after ${elapsed}. `,
+						"",
+					)
 					.replace(
 						`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`,
 						"",

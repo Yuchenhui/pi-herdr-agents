@@ -17,6 +17,7 @@ import type {
 	WorktreeSurfaceInfo,
 } from "../core/surface-provider.ts";
 import { PiHarnessAdapter } from "../adapters/pi/pi-harness-adapter.ts";
+import type { ProcessIdentityProbe } from "../adapters/pi/process-identity.ts";
 import {
 	launchOperationsFromSurface,
 	launchPiWorktreeHandoff,
@@ -187,6 +188,8 @@ export interface PiRunRecord {
 	stopState?: "requested" | "pending" | "failed";
 	stopFailure?: string;
 	crashNotified?: boolean;
+	/** Presentation of the latest operator cancel; the kernel owns the intent. */
+	cancelState?: "requested" | "confirmed" | "unconfirmed";
 }
 
 // pi-herdr-agents extension
@@ -322,6 +325,8 @@ export interface PiRunSessionInfrastructure {
 	launchOperations: PiLaunchOperations;
 	worktreeOperations?: WorktreeOperations;
 	supervision: SupervisionCoordinator;
+	/** Kernel process-identity probe for worktree cancel; tests inject it. */
+	processProbe?: ProcessIdentityProbe;
 }
 // pi-herdr-agents extension
 export interface DefaultRunSessionOptions {
@@ -405,7 +410,7 @@ interface PiSessionOwner {
 	entries: Map<string, PiEntry>;
 	infrastructure: Pick<
 		PiRunSessionInfrastructure,
-		"surfaceProvider" | "supervision"
+		"surfaceProvider" | "supervision" | "processProbe"
 	>;
 	worktreeOperations: WorktreeOperations;
 }
@@ -582,6 +587,17 @@ export function createDefaultRunSession(
 						task,
 					);
 				},
+				onCancelState(handle, task, cancelState) {
+					// The kernel owns the intent; project it onto whichever owner is
+					// current, including one transferred after the cancel call.
+					const entry = entries.get(task.id);
+					if (
+						entry &&
+						entry.record.id === handle.id &&
+						entry.record.sessionFile === handle.sessionId
+					)
+						entry.record.cancelState = cancelState;
+				},
 				onObserved(_handle, _projection, observation) {
 					const entry = [...entries.values()].find(
 						(e) =>
@@ -597,6 +613,16 @@ export function createDefaultRunSession(
 					const completed = { ...entry.completed!, run: result };
 					if (result.evidence?.errorMessage !== undefined)
 						completed.errorMessage = result.evidence.errorMessage;
+					if (result.cancellation) {
+						// A cancel can settle after a retryable attempt was finalized with
+						// its natural error; present the run's actual cancelled outcome.
+						completed.summary = "Subagent cancelled.";
+						completed.error = "cancelled";
+						completed.exitCode = 1;
+						completed.sessionFile = entry.record.sessionFile;
+						completed.errorMessage = undefined;
+						completed.ping = undefined;
+					}
 					entry.completed = completed;
 					try {
 						const decision = await state.options.hooks.onSettled(
@@ -718,6 +744,7 @@ export function createDefaultRunSession(
 			parent: snapshot.parent,
 			parentRuntime: snapshot.parentRuntime,
 			supervision: state.infrastructure.supervision,
+			processProbe: state.infrastructure.processProbe,
 			operations: launchOperations(snapshot),
 			onObservation(child, kind) {
 				const at = Date.now();
@@ -849,9 +876,13 @@ export function createDefaultRunSession(
 						child.worktree,
 					);
 					try {
+						// Only confirmed termination is a cancellation. Shutdown suppression
+						// of an unconfirmed cancel records what a plain shutdown would.
 						state.worktreeOperations.persistWorktreeResult(
 							child.worktree,
-							worktreeResultState(exitCode, !!evidence?.ping),
+							result.cancellation?.termination === "confirmed"
+								? "cancelled"
+								: worktreeResultState(exitCode, !!evidence?.ping),
 							worktree,
 						);
 					} catch (error) {
@@ -1126,6 +1157,15 @@ export function createDefaultRunSession(
 			if (r) r.lifecycle = markDelivery(r.lifecycle, "suppressed");
 			state.kernel.suppress(id);
 			state.entries.delete(id);
+		},
+		async cancel(id) {
+			// The kernel records the intent and projects every owner's cancel state
+			// through onCancelState; a natural result taken first keeps its own.
+			try {
+				return await state.kernel.cancel(id);
+			} finally {
+				prune(id);
+			}
 		},
 		async sendPersistent(id, text) {
 			return state.options.persistent.send(record(id), text, io);

@@ -1871,6 +1871,466 @@ describe("host adapter migration", () => {
 		}));
 });
 
+describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
+	const cancel = (f: any, params: { id?: string; name?: string }) =>
+		f.mock.registeredTools
+			.find((tool: any) => tool.name === "subagent_cancel")
+			.execute(
+				"cancel",
+				params,
+				new AbortController().signal,
+				undefined,
+				f.ctx,
+			);
+	const results = (f: any) =>
+		f.mock.sentMessages.filter(
+			(sent: any) => sent.message.customType === "subagent_result",
+		);
+	async function until(f: any, predicate: () => boolean, what: string) {
+		const deadline = Date.now() + 8_000;
+		while (!predicate()) {
+			assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+			await f.turn();
+		}
+	}
+	async function worktreeHost(f: any) {
+		const git = (cwd: string, ...args: string[]) =>
+			execFileSync(
+				"git",
+				[
+					"-c",
+					"user.name=Test",
+					"-c",
+					"user.email=test@example.com",
+					"-c",
+					"commit.gpgsign=false",
+					...args,
+				],
+				{ cwd, encoding: "utf8" },
+			).trim();
+		git(f.projectDir, "init", "-q");
+		writeFileSync(join(f.projectDir, "tracked"), "base");
+		git(f.projectDir, "add", "tracked");
+		git(f.projectDir, "commit", "-qm", "fixture");
+		const retained = join(f.globalDir, "retained");
+		execFileSync("git", ["clone", "-q", f.projectDir, retained]);
+		f.patch(f.launchOperations, "createWorktree", () => ({
+			path: retained,
+			workspaceId: "owned-workspace",
+			paneId: f.surface.createSurface({ name: "worktree-root", cwd: retained }),
+			branch: "cancel-worktree",
+		}));
+		return { retained, git };
+	}
+
+	// A fake kernel for worktree cancel: launch capture yields pid 4242's
+	// identity; SIGTERM removes it from the table.
+	function identityKernel(f: any) {
+		const host = { bootId: "boot", pidNamespace: "pid:[1]" };
+		const table = new Map<number, any>();
+		const signals: number[] = [];
+		f.patch(f.launchOperations, "captureProcessIdentity", async () => ({
+			pid: 4242,
+			startTime: "5000",
+			...host,
+		}));
+		f.patch(f.infrastructure, "processProbe", {
+			host: () => host,
+			stat(pid: number) {
+				const entry = table.get(pid);
+				if (entry === "EACCES")
+					throw Object.assign(new Error("EACCES: permission denied"), {
+						code: "EACCES",
+					});
+				return entry;
+			},
+			terminate(pid: number) {
+				signals.push(pid);
+				table.delete(pid);
+			},
+		});
+		return { table, signals };
+	}
+
+	it("registers a parent tool, is spawning-gated, and is denied to restricted children", () => {
+		const { api, registeredTools } = createMockExtensionApi();
+		subagentsModule.default(api);
+		const tool = registeredTools.find((t) => t.name === "subagent_cancel");
+		assert.ok(tool);
+		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), [
+			"id",
+			"name",
+		]);
+		for (const pattern of [
+			/terminal intent first/,
+			/exactly one cancelled result/,
+			/No model fallback, retry, or recovery/,
+			/keeps the workspace, checkout, commits, and manifest/,
+			/confirmed, requested .*unconfirmed .*already-terminal/,
+			/Persistent specialists are rejected; use subagent_stop/,
+			/Do not poll/,
+		])
+			assert.match(tool.description, pattern);
+		assert.equal(tool.promptSnippet, tool.description);
+		assert.equal(
+			subagentsModule.__test__
+				.resolveDenyTools({ spawning: false })
+				.has("subagent_cancel"),
+			true,
+		);
+		process.env.PI_SUBAGENT_ID = "child-test";
+		process.env.PI_DENY_TOOLS = "subagent_cancel";
+		try {
+			const child = createMockExtensionApi();
+			subagentsModule.default(child.api);
+			assert.equal(
+				child.registeredTools.some((t) => t.name === "subagent_cancel"),
+				false,
+			);
+			assert.equal(
+				child.registeredTools.some((t) => t.name === "subagent_interrupt"),
+				true,
+			);
+		} finally {
+			delete process.env.PI_SUBAGENT_ID;
+			delete process.env.PI_DENY_TOOLS;
+		}
+	});
+
+	it("negative control: closing a fallback-routed pane without cancel starts the next model", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "uncancelled",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			f.surface.closeSurface(child.surface);
+			await until(f, () => f.commands.length === 2, "the fallback launch");
+			assert.equal(results(f).length, 0);
+		}));
+
+	it("cancels a fallback-routed ordinary child once: no fallback, unrelated panes kept", async () =>
+		withAdapterHost(async (f) => {
+			const unrelated = f.surface.createSurface({
+				name: "user pane",
+				cwd: f.projectDir,
+			});
+			const other = await f.launch({ name: "other", task: "bounded" });
+			const child = await f.launch({
+				name: "target",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			const response = await cancel(f, { name: "target" });
+			assert.equal(response.details.status, "confirmed");
+			assert.equal(response.details.id, child.id);
+			assert.match(
+				response.content[0].text,
+				/pane was closed and Herdr confirmed it is gone\. No model fallback, retry, or recovery will start\./,
+			);
+			await until(f, () => results(f).length === 1, "the cancelled result");
+			const [delivered] = results(f);
+			const details = delivered.message.details;
+			assert.equal(details.name, "target");
+			assert.equal(details.error, "cancelled");
+			assert.equal(details.errorMessage, undefined);
+			assert.equal(details.cancellation.termination, "confirmed");
+			assert.deepEqual(details.fallbackAttempts, ["fake/first"]);
+			assert.equal(details.sessionFile, child.sessionFile);
+			assert.match(
+				delivered.message.content,
+				/Sub-agent "target" was cancelled by the parent after .*Termination was confirmed before this result; no model fallback, retry, or recovery was started\./,
+			);
+			assert.deepEqual(delivered.options, {
+				triggerTurn: true,
+				deliverAs: "steer",
+			});
+			// Give a late watcher/fallback every chance to misbehave.
+			for (let i = 0; i < 20; i++) await f.turn();
+			assert.equal(f.commands.length, 2, "no fallback attempt was launched");
+			assert.equal(results(f).length, 1);
+			assert.deepEqual([...new Set(f.closed)], [child.surface]);
+			assert.equal(f.runtime.runningSubagents.has(child.id), false);
+			assert.equal(f.runtime.runningSubagents.get(other.id), other);
+			const live = f.surface.listSurfaces().map((s: any) => s.id);
+			assert.ok(live.includes(unrelated) && live.includes(other.surface));
+			// Repeating the cancel by ID reports the retired run; by name it is gone.
+			const again = await cancel(f, { id: child.id });
+			assert.equal(again.details.status, "already-terminal");
+			assert.match(again.content[0].text, /nothing was cancelled/);
+			assert.match(
+				(await cancel(f, { name: "target" })).details.error,
+				/No running subagent named "target"/,
+			);
+			assert.equal(results(f).length, 1);
+			await f.finish(other);
+		}));
+
+	it("an unconfirmed termination keeps the run live and quiet until a retry confirms it", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "stubborn",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			const close = f.surface.closeSurface;
+			f.surface.closeSurface = async () => {
+				throw new Error("herdr pane close timed out");
+			};
+			const first = await cancel(f, { id: child.id });
+			assert.equal(first.details.status, "unconfirmed");
+			assert.match(first.details.error, /herdr pane close timed out/);
+			assert.match(first.content[0].text, /The run stays live and owned/);
+			assert.equal(f.runtime.runningSubagents.get(child.id), child);
+			assert.equal(child.cancelState, "unconfirmed");
+			assert.match(
+				subagentsModule.__test__
+					.renderSubagentWidgetLines([child], 100)
+					.join("\n"),
+				/cancel unconfirmed/,
+			);
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(results(f).length, 0);
+			assert.equal(f.commands.length, 1);
+			f.surface.closeSurface = close;
+			const retry = await cancel(f, { id: child.id });
+			assert.equal(retry.details.status, "confirmed");
+			assert.equal(retry.details.repeated, true);
+			assert.equal(retry.details.requestedAt, first.details.requestedAt);
+			await until(f, () => results(f).length === 1, "the cancelled result");
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(results(f).length, 1);
+			assert.equal(f.commands.length, 1);
+		}));
+
+	it("a cancel racing natural delivery is already-terminal and kills nothing", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "finisher",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			const control = f.runtime.session.getControlTaskId(child.id);
+			let late: Promise<any> | undefined;
+			const send = f.mock.api.sendMessage;
+			f.mock.api.sendMessage = (...args: any[]) => {
+				// The natural result is being delivered; the run is not yet retired.
+				late ??= f.runtime.session.cancel(control);
+				send(...args);
+			};
+			await f.finish(child);
+			assert.deepEqual(await late, { status: "already-terminal" });
+			assert.equal(child.cancelState, undefined);
+			assert.equal(results(f).length, 1);
+			assert.equal(results(f)[0].message.details.error, undefined);
+			assert.equal(results(f)[0].message.details.cancellation, undefined);
+			assert.match(results(f)[0].message.content, /completed/);
+			assert.equal(f.commands.length, 1);
+			assert.deepEqual(
+				f.closed,
+				[child.surface],
+				"only the normal release close",
+			);
+		}));
+
+	it("cancels an interrupted child", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({ name: "paused", task: "bounded" });
+			const interrupted =
+				await subagentsModule.__test__.handleSubagentInterrupt({
+					id: child.id,
+				});
+			assert.equal(interrupted.details.status, "interrupt_requested");
+			assert.equal(
+				(await cancel(f, { id: child.id })).details.status,
+				"confirmed",
+			);
+			await until(f, () => results(f).length === 1, "the cancelled result");
+			assert.equal(results(f)[0].message.details.error, "cancelled");
+		}));
+
+	it("rejects a persistent specialist with a pointer to subagent_stop and changes nothing", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "specialist",
+				task: "bounded",
+				persistent: true,
+			});
+			const response = await cancel(f, { name: "specialist" });
+			assert.match(
+				response.details.error,
+				new RegExp(
+					`persistent specialist; subagent_cancel does not stop it\\. Use subagent_stop\\(\\{ id: "${child.id}" \\}\\)`,
+				),
+			);
+			assert.equal(response.details.status, undefined);
+			assert.equal(child.cancelState, undefined);
+			assert.equal(child.stopState, undefined);
+			assert.deepEqual(f.closed, []);
+			assert.equal(f.runtime.runningSubagents.get(child.id), child);
+		}));
+
+	it("cancels a worktree child: stops only its process, retains workspace, commits, and handoff", async () =>
+		withAdapterHost(async (f) => {
+			const { retained, git } = await worktreeHost(f);
+			// The launch-verified identity of the child's Pi, and the kernel's view.
+			const kernel = identityKernel(f);
+			kernel.table.set(4242, "EACCES");
+			const child = await f.launch({
+				name: "writer",
+				task: "bounded",
+				worktree: { branch: "cancel-worktree" },
+			});
+			writeFileSync(join(retained, "work"), "committed work");
+			git(retained, "add", "work");
+			git(retained, "commit", "-qm", "child work");
+			const head = git(retained, "rev-parse", "HEAD");
+			// The identity is unreadable: never signal it, never guess it exited.
+			const first = await cancel(f, { id: child.id });
+			assert.equal(first.details.status, "unconfirmed");
+			assert.match(
+				first.details.error,
+				/process 4242 is unreadable: EACCES.*not signalled/,
+			);
+			assert.deepEqual(kernel.signals, []);
+			assert.equal(
+				JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state,
+				"running",
+			);
+			assert.equal(results(f).length, 0);
+			// The owned process is readable and alive: SIGTERM ends THAT identity.
+			kernel.table.set(4242, { state: "S", ppid: 10, startTime: "5000" });
+			const retry = await cancel(f, { id: child.id });
+			assert.deepEqual(kernel.signals, [4242]);
+			assert.equal(retry.details.status, "confirmed");
+			assert.match(
+				retry.content[0].text,
+				/Pi process exit is confirmed; the worktree workspace, checkout, commits, and manifest are retained/,
+			);
+			await until(f, () => results(f).length === 1, "the cancelled result");
+			const delivered = results(f)[0].message;
+			assert.equal(delivered.details.error, "cancelled");
+			assert.equal(delivered.details.worktree.headSha, head);
+			assert.equal(delivered.details.worktree.commitsAhead, 1);
+			assert.equal(delivered.details.worktree.workspaceId, "owned-workspace");
+			assert.match(delivered.content, /Worktree result retained for review:/);
+			assert.equal(
+				JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state,
+				"cancelled",
+			);
+			assert.deepEqual(f.closed, [], "no surface is closed for a worktree");
+			assert.ok(
+				f.surface.listSurfaces().some((s: any) => s.id === child.surface),
+			);
+			assert.equal(git(retained, "rev-parse", "HEAD"), head);
+			assert.equal(
+				readFileSync(join(retained, "work"), "utf8"),
+				"committed work",
+			);
+		}));
+
+	it("a worktree child without a captured process identity stays unconfirmed; shutdown never records cancelled", async () =>
+		withAdapterHost(async (f) => {
+			const { retained } = await worktreeHost(f);
+			// Herdr's idle shell is never exit evidence: only the identity is.
+			const kernel = identityKernel(f);
+			f.patch(f.launchOperations, "captureProcessIdentity", async () => {
+				throw new Error("Process identity not captured within 15000ms");
+			});
+			const child = await f.launch({
+				name: "uncaptured",
+				task: "bounded",
+				worktree: { branch: "cancel-worktree" },
+			});
+			f.patch(f.surface, "getProcessInfo", () => ({
+				shellPid: 10,
+				foregroundProcessGroupId: 10,
+				pids: [10],
+				foregroundProcesses: [],
+			}));
+			const manifest = () =>
+				JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state;
+			const report = await cancel(f, { id: child.id });
+			assert.equal(report.details.status, "unconfirmed");
+			assert.match(
+				report.details.error,
+				/identity was not captured .*nothing was signalled: Process identity not captured/,
+			);
+			assert.deepEqual(kernel.signals, []);
+			assert.equal(child.cancelState, "unconfirmed");
+			assert.equal(manifest(), "running");
+			// Parent shutdown suppresses the unconfirmed run: it is not a cancellation.
+			f.runtime.session.suppress(f.runtime.session.getControlTaskId(child.id));
+			await until(f, () => manifest() !== "running", "the shutdown manifest");
+			assert.equal(manifest(), "failed");
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(results(f).length, 0);
+			assert.deepEqual(f.closed, []);
+			assert.ok(existsSync(retained));
+		}));
+
+	it("a fallback owner transferred after the cancel shows its own unconfirmed kill and stays live", async () =>
+		withAdapterHost(async (f) => {
+			const first = await f.launch({
+				name: "transferred",
+				task: "bounded",
+				model: "fake/first, fake/second, fake/third",
+			});
+			let launched!: () => void;
+			let release!: () => void;
+			const launching = new Promise<void>((resolve) => {
+				launched = resolve;
+			});
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const runScript = f.launchOperations.runScript;
+			f.patch(f.launchOperations, "runScript", async (...args: any[]) => {
+				launched();
+				await gate;
+				return runScript(...args);
+			});
+			await f.finish(first, {
+				type: "error",
+				errorMessage: "provider refused",
+			});
+			await launching;
+			const requested = await cancel(f, { id: first.id });
+			assert.equal(requested.details.status, "requested");
+			assert.equal(first.cancelState, "requested");
+			// The transferred owner's automatic kill cannot confirm termination.
+			f.patch(f.surface, "closeSurface", async () => {
+				throw new Error("herdr pane close timed out");
+			});
+			release();
+			let second: any;
+			await until(
+				f,
+				() => {
+					second = f.runtime.runningSubagents.get(first.id);
+					return second !== first && second?.cancelState === "unconfirmed";
+				},
+				"the transferred owner's unconfirmed cancel",
+			);
+			assert.match(
+				subagentsModule.__test__
+					.renderSubagentWidgetLines([second], 100)
+					.join("\n"),
+				/cancel unconfirmed/,
+			);
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(
+				results(f).length,
+				0,
+				"nothing is delivered while unconfirmed",
+			);
+			assert.equal(f.commands.length, 2, "the third model is never launched");
+			assert.ok(
+				f.surface.listSurfaces().some((s: any) => s.id === second.surface),
+			);
+		}));
+});
+
 describe("session.ts", () => {
 	let dir: string;
 

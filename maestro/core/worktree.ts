@@ -42,6 +42,7 @@ export type WorktreeResultState =
 	| "ready_for_review"
 	| "failed"
 	| "needs_help"
+	| "cancelled"
 	| "removed";
 
 export function isWorktreeManifest(value: JsonObject): boolean {

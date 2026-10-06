@@ -126,12 +126,13 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 ### Extensions
 
-**Subagents** — 9 parent-session tools + 3 commands, plus 2 child-only tools:
+**Subagents** — 10 parent-session tools + 3 commands, plus 2 child-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_cancel`    | Cancel a running ordinary subagent: no fallback, one cancelled result after confirmed termination |
 | `subagent_send`      | Deliver a follow-up task to an idle persistent specialist                                   |
 | `subagent_stop`      | Gracefully stop a persistent specialist after its active task settles                      |
 | `subagents_list`     | List available agent definitions                                                            |
@@ -293,6 +294,7 @@ Projected labels include:
 - `stalled` — pane inspection is unhealthy long enough that the parent can no longer trust the run
 - `running` — fallback when only coarse process presence is known (e.g. non-Pi backends)
 - `finalizing` — completion was observed and delivery is in progress; the process elapsed timer freezes here
+- `cancelling…` / `cancel unconfirmed` — a `subagent_cancel` is terminating the run, or its termination could not be confirmed and the run stays live
 
 The widget header counts **active** vs **open**:
 
@@ -523,7 +525,8 @@ never interrupts, kills, retries, or restarts a child. It identifies `blocked-to
 `truncated-turn` (an observed `toolUse` stop with no tool call; its cause is unknown), or
 `generic-no-progress` when neither condition is established, then
 includes the session path and manual recovery options. Ordinary children can be
-interrupted or, after manual termination, resumed or newly spawned. Persistent
+interrupted, cancelled with `subagent_cancel`, or, after termination, resumed or
+newly spawned. Persistent
 ordinary-pane specialists can be interrupted or stopped with `subagent_stop` and
 replaced; they cannot be resumed. Managed-worktree children, including persistent
 ones, retain their workspace and continue there only after the previous process
@@ -691,7 +694,37 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 
 `id` and `name` are each optional, but execution requires one usable target: an exact running ID or an exact, unambiguous display name. When both are supplied, `id` is used. Duplicate names are rejected.
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+This is a turn-level interrupt, not a method for forcibly terminating a subagent session. To end the run, use `subagent_cancel`.
+
+## Cancelling a running subagent
+
+Use `subagent_cancel` to end one ordinary (non-persistent) managed run, including an interrupted one:
+
+```typescript
+subagent_cancel({ id: "abcd1234" });
+// or
+subagent_cancel({ name: "Scout" });
+```
+
+Target resolution matches `subagent_interrupt`: an exact running ID or an exact, unambiguous display name. Persistent specialists are rejected; use `subagent_stop`, whose graceful v1 semantics are unchanged.
+
+The cancel intent is recorded before anything is aborted or killed. From then on the run never advances its model shortlist, retries, or recovers, even when terminating the pane makes the watcher observe a lost pane, and even when a fallback launch was already in flight. The result reports one status:
+
+| Status | Meaning |
+| --- | --- |
+| `confirmed` | Termination is confirmed. One cancelled result is delivered automatically. |
+| `requested` | A launch or fallback acquisition is still in flight. Its owner is terminated as soon as it is acquired; no later model is tried. |
+| `unconfirmed` | Termination failed (the error is reported). The run stays live, owned, and supervised, and nothing is delivered or cleaned up. Call `subagent_cancel` again to retry. |
+| `already-terminal` | The run already took a natural result or was retired; nothing was cancelled. |
+
+Repeated cancels join an in-flight termination and keep the first request time. The parent receives exactly one `subagent_result` whose details carry `error: "cancelled"` and a `cancellation` record (`requestedAt`, `termination`, `confirmedAt`). Its message says the run was cancelled and lists any models already attempted. It is never presented as a provider failure. A child's natural result taken before the cancel stays authoritative. A cancel while a provider error is still eligible for fallback wins and stops that fallback.
+
+Termination follows surface ownership:
+
+- **Ordinary pane:** the pane is closed. Confirmation is Herdr reporting it absent; closing a Herdr pane terminates its terminal session, but this is not a separate OS process check. Other panes, tabs, and user panes are never closed.
+- **Managed worktree:** the retained root pane, workspace, checkout, branch, commits, and manifest are kept. At launch, the child records its own process identity (PID, kernel start time, boot ID, and PID namespace) beside its session; the parent accepts it only while that process is alive in the parent's PID namespace as the Herdr pane shell or a descendant of it. SIGTERM goes only to that identity, re-verified immediately before the signal. Confirmation requires that identity to no longer exist, or the pane to be gone while it is not known alive. Command-line text and Herdr's foreground list are never evidence, because Pi rewrites its process title. A live identity (for example a suspended Pi), or one whose SIGTERM fails while it is still alive, leaves termination `unconfirmed` even if the pane is gone. An identity that was not captured (including on non-Linux hosts), is unreadable, or whose PID now names another process is never signalled and leaves termination `unconfirmed` unless pane absence confirms it. Every Herdr query and capture wait is bounded by the cancel's deadline (5 seconds); an answer that arrives after the deadline is ignored, even if it settles before the timer runs, and never changes a reported outcome. A retry re-checks, and if the launch capture expired it captures the identity again within its own deadline. The manifest becomes `cancelled` only after confirmed termination (a parent shutdown while unconfirmed records the plain shutdown state), and the normal worktree handoff is delivered. No Git cleanup is performed. See [Worktree subagents](docs/worktree-subagents.md).
+
+Do not poll after cancelling; the cancelled result arrives as a steer message. Design rationale: [ADR-0014](docs/adr/0014-operator-cancel-terminal-intent.md).
 
 The package ships one host-owned skill, `pi-herdr-agents`, a general operating guide covering launching, lifecycle control, persistent specialists, worktrees, and configuration. Live tool descriptions and this README remain authoritative.
 
@@ -1038,7 +1071,7 @@ Without a restrictive `tools` allowlist or spawning policy, a sub-agent can spaw
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagent_send`, `subagent_stop`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagent_cancel`, `subagent_send`, `subagent_stop`, `subagents_list`, `subagent_resume`):
 
 ```yaml
 ---

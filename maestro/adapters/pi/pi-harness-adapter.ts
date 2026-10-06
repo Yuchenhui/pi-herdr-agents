@@ -34,8 +34,18 @@ import {
 import type { FileWakeRegistry } from "../../core/wake.ts";
 import type { SupervisionCoordinator } from "../../core/supervision.ts";
 import {
+	judgeProcessIdentity,
+	linuxProcessProbe,
+	terminateProcessIdentity,
+	type PiProcessIdentity,
+	type ProcessIdentityProbe,
+	type ProcessIdentityState,
+} from "./process-identity.ts";
+import {
 	launchOperationsFromSurface,
 	launchPiSubagent,
+	settleBefore,
+	startProcessIdentityCapture,
 	type FreshPiLaunchRequest,
 	type PiLaunchOperations,
 	type PiRunningChild,
@@ -85,6 +95,10 @@ export interface PiHarnessAdapterOptions {
 	/** Optional launch-operation injection, keeping the real Pi protocol in unit tests. */
 	operations?: PiLaunchOperations;
 	worktreeOperations?: WorktreeOperations;
+	/** Kernel process facts for a retained worktree child's identity; tests inject it. */
+	processProbe?: ProcessIdentityProbe;
+	/** Bound for confirming a retained worktree child's exit. Default: 5000ms. */
+	killTimeoutMs?: number;
 	/** Explicit local evidence/lifecycle bridge. The host still owns delivery and deduplication. */
 	onObservation?(
 		child: PiRunningChild,
@@ -165,6 +179,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
 			for (const name of [
 				"subagent",
 				"subagent_interrupt",
+				"subagent_cancel",
 				"subagent_send",
 				"subagent_stop",
 				"subagents_list",
@@ -349,10 +364,113 @@ export class PiHarnessAdapter implements HarnessAdapter {
 		child.lifecycle = markInterruptRequested(child.lifecycle, Date.now());
 		this.options.onObservation?.(child, "interrupt");
 	}
+	/** Resolves only with termination evidence; otherwise rejects (unconfirmed). */
 	async kill(handle: AgentHandle): Promise<void> {
 		const child = this.getRunningChild(handle);
-		await this.options.surface.closeSurface(child.surface);
-		await this.options.surface.waitForSurfaceAbsence(child.surface);
+		// A worktree root pane is the retained review workspace (Herdr refuses to
+		// close it): stop only the owned Pi process and keep pane and checkout.
+		if (child.worktree) return this.stopRetainedPi(child);
+		let closeError: unknown;
+		try {
+			await this.options.surface.closeSurface(child.surface);
+		} catch (error) {
+			// Absence is still checked: a pane that is already gone is terminated.
+			closeError = error;
+		}
+		try {
+			await this.options.surface.waitForSurfaceAbsence(child.surface);
+		} catch (error) {
+			if (closeError === undefined) throw error;
+			throw new Error(`${errorText(closeError)}; ${errorText(error)}`);
+		}
+	}
+	/**
+	 * Exit evidence is only the launch-verified identity (PID + start time, on
+	 * this boot and PID namespace) no longer existing, or a gone pane while that
+	 * identity is not known alive. SIGTERM goes only to that identity,
+	 * re-verified first; without it nothing is signalled and the cancel stays
+	 * unconfirmed. A failed SIGTERM to a live identity stays unconfirmed unless
+	 * that identity then exits. Herdr's foreground list and argv text are never
+	 * evidence.
+	 * Every provider await is bounded by the deadline, and a late answer is
+	 * dropped, so an unconfirmed outcome is reported on time and never flipped.
+	 */
+	private async stopRetainedPi(child: PiRunningChild): Promise<void> {
+		const probe = this.options.processProbe ?? linuxProcessProbe;
+		const timeoutMs = this.options.killTimeoutMs ?? 5_000;
+		const deadline = Date.now() + timeoutMs;
+		const paneGone = async () =>
+			(
+				await settleBefore(
+					// Providers may throw synchronously or reject; both mean "unknown".
+					Promise.resolve()
+						.then(() => this.options.surface.inspectSurface(child.surface))
+						.catch(() => undefined),
+					deadline,
+				)
+			)?.kind === "missing";
+		let identity = child.processIdentity;
+		if (!identity) {
+			// An expired capture gets one fresh attempt within this cancel's budget.
+			if (child.processIdentityError !== undefined)
+				startProcessIdentityCapture(child, this.operations, {
+					timeoutMs: Math.max(0, deadline - Date.now()),
+				});
+			// Inspect alongside the capture wait so absence evidence is not
+			// starved by it; the identity is re-read after the inspection.
+			const absence = paneGone();
+			const captured = await settleBefore(
+				child.processIdentityCapture,
+				deadline,
+			);
+			const gone = (child.processIdentity ?? captured) ? false : await absence;
+			identity = child.processIdentity ?? captured;
+			if (!identity) {
+				if (gone) return;
+				throw new Error(
+					`Owned Pi process identity was not captured for retained worktree pane ${child.surface}; nothing was signalled: ${child.processIdentityError ?? (child.processIdentityCapture ? "identity capture is still pending" : "no identity was recorded at launch")}`,
+				);
+			}
+		}
+		let signalled = false;
+		const verified = identity;
+		const signal = (): ProcessIdentityState => {
+			const before = judgeProcessIdentity(verified, probe);
+			if (before.kind !== "alive") return before;
+			const after = terminateProcessIdentity(verified, probe);
+			if (after.kind === "alive") signalled = true;
+			if (after.kind !== "unknown") return after;
+			// The identity was just known alive and the signal failed: only its
+			// own exit confirms; pane absence never does.
+			if (judgeProcessIdentity(verified, probe).kind === "exited")
+				return { kind: "exited" };
+			throw new Error(
+				`Owned Pi process exit unconfirmed in retained worktree pane ${child.surface}: ${after.reason}; process ${verified.pid} was alive when signalled`,
+			);
+		};
+		let state = signal();
+		let paneSeenGone = false;
+		for (;;) {
+			if (state.kind === "exited") return;
+			// Unknown is never signalled and waiting cannot make it evidence.
+			if (state.kind === "unknown") {
+				if (!paneSeenGone && !(await paneGone())) break;
+				paneSeenGone = true;
+				// The inspection awaited: confirm only while still not known alive.
+				state = judgeProcessIdentity(identity, probe);
+				if (state.kind === "alive" && !signalled) state = signal();
+				if (state.kind !== "alive") return;
+			}
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			await new Promise((resolve) =>
+				setTimeout(resolve, Math.min(50, remaining)),
+			);
+			state = judgeProcessIdentity(identity, probe);
+		}
+		throw new Error(
+			`Owned Pi process exit unconfirmed in retained worktree pane ${child.surface}: ${describeIdentityState(identity, state, signalled, timeoutMs)}`,
+		);
 	}
 	async readOutput(handle: AgentHandle, lines?: number): Promise<string> {
 		return this.options.surface.readScreen(
@@ -565,4 +683,19 @@ export class PiHarnessAdapter implements HarnessAdapter {
 				"The existing Pi launch protocol does not support per-child environment overrides",
 			);
 	}
+}
+
+function errorText(cause: unknown): string {
+	return cause instanceof Error ? cause.message : String(cause);
+}
+
+function describeIdentityState(
+	identity: PiProcessIdentity,
+	state: ProcessIdentityState,
+	signalled: boolean,
+	timeoutMs: number,
+): string {
+	if (state.kind === "unknown")
+		return `${state.reason}${signalled ? " after SIGTERM" : "; not signalled"}`;
+	return `process ${identity.pid} (start time ${identity.startTime}) is still ${state.kind} ${timeoutMs}ms after SIGTERM`;
 }
