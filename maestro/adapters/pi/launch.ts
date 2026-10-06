@@ -269,6 +269,7 @@ export async function captureSurfacePiProcessIdentity(
 	const intervalMs = options.intervalMs ?? 100;
 	const deadline = Date.now() + timeoutMs;
 	let lastError = "the child has not recorded its process identity";
+	let answered = false;
 	for (;;) {
 		try {
 			const record = readProcessIdentityRecord(expected.file);
@@ -279,8 +280,13 @@ export async function captureSurfacePiProcessIdentity(
 					deadline,
 					{ unref: true },
 				);
-				if (!info)
-					throw new Error(`Herdr process info for pane ${surface} timed out`);
+				if (!info) {
+					// The deadline passed; an earlier answer's refusal says more.
+					if (!answered)
+						lastError = `Herdr process info for pane ${surface} timed out`;
+					break;
+				}
+				answered = true;
 				if (info.shellPid === undefined)
 					throw new Error(`Herdr reports no shell for pane ${surface}`);
 				return verifyProcessIdentityRecord(
@@ -306,7 +312,8 @@ export async function captureSurfacePiProcessIdentity(
 
 /**
  * The pending value if it settles before the deadline; otherwise undefined.
- * A value that arrives after the deadline is dropped, never reported.
+ * A value that arrives after the deadline is dropped, never reported, even
+ * when a delayed event loop runs it before the overdue timer.
  */
 export async function settleBefore<T>(
 	pending: Promise<T> | undefined,
@@ -321,7 +328,10 @@ export async function settleBefore<T>(
 	const timer = setTimeout(expire, Math.max(0, deadline - Date.now()));
 	if (options.unref) timer.unref();
 	try {
-		return await Promise.race([pending, expired]);
+		const onTime = pending.then((value) =>
+			Date.now() > deadline ? undefined : value,
+		);
+		return await Promise.race([onTime, expired]);
 	} finally {
 		clearTimeout(timer);
 	}

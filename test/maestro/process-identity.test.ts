@@ -414,6 +414,43 @@ describe("process identity", () => {
 		}),
 	);
 
+	it(
+		"drops an overdue Herdr answer that wins the race before the overdue timer runs",
+		withDir(async (dir) => {
+			const file = join(dir, "s.jsonl.process.json");
+			writeProcessIdentityRecord(file, record());
+			const { probe } = fakeProbe([
+				[20, stat()],
+				[10, stat("1", "S", 1)],
+			]);
+			const expected = { file, id: "run", sessionFile: "/s.jsonl" };
+			// Synchronous work blocks the event loop past the deadline; the answer
+			// settles first, before the expired timer can fire.
+			const busy = {
+				getProcessInfo: () => {
+					const until = Date.now() + 30;
+					while (Date.now() < until);
+					return paneOf(10).getProcessInfo();
+				},
+			};
+			await assert.rejects(
+				captureSurfacePiProcessIdentity(busy, "pane", expected, {
+					timeoutMs: 5,
+					probe,
+				}),
+				/not captured within 5ms: Herdr process info for pane pane timed out/,
+			);
+			// Negative control: the same synchronous answer inside its budget is used.
+			assert.deepEqual(
+				await captureSurfacePiProcessIdentity(busy, "pane", expected, {
+					timeoutMs: 1_000,
+					probe,
+				}),
+				identity,
+			);
+		}),
+	);
+
 	it("the /proc reader treats only a missing PID as absence; other read errors throw", () => {
 		const probe = (error: Error) =>
 			createLinuxProcessProbe(() => {

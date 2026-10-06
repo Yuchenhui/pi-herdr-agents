@@ -389,7 +389,9 @@ export class PiHarnessAdapter implements HarnessAdapter {
 	 * this boot and PID namespace) no longer existing, or a gone pane while that
 	 * identity is not known alive. SIGTERM goes only to that identity,
 	 * re-verified first; without it nothing is signalled and the cancel stays
-	 * unconfirmed. Herdr's foreground list and argv text are never evidence.
+	 * unconfirmed. A failed SIGTERM to a live identity stays unconfirmed unless
+	 * that identity then exits. Herdr's foreground list and argv text are never
+	 * evidence.
 	 * Every provider await is bounded by the deadline, and a late answer is
 	 * dropped, so an unconfirmed outcome is reported on time and never flipped.
 	 */
@@ -430,8 +432,23 @@ export class PiHarnessAdapter implements HarnessAdapter {
 				);
 			}
 		}
-		let state: ProcessIdentityState = terminateProcessIdentity(identity, probe);
-		let signalled = state.kind === "alive";
+		let signalled = false;
+		const verified = identity;
+		const signal = (): ProcessIdentityState => {
+			const before = judgeProcessIdentity(verified, probe);
+			if (before.kind !== "alive") return before;
+			const after = terminateProcessIdentity(verified, probe);
+			if (after.kind === "alive") signalled = true;
+			if (after.kind !== "unknown") return after;
+			// The identity was just known alive and the signal failed: only its
+			// own exit confirms; pane absence never does.
+			if (judgeProcessIdentity(verified, probe).kind === "exited")
+				return { kind: "exited" };
+			throw new Error(
+				`Owned Pi process exit unconfirmed in retained worktree pane ${child.surface}: ${after.reason}; process ${verified.pid} was alive when signalled`,
+			);
+		};
+		let state = signal();
 		let paneSeenGone = false;
 		for (;;) {
 			if (state.kind === "exited") return;
@@ -441,10 +458,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
 				paneSeenGone = true;
 				// The inspection awaited: confirm only while still not known alive.
 				state = judgeProcessIdentity(identity, probe);
-				if (state.kind === "alive" && !signalled) {
-					state = terminateProcessIdentity(identity, probe);
-					signalled = state.kind === "alive";
-				}
+				if (state.kind === "alive" && !signalled) state = signal();
 				if (state.kind !== "alive") return;
 			}
 			const remaining = deadline - Date.now();

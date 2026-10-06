@@ -515,7 +515,10 @@ for (const backend of backends) {
 					}),
 					new RegExp(`Cancel ${s.id}`),
 				);
-				// Child Pi process is gone (exact session path), sleep may linger.
+				// Weak check only: Pi rewrites its process title, so its argv no
+				// longer names the session and this count is 0 even while it runs.
+				// Exit evidence is the runtime's identity-based confirmation above.
+				// The sleep may linger.
 				// SAFETY: a delivered subagent_result always records its session file.
 				const childSession = result.details.sessionFile as string;
 				assert.equal(

@@ -1033,6 +1033,48 @@ describe("PiHarnessAdapter retained worktree kill", () => {
 			await assert.rejects(w.adapter.kill(w.h), /is still alive/);
 			assert.deepEqual(signals, [20], "signalled once, after re-verification");
 		}));
+	const eperm = () => {
+		throw Object.assign(new Error("EPERM: kill 20"), { code: "EPERM" });
+	};
+	it("a failed SIGTERM to an identity known alive again after the pane check is unconfirmed, not confirmed by absence", async () =>
+		usingFixture(async (f) => {
+			const table = new Map<number, Entry>([[20, "EACCES"]]);
+			const { probe, signals } = fakeProbe(table, eperm);
+			const w = await worktreeChild(f, { probe, identity: identity() });
+			f.surface.inspectSurface = async () => {
+				table.set(20, alive());
+				return { kind: "missing" };
+			};
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/exit unconfirmed .*SIGTERM to process 20 failed: EPERM: kill 20; process 20 was alive when signalled/,
+			);
+			assert.deepEqual(signals, [20], "one failed attempt, never repeated");
+		}));
+	it("a failed SIGTERM to a live identity is unconfirmed even when the pane is already gone", async () =>
+		usingFixture(async (f) => {
+			const { probe, signals } = fakeProbe(new Map([[20, alive()]]), eperm);
+			const w = await worktreeChild(f, { probe, identity: identity() });
+			f.surface.removeSurface(w.child.surface);
+			await assert.rejects(
+				w.adapter.kill(w.h),
+				/SIGTERM to process 20 failed: EPERM.*was alive when signalled/,
+			);
+			assert.deepEqual(signals, [20]);
+		}));
+	for (const paneGone of [false, true])
+		it(`negative control: a failed SIGTERM whose identity is really gone confirms (pane ${paneGone ? "gone" : "present"})`, async () =>
+			usingFixture(async (f) => {
+				const table = new Map<number, Entry>([[20, alive()]]);
+				const { probe, signals } = fakeProbe(table, (pid) => {
+					table.delete(pid);
+					eperm();
+				});
+				const w = await worktreeChild(f, { probe, identity: identity() });
+				if (paneGone) f.surface.removeSurface(w.child.surface);
+				await w.adapter.kill(w.h);
+				assert.deepEqual(signals, [20]);
+			}));
 	it("negative control: an identity captured during the absence check that already exited confirms", async () =>
 		usingFixture(async (f) => {
 			const { probe, signals } = fakeProbe(new Map());
