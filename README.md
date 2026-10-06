@@ -627,13 +627,15 @@ child settles with a provider/agent error. Pi owns any automatic transient
 retrying inside that child; the extension does not infer retry counts or
 permanence from the error text. A later candidate that launches after a parent
 `/reload`, `/new`, `/resume`, or `/fork` uses the live parent session for its
-artifacts and lineage, as completion delivery does. Its candidate list, thinking
-level, and working directory stay those of the original call. If no live parent
-session exists, that candidate fails without launching. A completed child
-result, including a negative task result, never switches models. Completion
-metadata reports the requested
-candidate, every attempted candidate, the model actually used, and each raw
-model failure in attempt order when fallbacks are tried.
+artifacts and lineage, as completion delivery does. Its candidate list and
+thinking level stay those of the original call. The original parent directory
+and process directory remain the bases for directory resolution. Role files are
+read again for each attempt, so a changed role `cwd` can redirect a fallback
+when the tool call did not specify `cwd`. If no live parent context is available,
+that candidate fails without launching. A completed child result, including a
+negative task result, never switches models. Completion metadata reports the
+requested candidate, every attempted candidate, the model actually used, and
+each raw model failure in attempt order when fallbacks are tried.
 
 A catalog-listed model and configured authentication do not prove that the
 active provider account can use that model. Providers may reject an account /
