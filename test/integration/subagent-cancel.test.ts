@@ -529,6 +529,7 @@ for (const backend of backends) {
 				evidence("c: manifest", JSON.stringify(manifest, null, 2));
 				assert.equal(manifest.state, "cancelled");
 				assert.equal(manifest.branch, branch);
+				assert.equal(manifest.workspaceId, workspaceToRemove);
 				unrelatedUntouched(s);
 			} finally {
 				if (workspaceToRemove) {
