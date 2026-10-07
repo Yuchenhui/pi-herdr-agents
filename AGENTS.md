@@ -96,7 +96,7 @@ npm pack --dry-run
 git diff --check
 ```
 
-`npm run lint` needs Node.js 22.18+ (or older 22.x with `NODE_OPTIONS=--experimental-strip-types`) because oxlint imports `oxlint.config.ts` and its `tools/oxlint/anti-slop/index.ts` plugin as TypeScript.
+`npm run lint` needs Node.js 22.18+ (or 22.6–22.17 with `NODE_OPTIONS=--experimental-strip-types`) because oxlint imports `oxlint.config.ts` and its `tools/oxlint/anti-slop/index.ts` plugin as TypeScript.
 
 Run LSP diagnostics on every changed TypeScript file; lint and tests do not catch every TypeScript error.
 
