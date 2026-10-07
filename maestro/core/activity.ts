@@ -5,7 +5,7 @@ import type {
 	SubagentActivityState,
 } from "./types.ts";
 
-const KNOWN_SCOPES = new Set<SubagentActivityScope>([
+const KNOWN_SCOPES: ReadonlySet<string> = new Set<SubagentActivityScope>([
 	"agent",
 	"turn",
 	"provider",

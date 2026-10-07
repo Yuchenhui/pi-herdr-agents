@@ -754,11 +754,35 @@ describe("cleanup operating-system probes", () => {
 				encoding: "utf8",
 				stdio: ["ignore", "pipe", "pipe"],
 			});
+		// The cleanup operations spawn git with the inherited environment, so
+		// isolate the whole process from global hooksPath and similar settings.
+		// Hooks export an absolute GIT_DIR and GIT_INDEX_FILE; inheriting them
+		// would point fixture commands at the host repository.
+		const overriddenEnv = {
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_NOSYSTEM: "1",
+		};
+		const removedEnv = [
+			"GIT_DIR",
+			"GIT_INDEX_FILE",
+			"GIT_WORK_TREE",
+			"GIT_CONFIG_COUNT",
+			"GIT_CONFIG_PARAMETERS",
+		];
+		const savedEnv = Object.fromEntries(
+			[...Object.keys(overriddenEnv), ...removedEnv].map((key) => [
+				key,
+				process.env[key],
+			]),
+		);
+		Object.assign(process.env, overriddenEnv);
+		for (const key of removedEnv) delete process.env[key];
 		try {
 			git(["init", "-q", "-b", "task"]);
 			git(["config", "user.name", "Cleanup test"]);
 			git(["config", "user.email", "cleanup@example.invalid"]);
 			git(["config", "commit.gpgsign", "false"]);
+			git(["config", "core.untrackedCache", "true"]);
 			writeFileSync(join(dir, ".gitignore"), ".env\n");
 			writeFileSync(join(dir, "tracked"), "base\n");
 			git(["add", "."]);
@@ -773,14 +797,21 @@ describe("cleanup operating-system probes", () => {
 				liveHolders: () => [],
 			});
 			assert.equal((await ops.inspectGit(dir, dir)).ignoredFiles, 1);
-			const index = readFileSync(join(dir, ".git", "index"));
 			const status = git(["status", "--porcelain=v1"]);
+			// The first default-mode status fills the untracked cache and rewrites
+			// the index; inspectGit's --untracked-files=all status does not.
+			const index = readFileSync(join(dir, ".git", "index"));
 			const hook = join(dir, ".git", "hooks", "pre-commit");
-			writeFileSync(hook, "#!/bin/sh\nexit 1\n");
+			// Git does not export GIT_DIR to this hook.
+			writeFileSync(
+				hook,
+				'#!/bin/sh\ntouch "$(git rev-parse --git-dir)/hook-ran"\nexit 1\n',
+			);
 			chmodSync(hook, 0o755);
 			const entry = (await listContainedWorktrees(cleanupFixture().input))[0];
 			entry.path = dir;
-			assert.throws(() => ops.preserve(entry));
+			assert.throws(() => ops.preserve(entry), /git commit|pre-commit/);
+			assert.ok(fs.existsSync(join(dir, ".git", "hook-ran")));
 			assert.deepEqual(readFileSync(join(dir, ".git", "index")), index);
 			assert.equal(git(["status", "--porcelain=v1"]), status);
 			assert.equal(readFileSync(join(dir, "tracked"), "utf8"), "unstaged\n");
@@ -797,6 +828,10 @@ describe("cleanup operating-system probes", () => {
 			entry.branch = entry.git.branch;
 			assert.throws(() => ops.preserve(entry), /Retained branch/);
 		} finally {
+			for (const [key, value] of Object.entries(savedEnv)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
 			rmSync(dir, { recursive: true });
 		}
 	});
