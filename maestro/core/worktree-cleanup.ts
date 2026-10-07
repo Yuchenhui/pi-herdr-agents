@@ -60,8 +60,8 @@ export interface WorktreeCleanupOperations {
 	preserve(entry: WorktreeInventoryEntry): string;
 	removeWorkspace(id: string): void | Promise<void>;
 	/**
-	 * Report, never close, a primary workspace this process's worktree creation
-	 * opened. Undefined means the surface cannot report.
+	 * Suggest, never close, a primary workspace this process's worktree
+	 * creation appears to have opened. Undefined means the surface cannot report.
 	 */
 	reportOpenedPrimaryWorkspace(
 		sourceRepo: string,
@@ -95,6 +95,21 @@ function contained(root: string, path: string): boolean {
 		rel === "" ||
 		(rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 	);
+}
+
+function claimsForSource(
+	claims: readonly PrimaryWorkspaceClaim[],
+	sourceRepo: string,
+	ops: WorktreeCleanupOperations,
+): PrimaryWorkspaceClaim[] {
+	return claims.filter((claim) => {
+		if (claim.checkoutPath === sourceRepo) return true;
+		try {
+			return ops.realpath(claim.checkoutPath) === sourceRepo;
+		} catch {
+			return false;
+		}
+	});
 }
 
 export function cleanupBlockers(entry: WorktreeInventoryEntry): string[] {
@@ -363,7 +378,11 @@ export async function removeContainedWorktree(
 		if (!entry.workspaceId) ops.prune(entry.sourceRepo);
 		const warnings: string[] = [];
 		let primaryNote = "";
-		const claims = openedPrimaryWorkspaceClaims();
+		const claims = claimsForSource(
+			openedPrimaryWorkspaceClaims(),
+			entry.sourceRepo,
+			ops,
+		);
 		if (claims.length) {
 			try {
 				const report = await ops.reportOpenedPrimaryWorkspace(

@@ -52,17 +52,13 @@ export interface WorktreeSurface {
 	/** Provider-native workspace/container id for later removal. */
 	workspaceId: string;
 	surfaceId: string;
-	/**
-	 * Set only when this create opened the source repository's primary
-	 * workspace. A workspace that was already open is not claimed.
-	 */
-	openedPrimaryWorkspace?: PrimaryWorkspaceClaim;
+	/** Non-fatal provisioning problems the parent should see, such as a failed snapshot. */
+	diagnostics?: string[];
 }
 
 export interface ReportOpenedPrimaryWorkspaceInput {
 	sourceRepo: string;
 	claims: readonly PrimaryWorkspaceClaim[];
-	timeoutMs?: number;
 }
 
 export type RecoveredWorktreeProvisioning = Pick<
@@ -72,18 +68,14 @@ export type RecoveredWorktreeProvisioning = Pick<
 
 export class WorktreeProvisioningError extends Error {
 	readonly recoveredWorktree: RecoveredWorktreeProvisioning;
-	readonly openedPrimaryWorkspace?: PrimaryWorkspaceClaim;
 
 	constructor(
 		message: string,
 		recoveredWorktree: RecoveredWorktreeProvisioning,
-		openedPrimaryWorkspace?: PrimaryWorkspaceClaim,
 	) {
 		super(message);
 		this.name = "WorktreeProvisioningError";
 		this.recoveredWorktree = recoveredWorktree;
-		if (openedPrimaryWorkspace)
-			this.openedPrimaryWorkspace = openedPrimaryWorkspace;
 	}
 }
 
@@ -155,7 +147,7 @@ export interface SurfaceProvider {
 	): void | Promise<void>;
 
 	/**
-	 * Tell the caller when a claimed primary workspace still looks untouched.
+	 * Suggest closing a claimed primary workspace that still looks untouched.
 	 * Never closes it. Unsupported providers return undefined.
 	 */
 	reportOpenedPrimaryWorkspace(

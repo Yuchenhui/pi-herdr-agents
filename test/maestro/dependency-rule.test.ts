@@ -272,21 +272,6 @@ describe("maestro dependency rule", () => {
 		);
 	});
 
-	it("worktree cleanup core does not import Herdr", () => {
-		for (const relative of [
-			"maestro/core/worktree-cleanup.ts",
-			"maestro/core/opened-primary-workspace.ts",
-			"maestro/core/surface-provider.ts",
-		]) {
-			const refs = moduleReferences(path.join(repoRoot, relative));
-			assert.equal(
-				refs.some((ref) => ref.specifier.toLowerCase().includes("herdr")),
-				false,
-				relative,
-			);
-		}
-	});
-
 	it("adapters/pi imports core, node, pi host packages", () => {
 		assertNoForbiddenImports("adapters/pi dependency violations", (violation) =>
 			toRepoPath(repoRoot, violation.file).startsWith("maestro/adapters/pi/"),

@@ -120,19 +120,14 @@ export class HerdrSurfaceProvider implements SurfaceProvider {
 			workspaceId: worktree.workspaceId,
 			surfaceId: worktree.paneId,
 		};
-		if (worktree.openedPrimaryWorkspace)
-			surface.openedPrimaryWorkspace = worktree.openedPrimaryWorkspace;
+		if (worktree.diagnostics) surface.diagnostics = worktree.diagnostics;
 		return surface;
 	}
 
 	reportOpenedPrimaryWorkspace(
 		input: ReportOpenedPrimaryWorkspaceInput,
-	): OpenedPrimaryWorkspaceReport | undefined {
-		return reportHerdrOpenedPrimaryWorkspace(
-			input.sourceRepo,
-			input.claims,
-			input.timeoutMs,
-		);
+	): Promise<OpenedPrimaryWorkspaceReport | undefined> {
+		return reportHerdrOpenedPrimaryWorkspace(input.sourceRepo, input.claims);
 	}
 
 	removeWorktreeSurface(

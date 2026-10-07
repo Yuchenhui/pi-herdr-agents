@@ -1,12 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { describe, it } from "node:test";
 import {
-	OPENED_PRIMARY_CHILD_CHECK_TIMEOUT_MS,
-	OPENED_PRIMARY_REPORT_CALLS,
-	OPENED_PRIMARY_REPORT_WORST_CASE_MS,
-	OPENED_PRIMARY_SNAPSHOT_CALLS,
-	OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
 	clearOpenedPrimaryWorkspaceClaims,
 	openedPrimaryWorkspaceClaims,
 	rememberOpenedPrimaryWorkspace,
@@ -17,8 +11,14 @@ import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface
 import {
 	__herdrTest__,
 	createHerdrWorktree,
+	OPENED_PRIMARY_REPORT_CALLS,
+	OPENED_PRIMARY_REPORT_TIMEOUT_MS,
+	OPENED_PRIMARY_REPORT_WORST_CASE_MS,
+	OPENED_PRIMARY_SNAPSHOT_CALLS,
+	OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
+	OPENED_PRIMARY_SNAPSHOT_WORST_CASE_MS,
+	openedPrimaryWorkspaceNote,
 	reportOpenedPrimaryWorkspace,
-	shellHasChildProcesses,
 } from "../../maestro/surfaces/herdr/herdr.ts";
 import { cleanupFixture } from "../worktree-cleanup-fixture.ts";
 
@@ -29,6 +29,9 @@ const claim: PrimaryWorkspaceClaim = {
 	checkoutPath: "/repo",
 };
 
+const note =
+	"w1 appears to have been opened by worktree creation; if you haven't used it, close it with herdr workspace close w1";
+
 function json(value: any): string {
 	return JSON.stringify({ result: value });
 }
@@ -36,7 +39,7 @@ function json(value: any): string {
 interface ListedWorktreeFixture {
 	branch: string;
 	path: string;
-	is_linked_worktree: boolean;
+	is_linked_worktree?: boolean;
 	open_workspace_id?: string;
 }
 
@@ -85,9 +88,19 @@ function created(): string {
 interface WorkspaceFixtureOverride {
 	label?: string | number;
 	focused?: boolean | string;
+	tab_count?: number;
 }
 
-function workspace(overrides: WorkspaceFixtureOverride = {}): string {
+interface WorkspaceWorktreeFixtureOverride {
+	is_linked_worktree?: boolean;
+	repo_key?: string;
+	repo_name?: string;
+}
+
+function workspace(
+	overrides: WorkspaceFixtureOverride = {},
+	worktree: WorkspaceWorktreeFixtureOverride = {},
+): string {
 	return json({
 		type: "workspace_info",
 		workspace: {
@@ -99,6 +112,7 @@ function workspace(overrides: WorkspaceFixtureOverride = {}): string {
 				is_linked_worktree: false,
 				repo_key: "/repo/.git",
 				repo_name: "repo",
+				...worktree,
 			},
 			...overrides,
 		},
@@ -106,47 +120,38 @@ function workspace(overrides: WorkspaceFixtureOverride = {}): string {
 }
 
 interface PaneFixtureOverride {
+	pane_id?: string;
 	cwd?: string;
 	foreground_cwd?: string;
 	terminal_id?: string;
 }
 
-function paneList(extra: PaneFixtureOverride = {}): string {
+function paneList(...panes: PaneFixtureOverride[]): string {
 	return json({
 		type: "pane_list",
-		panes: [
-			{
-				pane_id: "w1:p1",
-				workspace_id: "w1",
-				terminal_id: "term-1",
-				cwd: "/repo",
-				foreground_cwd: "/repo",
-				...extra,
-			},
-		],
-	});
-}
-
-function processInfo(foreground = 100): string {
-	return json({
-		type: "pane_process_info",
-		process_info: {
+		panes: (panes.length ? panes : [{}]).map((extra) => ({
 			pane_id: "w1:p1",
-			shell_pid: 100,
-			foreground_process_group_id: foreground,
-		},
+			workspace_id: "w1",
+			terminal_id: "term-1",
+			cwd: "/repo",
+			foreground_cwd: "/repo",
+			...extra,
+		})),
 	});
 }
 
 function scriptedHerdr(queues: Record<string, string[]>) {
 	const calls: string[][] = [];
 	const timeouts: Array<number | undefined> = [];
+	const modes: Array<string | undefined> = [];
 	return {
 		calls,
 		timeouts,
-		exec(args: string[], timeout?: number): string {
+		modes,
+		exec(args: string[], timeout?: number, mode?: string): string {
 			calls.push(args);
 			timeouts.push(timeout);
+			modes.push(mode);
 			if (args[0] === "tab" && args[1] === "rename")
 				return json({ type: "ok" });
 			const key = `${args[0]} ${args[1]}`;
@@ -165,8 +170,44 @@ function herdrCalls(calls: string[][]): string[] {
 	return calls.map((args) => args.join(" "));
 }
 
+function isSnapshot(args: string[]): boolean {
+	return (
+		(args[0] === "worktree" && args[1] === "list") ||
+		(args[0] === "pane" && args[1] === "list")
+	);
+}
+
+function issuedClose(calls: string[][]): boolean {
+	return calls.some((args) => args[0] === "workspace" && args[1] === "close");
+}
+
+async function withoutConsole<T>(run: () => Promise<T>): Promise<{
+	value: T;
+	output: string[];
+}> {
+	const output: string[] = [];
+	const original = {
+		log: console.log,
+		warn: console.warn,
+		error: console.error,
+	};
+	const capture = (...args: any[]) => {
+		output.push(args.map(String).join(" "));
+	};
+	console.log = capture;
+	console.warn = capture;
+	console.error = capture;
+	try {
+		return { value: await run(), output };
+	} finally {
+		console.log = original.log;
+		console.warn = original.warn;
+		console.error = original.error;
+	}
+}
+
 describe("opened primary workspace snapshots", () => {
-	it("claims the primary workspace only when create opened it", async () => {
+	it("claims the primary workspace only when create opened it, within the derived budget", async () => {
 		clearOpenedPrimaryWorkspaceClaims();
 		try {
 			const script = scriptedHerdr({
@@ -177,22 +218,23 @@ describe("opened primary workspace snapshots", () => {
 			await __herdrTest__.withMockHerdrExec(script.exec, () => {
 				const surface = createHerdrWorktree("task", "/repo", "task", "HEAD");
 				assert.equal(surface.workspaceId, "w2");
-				assert.deepEqual(surface.openedPrimaryWorkspace, claim);
-				assert.deepEqual(openedPrimaryWorkspaceClaims(), [claim]);
-				const snapshotTimeouts = script.calls.flatMap((args, index) =>
-					(args[0] === "worktree" && args[1] === "list") ||
-					(args[0] === "pane" && args[1] === "list")
-						? [script.timeouts[index]]
-						: [],
-				);
-				assert.deepEqual(snapshotTimeouts, [
-					OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
-					OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
-					OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
-				]);
+				assert.equal(surface.diagnostics, undefined);
 			});
-			assert.equal(OPENED_PRIMARY_SNAPSHOT_CALLS, 3);
-			assert.equal(OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS, 10_000);
+			assert.deepEqual(openedPrimaryWorkspaceClaims(), [claim]);
+			const snapshotTimeouts = script.calls.flatMap((args, index) =>
+				isSnapshot(args) ? [script.timeouts[index] ?? 0] : [],
+			);
+			assert.equal(snapshotTimeouts.length, OPENED_PRIMARY_SNAPSHOT_CALLS);
+			assert.ok(
+				snapshotTimeouts.every(
+					(timeout) => timeout === OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
+				),
+			);
+			assert.equal(
+				snapshotTimeouts.reduce((sum, timeout) => sum + timeout, 0),
+				OPENED_PRIMARY_SNAPSHOT_WORST_CASE_MS,
+			);
+			assert.ok(OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS <= 3_000);
 		} finally {
 			clearOpenedPrimaryWorkspaceClaims();
 		}
@@ -206,46 +248,42 @@ describe("opened primary workspace snapshots", () => {
 				"worktree create": [created()],
 			});
 			await __herdrTest__.withMockHerdrExec(script.exec, () => {
-				const surface = createHerdrWorktree("task", "/repo", "task", "HEAD");
-				assert.equal(surface.openedPrimaryWorkspace, undefined);
-				assert.deepEqual(openedPrimaryWorkspaceClaims(), []);
-				assert.deepEqual(
-					herdrCalls(script.calls).filter((call) =>
-						call.startsWith("worktree list"),
-					),
-					["worktree list --cwd /repo"],
-				);
-				assert.equal(
-					script.calls.some((args) => args[0] === "pane"),
-					false,
-				);
+				createHerdrWorktree("task", "/repo", "task", "HEAD");
 			});
+			assert.deepEqual(openedPrimaryWorkspaceClaims(), []);
+			assert.deepEqual(
+				herdrCalls(script.calls).filter((call) =>
+					call.startsWith("worktree list"),
+				),
+				["worktree list --cwd /repo"],
+			);
+			assert.equal(
+				script.calls.some((args) => args[0] === "pane"),
+				false,
+			);
 		} finally {
 			clearOpenedPrimaryWorkspaceClaims();
 		}
 	});
 
-	it("logs a snapshot failure and claims nothing", async () => {
+	it("reports a before-snapshot failure as a launch diagnostic, without console output, and claims nothing", async () => {
 		clearOpenedPrimaryWorkspaceClaims();
-		const warnings: string[] = [];
-		const original = console.warn;
-		console.warn = (...args: any[]) => {
-			warnings.push(args.map(String).join(" "));
-		};
 		try {
 			const script = scriptedHerdr({
 				"worktree list": ["THROW herdr timed out"],
 				"worktree create": [created()],
 			});
-			await __herdrTest__.withMockHerdrExec(script.exec, () => {
-				const surface = createHerdrWorktree("task", "/repo", "task", "HEAD");
-				assert.equal(surface.workspaceId, "w2");
-				assert.equal(surface.openedPrimaryWorkspace, undefined);
-			});
-			assert.deepEqual(openedPrimaryWorkspaceClaims(), []);
-			assert.deepEqual(warnings, [
-				"pi-herdr-agents: opened primary workspace before snapshot failed: herdr timed out",
+			const { value: surface, output } = await withoutConsole(() =>
+				__herdrTest__.withMockHerdrExec(script.exec, () =>
+					createHerdrWorktree("task", "/repo", "task", "HEAD"),
+				),
+			);
+			assert.equal(surface.workspaceId, "w2");
+			assert.deepEqual(surface.diagnostics, [
+				"Primary workspace snapshot (before create) failed: herdr timed out",
 			]);
+			assert.deepEqual(output, []);
+			assert.deepEqual(openedPrimaryWorkspaceClaims(), []);
 			assert.equal(
 				herdrCalls(script.calls).filter((call) =>
 					call.startsWith("worktree list"),
@@ -253,38 +291,52 @@ describe("opened primary workspace snapshots", () => {
 				1,
 			);
 		} finally {
-			console.warn = original;
 			clearOpenedPrimaryWorkspaceClaims();
 		}
 	});
 
-	it("logs an after-snapshot failure and does not read a terminal", async () => {
+	it("reports an after-snapshot failure and does not read a terminal", async () => {
 		clearOpenedPrimaryWorkspaceClaims();
-		const warnings: string[] = [];
-		const original = console.warn;
-		console.warn = (...args: any[]) => {
-			warnings.push(args.map(String).join(" "));
-		};
 		try {
 			const script = scriptedHerdr({
 				"worktree list": [worktreeList(undefined), "THROW list failed"],
 				"worktree create": [created()],
 			});
-			await __herdrTest__.withMockHerdrExec(script.exec, () => {
-				assert.equal(
-					createHerdrWorktree("task", "/repo", "task", "HEAD")
-						.openedPrimaryWorkspace,
-					undefined,
-				);
-			});
-			assert.match(warnings[0] ?? "", /after snapshot failed: list failed/);
+			const { value: surface, output } = await withoutConsole(() =>
+				__herdrTest__.withMockHerdrExec(script.exec, () =>
+					createHerdrWorktree("task", "/repo", "task", "HEAD"),
+				),
+			);
+			assert.deepEqual(surface.diagnostics, [
+				"Primary workspace snapshot (after create) failed: list failed",
+			]);
+			assert.deepEqual(output, []);
 			assert.equal(
 				script.calls.some((args) => args[0] === "pane"),
 				false,
 			);
 			assert.deepEqual(openedPrimaryWorkspaceClaims(), []);
 		} finally {
-			console.warn = original;
+			clearOpenedPrimaryWorkspaceClaims();
+		}
+	});
+
+	it("reports an opened-workspace pane list failure and claims nothing", async () => {
+		clearOpenedPrimaryWorkspaceClaims();
+		try {
+			const script = scriptedHerdr({
+				"worktree list": [worktreeList(undefined), worktreeList("w1")],
+				"worktree create": [created()],
+				"pane list": ["THROW pane list failed"],
+			});
+			const surface = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+				createHerdrWorktree("task", "/repo", "task", "HEAD"),
+			);
+			assert.deepEqual(surface.diagnostics, [
+				"Primary workspace snapshot (opened workspace) failed: pane list failed",
+			]);
+			assert.deepEqual(openedPrimaryWorkspaceClaims(), []);
+		} finally {
 			clearOpenedPrimaryWorkspaceClaims();
 		}
 	});
@@ -303,11 +355,7 @@ describe("opened primary workspace snapshots", () => {
 				],
 			});
 			await __herdrTest__.withMockHerdrExec(script.exec, () => {
-				assert.equal(
-					createHerdrWorktree("task", "/repo", "task", "HEAD")
-						.openedPrimaryWorkspace,
-					undefined,
-				);
+				createHerdrWorktree("task", "/repo", "task", "HEAD");
 			});
 			assert.deepEqual(openedPrimaryWorkspaceClaims(), []);
 		} finally {
@@ -317,95 +365,51 @@ describe("opened primary workspace snapshots", () => {
 });
 
 describe("reporting an opened primary workspace", () => {
-	const untouched = {
-		"worktree list": [worktreeList("w1")],
-		"workspace get": [workspace(), workspace()],
-		"pane list": [paneList(), paneList()],
-		"pane process-info": [processInfo(), processInfo()],
-	};
+	function untouched() {
+		return {
+			"worktree list": [worktreeList("w1")],
+			"workspace get": [workspace()],
+			"pane list": [paneList()],
+		};
+	}
 
-	it("reports the close command and never closes the workspace", async () => {
-		const script = scriptedHerdr({
-			"worktree list": [...untouched["worktree list"]],
-			"workspace get": [...untouched["workspace get"]],
-			"pane list": [...untouched["pane list"]],
-			"pane process-info": [...untouched["pane process-info"]],
-		});
-		const children: number[] = [];
-		await __herdrTest__.withMockHerdrExec(script.exec, () => {
-			const report = reportOpenedPrimaryWorkspace(
-				"/repo",
-				[claim],
-				30_000,
-				(pid) => {
-					children.push(pid);
-					return false;
-				},
-			);
-			assert.equal(
-				report?.note,
-				"w1 was opened by worktree creation; close it with herdr workspace close w1",
-			);
-			assert.deepEqual(report?.releasedClaims, [
-				{
-					workspaceId: "w1",
-					repoKey: "/repo/.git",
-					terminalId: "term-1",
-				},
-			]);
-		});
-		assert.equal(children.length, 2);
+	it("suggests the close command without asserting attribution and never closes", async () => {
+		const script = scriptedHerdr(untouched());
+		const report = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+			reportOpenedPrimaryWorkspace("/repo", [claim]),
+		);
+		assert.equal(report?.note, note);
+		assert.equal(openedPrimaryWorkspaceNote("w1"), note);
+		assert.deepEqual(report?.releasedClaims, [
+			{ workspaceId: "w1", repoKey: "/repo/.git", terminalId: "term-1" },
+		]);
 		assert.deepEqual(herdrCalls(script.calls), [
 			"worktree list --cwd /repo",
 			"workspace get w1",
 			"pane list --workspace w1",
-			"pane process-info --pane w1:p1",
-			"workspace get w1",
-			"pane list --workspace w1",
-			"pane process-info --pane w1:p1",
 		]);
-		assert.equal(
-			herdrCalls(script.calls).length + children.length,
-			OPENED_PRIMARY_REPORT_CALLS,
-		);
-		assert.equal(OPENED_PRIMARY_REPORT_WORST_CASE_MS, 220_000);
-		assert.equal(OPENED_PRIMARY_CHILD_CHECK_TIMEOUT_MS, 5_000);
-		assert.ok(script.timeouts.every((timeout) => timeout === 30_000));
-		assert.equal(
-			script.calls.some(
-				(args) => args[0] === "workspace" && args[1] === "close",
+		assert.equal(script.calls.length, OPENED_PRIMARY_REPORT_CALLS);
+		assert.ok(script.modes.every((mode) => mode === "async"));
+		assert.ok(
+			script.timeouts.every(
+				(timeout) => timeout === OPENED_PRIMARY_REPORT_TIMEOUT_MS,
 			),
-			false,
 		);
+		assert.equal(
+			script.timeouts.reduce<number>((sum, timeout) => sum + (timeout ?? 0), 0),
+			OPENED_PRIMARY_REPORT_WORST_CASE_MS,
+		);
+		assert.ok(OPENED_PRIMARY_REPORT_TIMEOUT_MS <= 3_000);
+		assert.equal(issuedClose(script.calls), false);
 	});
 
-	it("re-checks workspace state immediately before reporting", async () => {
-		const script = scriptedHerdr({
-			"worktree list": [worktreeList("w1")],
-			"workspace get": [workspace(), workspace({ focused: true })],
-			"pane list": [paneList(), paneList()],
-			"pane process-info": [processInfo(), processInfo()],
-		});
-		await __herdrTest__.withMockHerdrExec(script.exec, () => {
-			const report = reportOpenedPrimaryWorkspace(
-				"/repo",
-				[claim],
-				undefined,
-				() => false,
-			);
-			assert.equal(report?.note, undefined);
-			assert.deepEqual(report?.releasedClaims, []);
-		});
-		assert.equal(
-			script.calls.filter(
-				(args) => args[0] === "workspace" && args[1] === "get",
-			).length,
-			2,
+	it("makes no Herdr call without a complete claim", async () => {
+		const script = scriptedHerdr({});
+		const report = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+			reportOpenedPrimaryWorkspace("/repo", [{ ...claim, terminalId: "" }]),
 		);
-		assert.equal(
-			script.calls.some((args) => args[1] === "close"),
-			false,
-		);
+		assert.equal(report, undefined);
+		assert.deepEqual(script.calls, []);
 	});
 
 	for (const [name, queues] of [
@@ -415,6 +419,18 @@ describe("reporting an opened primary workspace", () => {
 		],
 		["label is not a string", { "workspace get": [workspace({ label: 1 })] }],
 		[
+			"label and repo_name are both missing",
+			{
+				"workspace get": [
+					workspace({ label: undefined }, { repo_name: undefined }),
+				],
+			},
+		],
+		[
+			"repo_name is missing",
+			{ "workspace get": [workspace({}, { repo_name: undefined })] },
+		],
+		[
 			"focused is missing",
 			{ "workspace get": [workspace({ focused: undefined })] },
 		],
@@ -422,11 +438,44 @@ describe("reporting an opened primary workspace", () => {
 			"focused is not a boolean",
 			{ "workspace get": [workspace({ focused: "false" })] },
 		],
+		["focused is true", { "workspace get": [workspace({ focused: true })] }],
+		["tab_count is 2", { "workspace get": [workspace({ tab_count: 2 })] }],
+		[
+			"workspace get repo_key differs",
+			{ "workspace get": [workspace({}, { repo_key: "/other/.git" })] },
+		],
+		[
+			"is_linked_worktree is missing",
+			{
+				"workspace get": [workspace({}, { is_linked_worktree: undefined })],
+			},
+		],
 		[
 			"foreground_cwd is missing",
 			{
 				"workspace get": [workspace()],
 				"pane list": [paneList({ foreground_cwd: undefined })],
+			},
+		],
+		[
+			"foreground_cwd is outside the checkout",
+			{
+				"workspace get": [workspace()],
+				"pane list": [paneList({ foreground_cwd: "/repo-elsewhere" })],
+			},
+		],
+		[
+			"cwd is outside the checkout",
+			{
+				"workspace get": [workspace()],
+				"pane list": [paneList({ cwd: "/repo-elsewhere" })],
+			},
+		],
+		[
+			"cwd is missing",
+			{
+				"workspace get": [workspace()],
+				"pane list": [paneList({ cwd: undefined })],
 			},
 		],
 		[
@@ -437,10 +486,17 @@ describe("reporting an opened primary workspace", () => {
 			},
 		],
 		[
-			"cwd is missing",
+			"terminal_id differs from the claim",
 			{
 				"workspace get": [workspace()],
-				"pane list": [paneList({ cwd: undefined })],
+				"pane list": [paneList({ terminal_id: "term-2" })],
+			},
+		],
+		[
+			"the workspace has two panes",
+			{
+				"workspace get": [workspace()],
+				"pane list": [paneList({}, { pane_id: "w1:p2" })],
 			},
 		],
 	] as const) {
@@ -449,36 +505,23 @@ describe("reporting an opened primary workspace", () => {
 				"worktree list": [worktreeList("w1")],
 				"workspace get": [...queues["workspace get"]],
 				"pane list": "pane list" in queues ? [...queues["pane list"]] : [],
-				"pane process-info": [],
 			});
-			await __herdrTest__.withMockHerdrExec(script.exec, () => {
-				const report = reportOpenedPrimaryWorkspace(
-					"/repo",
-					[claim],
-					undefined,
-					() => false,
-				);
-				assert.equal(report?.note, undefined);
-			});
-			assert.equal(
-				script.calls.some((args) => args[1] === "close"),
-				false,
+			const report = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+				reportOpenedPrimaryWorkspace("/repo", [claim]),
 			);
+			assert.equal(report?.note, undefined);
+			assert.equal(issuedClose(script.calls), false);
 		});
 	}
 
 	it("ignores claims of other repositories", async () => {
-		const script = scriptedHerdr({
-			"worktree list": [worktreeList("w1")],
-		});
-		await __herdrTest__.withMockHerdrExec(script.exec, () => {
-			assert.equal(
-				reportOpenedPrimaryWorkspace("/repo", [
-					{ ...claim, repoKey: "/other/.git" },
-				]),
-				undefined,
-			);
-		});
+		const script = scriptedHerdr({ "worktree list": [worktreeList("w1")] });
+		const report = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+			reportOpenedPrimaryWorkspace("/repo", [
+				{ ...claim, repoKey: "/other/.git" },
+			]),
+		);
+		assert.equal(report, undefined);
 		assert.deepEqual(herdrCalls(script.calls), ["worktree list --cwd /repo"]);
 	});
 
@@ -495,49 +538,77 @@ describe("reporting an opened primary workspace", () => {
 				]),
 			],
 		});
-		await __herdrTest__.withMockHerdrExec(script.exec, () => {
-			const report = reportOpenedPrimaryWorkspace(
-				"/repo",
-				[claim],
-				undefined,
-				() => false,
-			);
-			assert.equal(report?.note, undefined);
-			assert.deepEqual(report?.releasedClaims, []);
-		});
+		const report = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+			reportOpenedPrimaryWorkspace("/repo", [claim]),
+		);
+		assert.equal(report?.note, undefined);
+		assert.deepEqual(report?.releasedClaims, []);
 		assert.equal(
 			script.calls.some((args) => args[0] === "workspace"),
 			false,
 		);
 	});
 
-	it("asks the Herdr provider, which still never closes", async () => {
+	it("fails closed on an open workspace whose linked flag is missing", async () => {
 		const script = scriptedHerdr({
-			"worktree list": [worktreeList("w1"), worktreeList("w1")],
-			"workspace get": [workspace(), workspace()],
-			"pane list": [paneList(), paneList()],
-			"pane process-info": [processInfo(), processInfo()],
+			"worktree list": [
+				worktreeList("w1", [
+					{
+						branch: "other",
+						path: "/managed/repo/other",
+						open_workspace_id: "w7",
+					},
+				]),
+			],
+			"workspace get": [workspace()],
+			"pane list": [paneList()],
 		});
+		const report = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+			reportOpenedPrimaryWorkspace("/repo", [claim]),
+		);
+		assert.equal(report?.note, undefined);
+		assert.deepEqual(herdrCalls(script.calls), ["worktree list --cwd /repo"]);
+	});
+
+	it("fails closed when a row naming the primary lacks a linked flag", async () => {
+		const script = scriptedHerdr({
+			"worktree list": [
+				worktreeList("w1", [
+					{
+						branch: "other",
+						path: "/managed/repo/other",
+						open_workspace_id: "w1",
+					},
+				]),
+			],
+			"workspace get": [workspace()],
+			"pane list": [paneList()],
+		});
+		const report = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+			reportOpenedPrimaryWorkspace("/repo", [claim]),
+		);
+		assert.equal(report?.note, undefined);
+		assert.deepEqual(herdrCalls(script.calls), ["worktree list --cwd /repo"]);
+	});
+
+	it("asks the Herdr provider, which still never closes", async () => {
+		const script = scriptedHerdr(untouched());
 		const provider = new HerdrSurfaceProvider({
 			paneConfig: { mode: "tab", direction: "right", maxPerTab: 4 },
 		});
-		await __herdrTest__.withMockHerdrExec(script.exec, () => {
-			const report = provider.reportOpenedPrimaryWorkspace({
+		const report = await __herdrTest__.withMockHerdrExec(script.exec, () =>
+			provider.reportOpenedPrimaryWorkspace({
 				sourceRepo: "/repo",
 				claims: [claim],
-				timeoutMs: 30_000,
-			});
-			assert.match(report?.note ?? "", /herdr workspace close w1/);
-		});
-		assert.equal(
-			script.calls.some((args) => args[1] === "close"),
-			false,
+			}),
 		);
+		assert.equal(report?.note, note);
+		assert.equal(issuedClose(script.calls), false);
 	});
 });
 
 describe("explicit removal reports a live claim only", () => {
-	it("includes the report and forgets the claim without closing", async () => {
+	it("includes the suggestion and forgets the claim without closing", async () => {
 		clearOpenedPrimaryWorkspaceClaims();
 		try {
 			rememberOpenedPrimaryWorkspace(claim);
@@ -546,7 +617,7 @@ describe("explicit removal reports a live claim only", () => {
 				assert.equal(source, "/repo");
 				assert.deepEqual(claims, [claim]);
 				return {
-					note: "w1 was opened by worktree creation; close it with herdr workspace close w1",
+					note,
 					repoKey: claim.repoKey,
 					releasedClaims: [
 						{
@@ -559,11 +630,7 @@ describe("explicit removal reports a live claim only", () => {
 			};
 			const result = await removeContainedWorktree(fixture.input);
 			assert.equal(result.status, "removed");
-			assert.match(
-				result.message,
-				/w1 was opened by worktree creation; close it with herdr workspace close w1/,
-			);
-			assert.doesNotMatch(result.message, /Closed primary workspace/);
+			assert.ok(result.message.includes(note), result.message);
 			assert.deepEqual(openedPrimaryWorkspaceClaims(), []);
 			assert.deepEqual(fixture.calls, [
 				"git:/repo:/managed/repo/task",
@@ -574,33 +641,33 @@ describe("explicit removal reports a live claim only", () => {
 		}
 	});
 
-	it("ignores a manifest claim after restart when this process did not record it", async () => {
+	it("skips the report when this process holds no claim for the removed repository", async () => {
 		clearOpenedPrimaryWorkspaceClaims();
 		try {
+			const other = { ...claim, checkoutPath: "/other" };
+			rememberOpenedPrimaryWorkspace(other);
 			const fixture = cleanupFixture();
-			fixture.operations.readManifests = () => [
-				{
-					file: "/manifest.json",
-					value: {
-						branch: "task",
-						path: "/managed/repo/task",
-						state: "ready_for_review",
-						openedPrimaryWorkspaceId: "w1",
-						openedPrimaryRepoKey: "/repo/.git",
-						openedPrimaryTerminalId: "term-1",
-						openedPrimaryCheckoutPath: "/repo",
-					},
-				},
-			];
 			fixture.operations.reportOpenedPrimaryWorkspace = () => {
 				throw new Error("must not be called");
 			};
 			const result = await removeContainedWorktree(fixture.input);
 			assert.equal(result.status, "removed", result.message);
-			assert.doesNotMatch(result.message, /opened by worktree creation/);
+			assert.doesNotMatch(result.message, /worktree creation|report failed/);
+			assert.deepEqual(openedPrimaryWorkspaceClaims(), [other]);
 		} finally {
 			clearOpenedPrimaryWorkspaceClaims();
 		}
+	});
+
+	it("reports nothing after a restart, when this process recorded no claim", async () => {
+		clearOpenedPrimaryWorkspaceClaims();
+		const fixture = cleanupFixture();
+		fixture.operations.reportOpenedPrimaryWorkspace = () => {
+			throw new Error("must not be called");
+		};
+		const result = await removeContainedWorktree(fixture.input);
+		assert.equal(result.status, "removed", result.message);
+		assert.doesNotMatch(result.message, /worktree creation/);
 	});
 
 	it("reports a failed primary lookup as a warning after the checkout is gone", async () => {
@@ -620,19 +687,6 @@ describe("explicit removal reports a live claim only", () => {
 			assert.deepEqual(openedPrimaryWorkspaceClaims(), [claim]);
 		} finally {
 			clearOpenedPrimaryWorkspaceClaims();
-		}
-	});
-});
-
-describe("shell child check", () => {
-	it("detects child processes of a real shell with pgrep", async () => {
-		const child = spawn("sleep", ["30"], { stdio: "ignore" });
-		try {
-			assert.equal(Number.isInteger(child.pid), true);
-			assert.equal(shellHasChildProcesses(process.pid), true);
-			assert.equal(shellHasChildProcesses(child.pid ?? 0), false);
-		} finally {
-			child.kill();
 		}
 	});
 });

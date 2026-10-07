@@ -684,6 +684,16 @@ function formatWorktreeHandoff(worktree: WorktreeHandoff): string {
 	return lines.join("\n");
 }
 
+function launchDiagnosticsText(
+	diagnostics: readonly string[] | undefined,
+	prefix: string,
+	suffix: string,
+): string {
+	return diagnostics?.length
+		? `${prefix}Launch diagnostics: ${diagnostics.join("; ")}.${suffix}`
+		: "";
+}
+
 function resolveResultPresentation(
 	result: Pick<
 		SubagentResult,
@@ -2833,6 +2843,7 @@ export default function subagentsExtension(
 								(running.worktree
 									? ` in worktree ${running.worktree.path} on branch ${running.worktree.branch}. `
 									: ". ") +
+								launchDiagnosticsText(running.worktree?.diagnostics, "", " ") +
 								`Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
 								`The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
 								`Until then, move on to other work or tell the user you're waiting.`,
@@ -3462,10 +3473,13 @@ export default function subagentsExtension(
 					throw new Error("Worktree handoff did not return worktree metadata");
 				}
 				ctx.ui.notify(
-					result.focusError
+					(result.focusError
 						? `Worktree launched, but workspace focus failed: ${result.focusError}\nWorktree: ${worktree.path}`
-						: `Worktree launched in ${worktree.path} (workspace ${worktree.workspaceId}).`,
-					result.focusError ? "warning" : "info",
+						: `Worktree launched in ${worktree.path} (workspace ${worktree.workspaceId}).`) +
+						launchDiagnosticsText(worktree.diagnostics, "\n", ""),
+					result.focusError || worktree.diagnostics?.length
+						? "warning"
+						: "info",
 				);
 			} catch (error) {
 				ctx.ui.notify(

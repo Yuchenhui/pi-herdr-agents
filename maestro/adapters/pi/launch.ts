@@ -9,15 +9,8 @@ import {
 } from "../../core/lifecycle.ts";
 import type { ResolvedRuntimePlan } from "../../core/routing.ts";
 import type { PaneConfig } from "../../core/config/pane-config.ts";
-import {
-	isNonEmptyString,
-	type JsonObject,
-} from "../../core/config/type-guards.ts";
+import { isNonEmptyString } from "../../core/config/type-guards.ts";
 import { shellQuote } from "../../core/shell.ts";
-import {
-	rememberOpenedPrimaryWorkspace,
-	type PrimaryWorkspaceClaim,
-} from "../../core/opened-primary-workspace.ts";
 import type {
 	SurfaceProvider,
 	WorktreeSurface,
@@ -148,12 +141,12 @@ export interface ProcessIdentityExpectation {
 
 type MaybePromise<T> = T | Promise<T>;
 
-interface WorktreeSurfaceForLaunch {
+export interface WorktreeSurfaceForLaunch {
 	path: string;
 	branch: string;
 	workspaceId: string;
 	paneId: string;
-	openedPrimaryWorkspace?: PrimaryWorkspaceClaim;
+	diagnostics?: string[];
 }
 
 export interface PiLaunchOperations {
@@ -204,21 +197,8 @@ function worktreeSurfaceForLaunch(
 		workspaceId: worktree.workspaceId,
 		paneId: worktree.surfaceId,
 	};
-	if (worktree.openedPrimaryWorkspace)
-		surface.openedPrimaryWorkspace = worktree.openedPrimaryWorkspace;
+	if (worktree.diagnostics?.length) surface.diagnostics = worktree.diagnostics;
 	return surface;
-}
-
-function recordOpenedPrimaryWorkspace(
-	manifest: JsonObject,
-	claim: PrimaryWorkspaceClaim | undefined,
-): void {
-	if (!claim) return;
-	rememberOpenedPrimaryWorkspace(claim);
-	manifest.openedPrimaryWorkspaceId = claim.workspaceId;
-	manifest.openedPrimaryRepoKey = claim.repoKey;
-	manifest.openedPrimaryTerminalId = claim.terminalId;
-	manifest.openedPrimaryCheckoutPath = claim.checkoutPath;
 }
 
 export function isExpectedPiProcess(
@@ -644,10 +624,6 @@ async function prepareLaunchSurface(
 		};
 		if (error instanceof WorktreeProvisioningError) {
 			Object.assign(failedManifest, error.recoveredWorktree);
-			recordOpenedPrimaryWorkspace(
-				failedManifest,
-				error.openedPrimaryWorkspace,
-			);
 		}
 		failedManifest.error = errorMessage(error);
 		worktreeOps.writeWorktreeManifest(manifestFile, failedManifest);
@@ -663,13 +639,12 @@ async function prepareLaunchSurface(
 		baseSha,
 		manifestFile,
 	};
-	const provisioned: JsonObject = {
+	if (created.diagnostics?.length) worktree.diagnostics = created.diagnostics;
+	worktreeOps.writeWorktreeManifest(manifestFile, {
 		state: "provisioned",
 		...ownership,
 		...worktree,
-	};
-	recordOpenedPrimaryWorkspace(provisioned, created.openedPrimaryWorkspace);
-	worktreeOps.writeWorktreeManifest(manifestFile, provisioned);
+	});
 	const isolatedAgentDir = join(created.path, ".pi", "agent");
 	const hasIsolatedAgentDir = existsSync(isolatedAgentDir);
 	return {

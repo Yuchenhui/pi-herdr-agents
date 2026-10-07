@@ -3,8 +3,7 @@ import { isNonEmptyString } from "./config/type-guards.ts";
 /**
  * A primary workspace this process saw Herdr open while creating a worktree.
  * The record lives only in this process. Another session is another process,
- * and a restart starts empty, so neither reports a claim. Manifest copies are
- * not consulted.
+ * and a restart starts empty, so neither reports a claim. Nothing is persisted.
  */
 export interface PrimaryWorkspaceClaim {
 	workspaceId: string;
@@ -19,32 +18,15 @@ export interface ReleasedPrimaryWorkspaceClaim {
 	terminalId: string;
 }
 
-/** A report never closes a workspace. `note` is absent when nothing is safe to suggest. */
+/**
+ * A report never closes a workspace. `note` is absent when nothing is safe to
+ * suggest, and never states the attribution as fact.
+ */
 export interface OpenedPrimaryWorkspaceReport {
 	note?: string;
 	repoKey: string;
 	releasedClaims: ReleasedPrimaryWorkspaceClaim[];
 }
-
-/** Each launch snapshot (`worktree list` or the opened workspace's `pane list`). */
-export const OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS = 10_000;
-
-/**
- * How many of those snapshots a worktree launch can run: list before create,
- * list after create, and pane list for the opened workspace.
- */
-export const OPENED_PRIMARY_SNAPSHOT_CALLS = 3;
-
-/** `pgrep -P` while deciding whether a removal may mention the primary workspace. */
-export const OPENED_PRIMARY_CHILD_CHECK_TIMEOUT_MS = 5_000;
-
-/**
- * Positive removal report, each call at its timeout: one 30s worktree list,
- * then workspace get, pane list, process-info (30s each) and pgrep (5s),
- * then those four again immediately before the note.
- */
-export const OPENED_PRIMARY_REPORT_CALLS = 9;
-export const OPENED_PRIMARY_REPORT_WORST_CASE_MS = 220_000;
 
 const openedPrimaryWorkspacesKey = Symbol.for(
 	"pi-herdr-agents:opened-primary-workspaces",
