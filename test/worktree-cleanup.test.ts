@@ -773,8 +773,9 @@ describe("cleanup operating-system probes", () => {
 				liveHolders: () => [],
 			});
 			assert.equal((await ops.inspectGit(dir, dir)).ignoredFiles, 1);
-			const index = readFileSync(join(dir, ".git", "index"));
 			const status = git(["status", "--porcelain=v1"]);
+			// Status can rewrite index extensions such as core.untrackedCache data.
+			const index = readFileSync(join(dir, ".git", "index"));
 			const hook = join(dir, ".git", "hooks", "pre-commit");
 			writeFileSync(hook, "#!/bin/sh\nexit 1\n");
 			chmodSync(hook, 0o755);
