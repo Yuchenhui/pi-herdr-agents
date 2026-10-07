@@ -240,15 +240,17 @@ async function waitForSurfacePiReady(
 	while (Date.now() <= deadline) {
 		try {
 			const info = await Promise.resolve(provider.getProcessInfo(surface));
-			if (
-				info.foregroundProcesses.some((process) =>
-					isExpectedPiProcess(process, sessionFile, cwd),
-				)
-			) {
-				return;
+			// An unreadable process (one that is exiting) proves nothing, but must
+			// not hide a matching sibling.
+			for (const process of info.foregroundProcesses) {
+				try {
+					if (isExpectedPiProcess(process, sessionFile, cwd)) return;
+				} catch (error) {
+					lastError = errorMessage(error);
+				}
 			}
 		} catch (error) {
-			lastError = error instanceof Error ? error.message : String(error);
+			lastError = errorMessage(error);
 		}
 		if (Date.now() >= deadline) break;
 		await new Promise((resolve) => setTimeout(resolve, intervalMs));

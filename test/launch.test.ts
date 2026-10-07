@@ -266,6 +266,7 @@ describe("Pi launch", () => {
 		) => infer Result
 			? Awaited<Result>
 			: never,
+		reason = /expected Pi process not observed/,
 	) {
 		const provider = new FakeSurfaceProvider();
 		provider.createSurface({ name: "ready", cwd: "/repo" });
@@ -286,7 +287,9 @@ describe("Pi launch", () => {
 					"/tmp/child.jsonl",
 					"/repo",
 				),
-				/Timed out waiting for Pi session \/tmp\/child\.jsonl in Herdr pane fake-surface-1: expected Pi process not observed/,
+				new RegExp(
+					`Timed out waiting for Pi session /tmp/child\\.jsonl in Herdr pane fake-surface-1: ${reason.source}`,
+				),
 			);
 		} finally {
 			Date.now = originalNow;
@@ -407,6 +410,26 @@ describe("Pi launch", () => {
 			});
 		},
 	);
+
+	it("provider Pi readiness treats an unreadable environment as unproven without hiding a match", {
+		skip: process.platform !== "linux" || process.getuid?.() === 0,
+	}, async () => {
+		// PID 1 belongs to root, so its environment is EACCES, as for an exiting Pi.
+		const unreadable = { pid: 1, name: "pi", argv: ["pi"], cwd: "/repo" };
+		await assertPiReadyRejects(
+			{ pids: [1], foregroundProcesses: [unreadable] },
+			/EACCES/,
+		);
+		await withLaunchedSessionProcess("/tmp/child.jsonl", async (pid) => {
+			await assertPiReady({
+				pids: [1, pid],
+				foregroundProcesses: [
+					unreadable,
+					{ pid, name: "pi", argv: ["pi"], cwd: "/repo" },
+				],
+			});
+		});
+	});
 
 	it(
 		"provider Pi readiness rejects each identity mismatch independently",

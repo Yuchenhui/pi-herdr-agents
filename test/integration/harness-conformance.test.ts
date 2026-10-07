@@ -291,9 +291,18 @@ async function fixture(
 						async () =>
 							!(
 								await surface.getProcessInfo(child.surface)
-							).foregroundProcesses.some((process) =>
-								isExpectedPiProcess(process, child.sessionFile, handle.cwd),
-							),
+							).foregroundProcesses.some((process) => {
+								try {
+									return isExpectedPiProcess(
+										process,
+										child.sessionFile,
+										handle.cwd,
+									);
+								} catch {
+									// An exiting process's environment is unreadable; that is not exit evidence.
+									return true;
+								}
+							}),
 						`${kind} Pi process exit`,
 					);
 				} catch (error) {
