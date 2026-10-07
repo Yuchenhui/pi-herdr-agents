@@ -1,12 +1,14 @@
 import type {
 	CreateSurfaceOptions,
 	CreateWorktreeSurfaceOptions,
+	ReportOpenedPrimaryWorkspaceInput,
 	SurfaceInfo,
 	SurfaceProcessInfo,
 	SurfaceProvider,
 	WorktreeSurface,
 	WorktreeSurfaceInfo,
 } from "../../core/surface-provider.ts";
+import type { OpenedPrimaryWorkspaceReport } from "../../core/opened-primary-workspace.ts";
 import type { PaneInspection, SurfaceHandle } from "../../core/types.ts";
 import type { PaneConfig } from "../../core/config/pane-config.ts";
 import {
@@ -16,6 +18,7 @@ import {
 	createHerdrSurfaceSplit,
 	createHerdrWorktree,
 	focusHerdrWorkspace,
+	reportOpenedPrimaryWorkspace as reportHerdrOpenedPrimaryWorkspace,
 	getHerdrPaneProcessInfo,
 	getHerdrPaneProcessInfoAsync,
 	inspectHerdrPane,
@@ -111,12 +114,20 @@ export class HerdrSurfaceProvider implements SurfaceProvider {
 			opts.branch,
 			opts.base,
 		);
-		return {
+		const surface: WorktreeSurface = {
 			path: worktree.path,
 			branch: worktree.branch,
 			workspaceId: worktree.workspaceId,
 			surfaceId: worktree.paneId,
 		};
+		if (worktree.diagnostics) surface.diagnostics = worktree.diagnostics;
+		return surface;
+	}
+
+	reportOpenedPrimaryWorkspace(
+		input: ReportOpenedPrimaryWorkspaceInput,
+	): Promise<OpenedPrimaryWorkspaceReport | undefined> {
+		return reportHerdrOpenedPrimaryWorkspace(input.sourceRepo, input.claims);
 	}
 
 	removeWorktreeSurface(

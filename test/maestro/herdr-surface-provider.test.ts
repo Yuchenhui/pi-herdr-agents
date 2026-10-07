@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS } from "../../maestro/surfaces/herdr/herdr.ts";
 import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
 import { __herdrTest__ } from "../../maestro/surfaces/herdr/herdr.ts";
 
@@ -124,6 +125,10 @@ describe("HerdrSurfaceProvider", () => {
 				"/repo",
 				"--no-focus",
 			],
+		);
+		assert.equal(
+			calls.some((args) => args[0] === "worktree"),
+			false,
 		);
 		assert.deepEqual(
 			calls.find((args) => args[0] === "pane" && args[1] === "split"),
@@ -321,7 +326,17 @@ describe("HerdrSurfaceProvider", () => {
 			calls.filter(
 				(call) => call.args[0] === "worktree" && call.args[1] === "list",
 			),
-			[{ args: ["worktree", "list", "--cwd", "/repo-a"], timeout: 1234 }],
+			[
+				{
+					args: ["worktree", "list", "--cwd", "/repo-created"],
+					timeout: OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
+				},
+				{
+					args: ["worktree", "list", "--cwd", "/repo-created"],
+					timeout: OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
+				},
+				{ args: ["worktree", "list", "--cwd", "/repo-a"], timeout: 1234 },
+			],
 		);
 	});
 

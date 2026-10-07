@@ -11,6 +11,8 @@ export interface WorktreeLaunch {
 	sessionFile?: string;
 	sourceSessionFile?: string;
 	handoffMessage?: string;
+	/** Non-fatal provisioning problems reported with the launch. */
+	diagnostics?: string[];
 }
 
 export interface FailedWorktreeManifest extends JsonObject {

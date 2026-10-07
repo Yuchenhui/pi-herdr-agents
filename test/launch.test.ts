@@ -18,6 +18,7 @@ import {
 	type FreshPiLaunchRequest,
 	type PiLaunchOperations,
 	type ResumePiLaunchRequest,
+	type WorktreeSurfaceForLaunch,
 } from "../maestro/adapters/pi/launch.ts";
 import { createWorktreeOperations } from "../maestro/runtime/worktree-operations.ts";
 import { createSubagentPaneFactory } from "../maestro/core/config/pane-config.ts";
@@ -166,6 +167,8 @@ function providerWithOverrides(
 		waitForSurfaceAbsence: (surface, opts) =>
 			base.waitForSurfaceAbsence(surface, opts),
 		listWorktreeSurfaces: (opts) => base.listWorktreeSurfaces(opts),
+		reportOpenedPrimaryWorkspace: (input) =>
+			base.reportOpenedPrimaryWorkspace(input),
 		focusWorkspace: (workspace) => base.focusWorkspace(workspace),
 		setTitle: (target, title) => base.setTitle(target, title),
 		...overrides,
@@ -382,6 +385,65 @@ describe("Pi launch", () => {
 			assert.equal(manifest.workspaceId, "workspace-partial");
 		});
 	});
+
+	for (const failed of [true, false]) {
+		it(`${failed ? "reports" : "omits"} launch diagnostics without writing claims to the manifest`, async () => {
+			await withFixture(async ({ request, project, sessionDir, root }) => {
+				initializeGitRepository(project);
+				writeFileSync(join(project, "base.txt"), "base\n");
+				commitAll(project, "base");
+				const worktreePath = join(root, "diagnostic-tree");
+				const manifestFile = join(
+					sessionDir,
+					"artifacts",
+					"parent",
+					"worktree-runs",
+					"child-1.json",
+				);
+				const diagnostics = [
+					"Primary workspace snapshot (before create) failed: x",
+				];
+				const running = await launchPiSubagent(
+					{ ...request, worktree: { branch: "issue/diagnostic" } },
+					{
+						worktree: createWorktreeOperations(),
+						createPane() {
+							throw new Error("unexpected pane creation");
+						},
+						createWorktree(_name, cwd, branch, base) {
+							execFileSync(
+								"git",
+								["worktree", "add", "-q", "-b", branch, worktreePath, base],
+								{ cwd },
+							);
+							const surface: WorktreeSurfaceForLaunch = {
+								path: worktreePath,
+								branch,
+								workspaceId: "workspace-1",
+								paneId: "root-pane-1",
+							};
+							if (failed) surface.diagnostics = diagnostics;
+							return surface;
+						},
+						async waitForShellReady() {},
+						runScript: (_surface, _value, options) => options.scriptPath,
+						closePane() {},
+					},
+				);
+				assert.deepEqual(
+					running.worktree?.diagnostics,
+					failed ? diagnostics : undefined,
+				);
+				const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+				assert.deepEqual(
+					Object.keys(manifest).filter((key) =>
+						key.startsWith("openedPrimary"),
+					),
+					[],
+				);
+			});
+		});
+	}
 
 	it("launches an ordinary child through one transaction", async () => {
 		await withFixture(async ({ request, project, agentDir }) => {

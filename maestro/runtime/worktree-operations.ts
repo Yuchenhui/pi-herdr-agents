@@ -612,6 +612,8 @@ export function createWorktreeCleanupOperations(
 		},
 		removeWorkspace: (id) =>
 			provider.removeWorktreeSurface(id, { timeoutMs: CLEANUP_TIMEOUT_MS }),
+		reportOpenedPrimaryWorkspace: (sourceRepo, claims) =>
+			provider.reportOpenedPrimaryWorkspace({ sourceRepo, claims }),
 		removeCheckout: (source, path) => {
 			git(source, ["worktree", "remove", "--", path]);
 		},

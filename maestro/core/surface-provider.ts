@@ -6,6 +6,10 @@
  * Methods may be sync or async; providers choose. The CLI is the only place
  * that wires a provider to an adapter (via core's SurfaceHandle).
  */
+import type {
+	OpenedPrimaryWorkspaceReport,
+	PrimaryWorkspaceClaim,
+} from "./opened-primary-workspace.ts";
 import type { PaneInspection, SurfaceHandle } from "./types.ts";
 
 // pi-herdr-agents extension
@@ -48,6 +52,13 @@ export interface WorktreeSurface {
 	/** Provider-native workspace/container id for later removal. */
 	workspaceId: string;
 	surfaceId: string;
+	/** Non-fatal provisioning problems the parent should see, such as a failed snapshot. */
+	diagnostics?: string[];
+}
+
+export interface ReportOpenedPrimaryWorkspaceInput {
+	sourceRepo: string;
+	claims: readonly PrimaryWorkspaceClaim[];
 }
 
 export type RecoveredWorktreeProvisioning = Pick<
@@ -134,6 +145,17 @@ export interface SurfaceProvider {
 		workspaceId: string,
 		opts?: { timeoutMs?: number },
 	): void | Promise<void>;
+
+	/**
+	 * Suggest closing a claimed primary workspace that still looks untouched.
+	 * Never closes it. Unsupported providers return undefined.
+	 */
+	reportOpenedPrimaryWorkspace(
+		input: ReportOpenedPrimaryWorkspaceInput,
+	):
+		| OpenedPrimaryWorkspaceReport
+		| undefined
+		| Promise<OpenedPrimaryWorkspaceReport | undefined>;
 
 	/** Human-readable hint when isAvailable() is false; today's terminalSetupHint(). */
 	// pi-herdr-agents extension

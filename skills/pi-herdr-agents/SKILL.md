@@ -210,7 +210,12 @@ independent writer.
   blockers. Startup does not scan it.
 - `worktree_remove({ target, preserve? })` / `/worktree remove <target>
   [--preserve]` is explicit, parent-only, and needs separate authorization;
-  stopping or interrupting a child never authorizes cleanup. Dirty work is
+  stopping or interrupting a child never authorizes cleanup. Removal never
+  closes the source repository's primary workspace. If this process's create
+  appears to have opened that workspace and it still looks untouched, the
+  result suggests `herdr workspace close <id>` if you haven't used it. Another
+  session or a restarted process says nothing about it. Primary-workspace
+  snapshot failures at launch appear as launch diagnostics. Dirty work is
   blocked unless committed first or `preserve: true` makes a WIP commit (SHA
   reported). Eligibility is rechecked at removal and fails closed (unknown
   state, live holder, untracked files, conflicts, detached HEAD, locks,

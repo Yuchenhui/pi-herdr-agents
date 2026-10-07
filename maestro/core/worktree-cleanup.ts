@@ -1,5 +1,11 @@
 import { isAbsolute, relative, sep } from "node:path";
 import { isString, type JsonObject } from "./config/type-guards.ts";
+import {
+	forgetOpenedPrimaryWorkspaceClaims,
+	openedPrimaryWorkspaceClaims,
+	type OpenedPrimaryWorkspaceReport,
+	type PrimaryWorkspaceClaim,
+} from "./opened-primary-workspace.ts";
 import type { WorktreeSurfaceInfo } from "./surface-provider.ts";
 
 export interface CleanupGitState {
@@ -53,6 +59,17 @@ export interface WorktreeCleanupOperations {
 	exists(path: string): boolean;
 	preserve(entry: WorktreeInventoryEntry): string;
 	removeWorkspace(id: string): void | Promise<void>;
+	/**
+	 * Suggest, never close, a primary workspace this process's worktree
+	 * creation appears to have opened. Undefined means the surface cannot report.
+	 */
+	reportOpenedPrimaryWorkspace(
+		sourceRepo: string,
+		claims: readonly PrimaryWorkspaceClaim[],
+	):
+		| OpenedPrimaryWorkspaceReport
+		| undefined
+		| Promise<OpenedPrimaryWorkspaceReport | undefined>;
 	removeCheckout(sourceRepo: string, path: string): void | Promise<void>;
 	prune(sourceRepo: string): void;
 	writeManifest(file: string, value: JsonObject): void;
@@ -78,6 +95,21 @@ function contained(root: string, path: string): boolean {
 		rel === "" ||
 		(rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 	);
+}
+
+function claimsForSource(
+	claims: readonly PrimaryWorkspaceClaim[],
+	sourceRepo: string,
+	ops: WorktreeCleanupOperations,
+): PrimaryWorkspaceClaim[] {
+	return claims.filter((claim) => {
+		if (claim.checkoutPath === sourceRepo) return true;
+		try {
+			return ops.realpath(claim.checkoutPath) === sourceRepo;
+		} catch {
+			return false;
+		}
+	});
 }
 
 export function cleanupBlockers(entry: WorktreeInventoryEntry): string[] {
@@ -345,6 +377,25 @@ export async function removeContainedWorktree(
 		checkoutRemoved = true;
 		if (!entry.workspaceId) ops.prune(entry.sourceRepo);
 		const warnings: string[] = [];
+		let primaryNote = "";
+		const claims = claimsForSource(
+			openedPrimaryWorkspaceClaims(),
+			entry.sourceRepo,
+			ops,
+		);
+		if (claims.length) {
+			try {
+				const report = await ops.reportOpenedPrimaryWorkspace(
+					entry.sourceRepo,
+					claims,
+				);
+				if (report?.note) primaryNote = ` ${report.note}`;
+				if (report?.releasedClaims.length)
+					forgetOpenedPrimaryWorkspaceClaims(report.releasedClaims);
+			} catch (error) {
+				warnings.push(`Primary workspace report failed: ${message(error)}`);
+			}
+		}
 		for (const manifest of entry.manifest) {
 			try {
 				ops.writeManifest(manifest.file, {
@@ -361,7 +412,7 @@ export async function removeContainedWorktree(
 			status: "removed",
 			entry,
 			preservationSha,
-			message: `Removed ${entry.path}. Branch ${entry.branch} and its commits retained.${preservationSha ? ` Preservation commit: ${preservationSha}.` : ""}${ignoredNotice()}${warnings.length ? ` Warning: ${warnings.join("; ")}` : entry.manifest.length ? " Manifest marked removed." : " No reachable manifest (orphan)."}`,
+			message: `Removed ${entry.path}. Branch ${entry.branch} and its commits retained.${preservationSha ? ` Preservation commit: ${preservationSha}.` : ""}${ignoredNotice()}${primaryNote}${warnings.length ? ` Warning: ${warnings.join("; ")}` : entry.manifest.length ? " Manifest marked removed." : " No reachable manifest (orphan)."}`,
 		});
 	} catch (error) {
 		return finish({

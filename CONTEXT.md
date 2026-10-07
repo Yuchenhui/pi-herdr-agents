@@ -182,9 +182,13 @@ global enumeration and unsupported platforms remain blockers.
 _Avoid_: Proven unrelated, machine-wide inactivity, bypass permission
 
 **Explicit worktree removal**:
-A parent-requested removal of one named managed checkout and its open workspace,
-with absence verification and retained branch history. Never automatic reaping.
-_Avoid_: Branch deletion, completion cleanup
+A parent-requested removal of one named managed checkout and its open worktree
+workspace, with absence verification and retained branch history. Never automatic
+reaping. It never closes the source repository's primary workspace. When this
+process recorded that worktree creation appeared to open that workspace and a
+read taken just before the report still shows it untouched, removal suggests
+the `herdr workspace close` command, to use only if the workspace is unused.
+_Avoid_: Branch deletion, completion cleanup, automatic close of a workspace the user may have used
 
 **Dirty-state preservation**:
 Explicit opt-in staging and WIP commitment of a worktree's uncommitted and

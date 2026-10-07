@@ -141,11 +141,12 @@ export interface ProcessIdentityExpectation {
 
 type MaybePromise<T> = T | Promise<T>;
 
-interface WorktreeSurfaceForLaunch {
+export interface WorktreeSurfaceForLaunch {
 	path: string;
 	branch: string;
 	workspaceId: string;
 	paneId: string;
+	diagnostics?: string[];
 }
 
 export interface PiLaunchOperations {
@@ -190,12 +191,14 @@ function placementFromPaneConfig(config: PaneConfig) {
 function worktreeSurfaceForLaunch(
 	worktree: WorktreeSurface,
 ): WorktreeSurfaceForLaunch {
-	return {
+	const surface: WorktreeSurfaceForLaunch = {
 		path: worktree.path,
 		branch: worktree.branch,
 		workspaceId: worktree.workspaceId,
 		paneId: worktree.surfaceId,
 	};
+	if (worktree.diagnostics?.length) surface.diagnostics = worktree.diagnostics;
+	return surface;
 }
 
 export function isExpectedPiProcess(
@@ -636,6 +639,7 @@ async function prepareLaunchSurface(
 		baseSha,
 		manifestFile,
 	};
+	if (created.diagnostics?.length) worktree.diagnostics = created.diagnostics;
 	worktreeOps.writeWorktreeManifest(manifestFile, {
 		state: "provisioned",
 		...ownership,

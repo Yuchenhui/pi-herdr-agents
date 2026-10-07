@@ -9570,7 +9570,20 @@ describe("worktree cleanup public surface", () => {
 				notices.at(-1),
 				"Worktree launch failed: fixture handoff creation stopped",
 			);
-			assert.equal(effects.length, 6);
+			// The extra Herdr call is the pre-create snapshot of the source primary workspace.
+			assert.equal(effects.length, 7);
+			assert.deepEqual(effects.at(-2), [
+				"herdr",
+				"worktree",
+				"list",
+				"--cwd",
+				"/repo",
+			]);
+			assert.deepEqual(effects.at(-1)?.slice(0, 3), [
+				"herdr",
+				"worktree",
+				"create",
+			]);
 			const manifestDir = join(dir, "artifacts", "child", "worktree-runs");
 			const manifests = readdirSync(manifestDir);
 			assert.equal(manifests.length, 1);

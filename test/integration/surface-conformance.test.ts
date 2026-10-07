@@ -49,6 +49,9 @@ class TrackedSurfaceProvider implements SurfaceProvider {
 	listSurfaces = () => this.#inner.listSurfaces();
 	listWorktreeSurfaces = (opts?: { cwd?: string; timeoutMs?: number }) =>
 		this.#inner.listWorktreeSurfaces(opts);
+	reportOpenedPrimaryWorkspace = (
+		input: Parameters<SurfaceProvider["reportOpenedPrimaryWorkspace"]>[0],
+	) => this.#inner.reportOpenedPrimaryWorkspace(input);
 	focusWorkspace = (workspaceId: string) =>
 		this.#inner.focusWorkspace(workspaceId);
 	setTitle = (target: "tab" | "workspace", title: string) =>
