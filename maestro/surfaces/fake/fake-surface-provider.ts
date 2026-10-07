@@ -1,7 +1,9 @@
 import path from "node:path";
+import type { OpenedPrimaryWorkspaceReport } from "../../core/opened-primary-workspace.ts";
 import type {
 	CreateSurfaceOptions,
 	CreateWorktreeSurfaceOptions,
+	ReportOpenedPrimaryWorkspaceInput,
 	SurfaceInfo,
 	SurfaceProcessInfo,
 	SurfaceProvider,
@@ -145,6 +147,12 @@ export class FakeSurfaceProvider implements SurfaceProvider {
 			(info) => info.workspaceId !== workspaceId,
 		);
 		this.removeSurface(worktree.surfaceId);
+	}
+
+	reportOpenedPrimaryWorkspace(
+		_input: ReportOpenedPrimaryWorkspaceInput,
+	): OpenedPrimaryWorkspaceReport | undefined {
+		return undefined;
 	}
 
 	setupHint(): string {

@@ -21,6 +21,10 @@ import {
 } from "../maestro/adapters/pi/launch.ts";
 import { createWorktreeOperations } from "../maestro/runtime/worktree-operations.ts";
 import { createSubagentPaneFactory } from "../maestro/core/config/pane-config.ts";
+import {
+	clearOpenedPrimaryWorkspaceClaims,
+	openedPrimaryWorkspaceClaims,
+} from "../maestro/core/opened-primary-workspace.ts";
 import { FakeSurfaceProvider } from "../maestro/surfaces/fake/fake-surface-provider.ts";
 import type { SurfaceProvider } from "../maestro/core/surface-provider.ts";
 import { WorktreeProvisioningError } from "../maestro/core/surface-provider.ts";
@@ -166,6 +170,8 @@ function providerWithOverrides(
 		waitForSurfaceAbsence: (surface, opts) =>
 			base.waitForSurfaceAbsence(surface, opts),
 		listWorktreeSurfaces: (opts) => base.listWorktreeSurfaces(opts),
+		reportOpenedPrimaryWorkspace: (input) =>
+			base.reportOpenedPrimaryWorkspace(input),
 		focusWorkspace: (workspace) => base.focusWorkspace(workspace),
 		setTitle: (target, title) => base.setTitle(target, title),
 		...overrides,
@@ -382,6 +388,82 @@ describe("Pi launch", () => {
 			assert.equal(manifest.workspaceId, "workspace-partial");
 		});
 	});
+
+	for (const opened of [true, false]) {
+		it(`${opened ? "records" : "omits"} an opened primary workspace claim for this process`, async () => {
+			clearOpenedPrimaryWorkspaceClaims();
+			try {
+				await withFixture(async ({ request, project, sessionDir, root }) => {
+					initializeGitRepository(project);
+					writeFileSync(join(project, "base.txt"), "base\n");
+					commitAll(project, "base");
+					const worktreePath = join(root, "claim-tree");
+					const manifestFile = join(
+						sessionDir,
+						"artifacts",
+						"parent",
+						"worktree-runs",
+						"child-1.json",
+					);
+					const claim = {
+						workspaceId: "primary-1",
+						repoKey: "/repo/.git",
+						terminalId: "term-1",
+						checkoutPath: "/repo",
+					};
+					await launchPiSubagent(
+						{ ...request, worktree: { branch: "issue/claim" } },
+						{
+							worktree: createWorktreeOperations(),
+							createPane() {
+								throw new Error("unexpected pane creation");
+							},
+							createWorktree(_name, cwd, branch, base) {
+								execFileSync(
+									"git",
+									["worktree", "add", "-q", "-b", branch, worktreePath, base],
+									{ cwd },
+								);
+								return {
+									path: worktreePath,
+									branch,
+									workspaceId: "workspace-1",
+									paneId: "root-pane-1",
+									openedPrimaryWorkspace: opened ? claim : undefined,
+								};
+							},
+							async waitForShellReady() {},
+							runScript: (_surface, _value, options) => options.scriptPath,
+							closePane() {},
+						},
+					);
+					const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+					assert.equal(
+						manifest.openedPrimaryWorkspaceId,
+						opened ? "primary-1" : undefined,
+					);
+					assert.equal(
+						manifest.openedPrimaryRepoKey,
+						opened ? "/repo/.git" : undefined,
+					);
+					assert.equal(
+						manifest.openedPrimaryTerminalId,
+						opened ? "term-1" : undefined,
+					);
+					assert.equal(
+						manifest.openedPrimaryCheckoutPath,
+						opened ? "/repo" : undefined,
+					);
+					assert.deepEqual(
+						openedPrimaryWorkspaceClaims(),
+						opened ? [claim] : [],
+					);
+				});
+			} finally {
+				clearOpenedPrimaryWorkspaceClaims();
+			}
+		});
+	}
 
 	it("launches an ordinary child through one transaction", async () => {
 		await withFixture(async ({ request, project, agentDir }) => {

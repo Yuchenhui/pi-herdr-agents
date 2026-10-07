@@ -3,10 +3,21 @@ import { promisify } from "node:util";
 import { realpathSync } from "node:fs";
 import { resolve, relative, isAbsolute, sep } from "node:path";
 import {
+	isBoolean,
 	isFiniteNumber,
+	isNonEmptyString,
 	isPlainObject,
 	isString,
 } from "../../core/config/type-guards.ts";
+import {
+	isCompletePrimaryWorkspaceClaim,
+	OPENED_PRIMARY_CHILD_CHECK_TIMEOUT_MS,
+	OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
+	rememberOpenedPrimaryWorkspace,
+	type OpenedPrimaryWorkspaceReport,
+	type PrimaryWorkspaceClaim,
+	type ReleasedPrimaryWorkspaceClaim,
+} from "../../core/opened-primary-workspace.ts";
 import { WorktreeProvisioningError } from "../../core/surface-provider.ts";
 
 const execFileAsync = promisify(execFile);
@@ -83,6 +94,8 @@ export interface HerdrWorktreeSurface {
 	branch: string;
 	workspaceId: string;
 	paneId: string;
+	/** Set only when this create opened the source repository's primary workspace. */
+	openedPrimaryWorkspace?: PrimaryWorkspaceClaim;
 }
 
 function extractHerdrWorktree(output: string): HerdrWorktreeSurface {
@@ -416,8 +429,9 @@ export class HerdrWorktreeCreateError extends WorktreeProvisioningError {
 			HerdrWorktreeInfo,
 			"path" | "branch" | "workspaceId"
 		>,
+		openedPrimaryWorkspace?: PrimaryWorkspaceClaim,
 	) {
-		super(message, recoveredWorktree);
+		super(message, recoveredWorktree, openedPrimaryWorkspace);
 		this.name = "HerdrWorktreeCreateError";
 	}
 }
@@ -536,15 +550,152 @@ function retainWorktreeTab(
 	return worktree;
 }
 
+interface HerdrWorktreeSource {
+	repoKey?: string;
+	checkoutPath?: string;
+	primaryWorkspaceId?: string;
+}
+
+function snapshotFailure(error: any): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function logOpenedPrimarySnapshotFailure(
+	phase: "before" | "after" | "terminal",
+	error: any,
+): void {
+	console.warn(
+		`pi-herdr-agents: opened primary workspace ${phase} snapshot failed: ${snapshotFailure(error)}`,
+	);
+}
+
+function parseHerdrWorktreeSource(output: string): HerdrWorktreeSource {
+	const parsed = parseHerdrJson(output);
+	if (parsed?.result?.type !== "worktree_list") {
+		throw new Error("Unexpected herdr worktree list output");
+	}
+	const source = parsed.result.source;
+	const info: HerdrWorktreeSource = {};
+	if (!isPlainObject(source)) return info;
+	if (isNonEmptyString(source.repo_key)) info.repoKey = source.repo_key;
+	if (isNonEmptyString(source.source_checkout_path))
+		info.checkoutPath = source.source_checkout_path;
+	if (isNonEmptyString(source.source_workspace_id))
+		info.primaryWorkspaceId = source.source_workspace_id;
+	return info;
+}
+
+function readHerdrWorktreeSource(
+	cwd: string,
+	timeout: number,
+	phase: "before" | "after",
+): HerdrWorktreeSource | undefined {
+	try {
+		return parseHerdrWorktreeSource(
+			herdrExec(["worktree", "list", "--cwd", cwd], timeout),
+		);
+	} catch (error) {
+		logOpenedPrimarySnapshotFailure(phase, error);
+		return undefined;
+	}
+}
+
+interface ClaimedPane {
+	paneId: string;
+	terminalId?: string;
+	cwd?: string;
+	foregroundCwd?: string;
+}
+
+function parseClaimedPanes(output: string, workspaceId: string): ClaimedPane[] {
+	const parsed = parseHerdrJson(output);
+	if (
+		parsed?.result?.type !== "pane_list" ||
+		!Array.isArray(parsed.result.panes)
+	) {
+		throw new Error("Unexpected herdr pane list output");
+	}
+	const panes: ClaimedPane[] = [];
+	for (const pane of parsed.result.panes) {
+		if (!isPlainObject(pane) || pane.workspace_id !== workspaceId) continue;
+		if (!isNonEmptyString(pane.pane_id)) continue;
+		const record: ClaimedPane = { paneId: pane.pane_id };
+		if (isNonEmptyString(pane.terminal_id))
+			record.terminalId = pane.terminal_id;
+		if (isNonEmptyString(pane.cwd)) record.cwd = pane.cwd;
+		if (isNonEmptyString(pane.foreground_cwd))
+			record.foregroundCwd = pane.foreground_cwd;
+		panes.push(record);
+	}
+	return panes;
+}
+
+function readPrimaryTerminalId(
+	workspaceId: string,
+	timeout: number,
+): string | undefined {
+	try {
+		const panes = parseClaimedPanes(
+			herdrExec(["pane", "list", "--workspace", workspaceId], timeout),
+			workspaceId,
+		);
+		return panes.length === 1 ? panes[0].terminalId : undefined;
+	} catch (error) {
+		logOpenedPrimarySnapshotFailure("terminal", error);
+		return undefined;
+	}
+}
+
+function openedPrimaryClaim(
+	source: HerdrWorktreeSource | undefined,
+	timeout: number,
+): PrimaryWorkspaceClaim | undefined {
+	if (!source?.primaryWorkspaceId || !source.repoKey || !source.checkoutPath)
+		return undefined;
+	const terminalId = readPrimaryTerminalId(source.primaryWorkspaceId, timeout);
+	if (!terminalId) return undefined;
+	const claim: PrimaryWorkspaceClaim = {
+		workspaceId: source.primaryWorkspaceId,
+		repoKey: source.repoKey,
+		terminalId,
+		checkoutPath: source.checkoutPath,
+	};
+	return isCompletePrimaryWorkspaceClaim(claim) ? claim : undefined;
+}
+
+function withOpenedPrimary(
+	worktree: HerdrWorktreeSurface,
+	claim: PrimaryWorkspaceClaim | undefined,
+): HerdrWorktreeSurface {
+	if (!claim) return worktree;
+	rememberOpenedPrimaryWorkspace(claim);
+	return { ...worktree, openedPrimaryWorkspace: claim };
+}
+
 export function createHerdrWorktree(
 	name: string,
 	cwd: string,
 	branch: string,
 	base: string,
+	snapshotTimeoutMs = OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
 ): HerdrWorktreeSurface {
+	// A failed before-snapshot claims nothing and skips the later snapshots.
+	// Herdr does not report which workspace create opened, so a workspace that
+	// appears during a long checkout can be misattributed. Removal only reports
+	// that claim; it never closes the workspace.
+	const before = readHerdrWorktreeSource(cwd, snapshotTimeoutMs, "before");
 	const output = herdrExec(buildWorktreeCreateArgs(name, cwd, branch, base));
+	const after =
+		before && !before.primaryWorkspaceId
+			? readHerdrWorktreeSource(cwd, snapshotTimeoutMs, "after")
+			: undefined;
+	const claim = openedPrimaryClaim(after, snapshotTimeoutMs);
+	if (claim) rememberOpenedPrimaryWorkspace(claim);
 	try {
-		return retainWorktreeTab(extractHerdrWorktree(output), output);
+		return withOpenedPrimary(
+			retainWorktreeTab(extractHerdrWorktree(output), output),
+			claim,
+		);
 	} catch (parseError) {
 		let recovered: HerdrWorktreeSurface | HerdrWorktreeInfo | undefined;
 		try {
@@ -553,15 +704,228 @@ export function createHerdrWorktree(
 			throw parseError;
 		}
 		if (recovered?.workspaceId && "paneId" in recovered)
-			return retainWorktreeTab(recovered, output);
+			return withOpenedPrimary(retainWorktreeTab(recovered, output), claim);
 		if (recovered) {
+			if (claim) rememberOpenedPrimaryWorkspace(claim);
 			throw new HerdrWorktreeCreateError(
 				`Herdr created branch ${branch}, but its workspace response was incomplete`,
 				recovered,
+				claim,
 			);
 		}
 		throw parseError;
 	}
+}
+
+interface DecodedPrimaryWorkspace {
+	label?: string;
+	focused?: boolean;
+	tabCount?: number;
+	linked?: boolean;
+	repoKey?: string;
+	repoName?: string;
+}
+
+function decodePrimaryWorkspace(
+	value: any,
+): DecodedPrimaryWorkspace | undefined {
+	if (!isPlainObject(value)) return undefined;
+	const decoded: DecodedPrimaryWorkspace = {};
+	if (isNonEmptyString(value.label)) decoded.label = value.label;
+	if (isBoolean(value.focused)) decoded.focused = value.focused;
+	if (isFiniteNumber(value.tab_count)) decoded.tabCount = value.tab_count;
+	if (!isPlainObject(value.worktree)) return decoded;
+	if (isBoolean(value.worktree.is_linked_worktree))
+		decoded.linked = value.worktree.is_linked_worktree;
+	if (isNonEmptyString(value.worktree.repo_key))
+		decoded.repoKey = value.worktree.repo_key;
+	if (isNonEmptyString(value.worktree.repo_name))
+		decoded.repoName = value.worktree.repo_name;
+	return decoded;
+}
+
+function workspaceLooksUntouched(
+	workspace: DecodedPrimaryWorkspace | undefined,
+	repoKey: string,
+): boolean {
+	return (
+		workspace?.label !== undefined &&
+		workspace.repoName !== undefined &&
+		workspace.label === workspace.repoName &&
+		workspace.focused === false &&
+		workspace.tabCount === 1 &&
+		workspace.linked === false &&
+		workspace.repoKey === repoKey
+	);
+}
+
+function sameCheckoutPath(left: string, right: string): boolean {
+	if (left === right) return true;
+	try {
+		return realpathSync(left) === realpathSync(right);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Whether `pid` has child processes. True or false when pgrep answered;
+ * undefined when it did not finish.
+ */
+export function shellHasChildProcesses(pid: number): boolean | undefined {
+	try {
+		execFileSync("pgrep", ["-P", String(pid)], {
+			stdio: "pipe",
+			encoding: "utf8",
+			timeout: OPENED_PRIMARY_CHILD_CHECK_TIMEOUT_MS,
+			killSignal: "SIGKILL",
+		});
+		return true;
+	} catch (error) {
+		const status =
+			error instanceof Error && "status" in error ? error.status : undefined;
+		return status === 1 ? false : undefined;
+	}
+}
+
+function releaseClaim(
+	claim: PrimaryWorkspaceClaim,
+): ReleasedPrimaryWorkspaceClaim {
+	return {
+		workspaceId: claim.workspaceId,
+		repoKey: claim.repoKey,
+		terminalId: claim.terminalId,
+	};
+}
+
+interface PrimaryInspection {
+	untouched: boolean;
+	release: ReleasedPrimaryWorkspaceClaim[];
+	matched?: PrimaryWorkspaceClaim;
+}
+
+function inspectOpenedPrimary(
+	workspaceId: string,
+	repoKey: string,
+	named: readonly PrimaryWorkspaceClaim[],
+	timeout: number | undefined,
+	hasChildProcesses: (pid: number) => boolean | undefined,
+): PrimaryInspection {
+	const decoded = decodePrimaryWorkspace(
+		parseHerdrJson(herdrExec(["workspace", "get", workspaceId], timeout))
+			?.result?.workspace,
+	);
+	if (!workspaceLooksUntouched(decoded, repoKey))
+		return { untouched: false, release: [] };
+	const panes = parseClaimedPanes(
+		herdrExec(["pane", "list", "--workspace", workspaceId], timeout),
+		workspaceId,
+	);
+	if (panes.length !== 1) return { untouched: false, release: [] };
+	const pane = panes[0];
+	if (!pane.terminalId)
+		return { untouched: false, release: named.map(releaseClaim) };
+	const matched = named.find((claim) => claim.terminalId === pane.terminalId);
+	const stale = named.filter((claim) => claim.terminalId !== pane.terminalId);
+	if (!matched) return { untouched: false, release: named.map(releaseClaim) };
+	if (
+		!pane.cwd ||
+		!pane.foregroundCwd ||
+		!sameCheckoutPath(pane.cwd, matched.checkoutPath) ||
+		!sameCheckoutPath(pane.foregroundCwd, matched.checkoutPath)
+	)
+		return { untouched: false, release: stale.map(releaseClaim) };
+	const info = getHerdrPaneProcessInfo(pane.paneId, timeout);
+	const shellPid = info.shellPid;
+	if (
+		!Number.isInteger(shellPid) ||
+		shellPid === undefined ||
+		shellPid <= 0 ||
+		info.foregroundProcessGroupId !== shellPid
+	)
+		return { untouched: false, release: stale.map(releaseClaim) };
+	if (hasChildProcesses(shellPid) !== false)
+		return { untouched: false, release: stale.map(releaseClaim) };
+	return {
+		untouched: true,
+		release: stale.map(releaseClaim),
+		matched,
+	};
+}
+
+/**
+ * Report a primary workspace this process recorded at worktree creation, when
+ * a fresh re-check still shows it untouched. Never closes the workspace.
+ * Returns undefined when no claim applies to the source Herdr reports.
+ */
+export function reportOpenedPrimaryWorkspace(
+	cwd: string,
+	claims: readonly PrimaryWorkspaceClaim[],
+	timeout?: number,
+	hasChildProcesses: (
+		pid: number,
+	) => boolean | undefined = shellHasChildProcesses,
+): OpenedPrimaryWorkspaceReport | undefined {
+	const listing = herdrExec(["worktree", "list", "--cwd", cwd], timeout);
+	const source = parseHerdrWorktreeSource(listing);
+	if (!source.repoKey) return undefined;
+	const own = claims.filter(
+		(claim) =>
+			claim.repoKey === source.repoKey &&
+			isCompletePrimaryWorkspaceClaim(claim),
+	);
+	if (!own.length) return undefined;
+	const id = source.primaryWorkspaceId;
+	const elsewhere = own.filter((claim) => claim.workspaceId !== id);
+	const released = (extra: readonly PrimaryWorkspaceClaim[] = []) =>
+		[...elsewhere, ...extra].map(releaseClaim);
+	if (!id) return { repoKey: source.repoKey, releasedClaims: released() };
+	const named = own.filter((claim) => claim.workspaceId === id);
+	if (!named.length)
+		return { repoKey: source.repoKey, releasedClaims: released() };
+	const linked = parseHerdrWorktreeList(listing).filter(
+		(worktree) =>
+			worktree.isLinkedWorktree &&
+			worktree.workspaceId !== undefined &&
+			worktree.workspaceId !== id,
+	);
+	if (linked.length)
+		return { repoKey: source.repoKey, releasedClaims: released() };
+	const first = inspectOpenedPrimary(
+		id,
+		source.repoKey,
+		named,
+		timeout,
+		hasChildProcesses,
+	);
+	if (!first.untouched)
+		return {
+			repoKey: source.repoKey,
+			releasedClaims: [...released(), ...first.release],
+		};
+	// The first inspection can go stale while Herdr answers. Only this second
+	// read may produce a note, and nothing Herdr-related runs after it.
+	const second = inspectOpenedPrimary(
+		id,
+		source.repoKey,
+		named,
+		timeout,
+		hasChildProcesses,
+	);
+	if (!second.untouched || !second.matched)
+		return {
+			repoKey: source.repoKey,
+			releasedClaims: [...released(), ...second.release],
+		};
+	return {
+		note: `${id} was opened by worktree creation; close it with herdr workspace close ${id}`,
+		repoKey: source.repoKey,
+		releasedClaims: [
+			...released(),
+			...second.release,
+			releaseClaim(second.matched),
+		],
+	};
 }
 
 export function createHerdrSurfaceSplit(

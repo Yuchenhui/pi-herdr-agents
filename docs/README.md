@@ -60,10 +60,11 @@ real implementations; in-memory fakes are conformance fixtures only.
 | [`0008`](adr/0008-adopt-pi-only-subagent-execution.md) | Partially superseded by 0012 | Keep Pi-only execution; 0012 supersedes only the adapter-seam restriction. |
 | [`0009`](adr/0009-remove-workflow-subsystem.md) | Accepted; skill ownership moved by 0013 | Remove the workflow subsystem; use public subagent fan-out and parent synthesis. |
 | [`0010`](adr/0010-persistent-specialists-as-session-generations.md) | Accepted | Define persistent specialists as logical identities with policy-bound session generations. |
-| [`0011`](adr/0011-explicit-worktree-cleanup.md) | Accepted | Authorize explicit worktree cleanup by cwd containment; retain branches and reject automatic reaping. |
+| [`0011`](adr/0011-explicit-worktree-cleanup.md) | Accepted; amended by 0015 | Authorize explicit worktree cleanup by cwd containment; retain branches and reject automatic reaping. |
 | [`0012`](adr/0012-adopt-maestro-seams-in-repo.md) | Accepted | Adopt in-repo seams and conformance fakes; keep one package, Pi-only execution, and Herdr-only surfaces. |
 | [`0013`](adr/0013-pack-neutral-execution-host.md) | Accepted | Ship a pack-neutral execution host; roles and workflows move to optional packs, and `/iterate` and `/btw` are removed. |
 | [`0014`](adr/0014-operator-cancel-terminal-intent.md) | Accepted | Operator cancel records terminal intent before owned termination: no fallback, one confirmed cancelled result, unconfirmed runs stay live. |
+| [`0015`](adr/0015-report-opened-primary-workspace.md) | Accepted | Report, and never automatically close, a primary workspace that worktree creation opened. |
 
 ## Historical material
 

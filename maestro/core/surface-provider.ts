@@ -6,6 +6,10 @@
  * Methods may be sync or async; providers choose. The CLI is the only place
  * that wires a provider to an adapter (via core's SurfaceHandle).
  */
+import type {
+	OpenedPrimaryWorkspaceReport,
+	PrimaryWorkspaceClaim,
+} from "./opened-primary-workspace.ts";
 import type { PaneInspection, SurfaceHandle } from "./types.ts";
 
 // pi-herdr-agents extension
@@ -48,6 +52,17 @@ export interface WorktreeSurface {
 	/** Provider-native workspace/container id for later removal. */
 	workspaceId: string;
 	surfaceId: string;
+	/**
+	 * Set only when this create opened the source repository's primary
+	 * workspace. A workspace that was already open is not claimed.
+	 */
+	openedPrimaryWorkspace?: PrimaryWorkspaceClaim;
+}
+
+export interface ReportOpenedPrimaryWorkspaceInput {
+	sourceRepo: string;
+	claims: readonly PrimaryWorkspaceClaim[];
+	timeoutMs?: number;
 }
 
 export type RecoveredWorktreeProvisioning = Pick<
@@ -57,14 +72,18 @@ export type RecoveredWorktreeProvisioning = Pick<
 
 export class WorktreeProvisioningError extends Error {
 	readonly recoveredWorktree: RecoveredWorktreeProvisioning;
+	readonly openedPrimaryWorkspace?: PrimaryWorkspaceClaim;
 
 	constructor(
 		message: string,
 		recoveredWorktree: RecoveredWorktreeProvisioning,
+		openedPrimaryWorkspace?: PrimaryWorkspaceClaim,
 	) {
 		super(message);
 		this.name = "WorktreeProvisioningError";
 		this.recoveredWorktree = recoveredWorktree;
+		if (openedPrimaryWorkspace)
+			this.openedPrimaryWorkspace = openedPrimaryWorkspace;
 	}
 }
 
@@ -134,6 +153,17 @@ export interface SurfaceProvider {
 		workspaceId: string,
 		opts?: { timeoutMs?: number },
 	): void | Promise<void>;
+
+	/**
+	 * Tell the caller when a claimed primary workspace still looks untouched.
+	 * Never closes it. Unsupported providers return undefined.
+	 */
+	reportOpenedPrimaryWorkspace(
+		input: ReportOpenedPrimaryWorkspaceInput,
+	):
+		| OpenedPrimaryWorkspaceReport
+		| undefined
+		| Promise<OpenedPrimaryWorkspaceReport | undefined>;
 
 	/** Human-readable hint when isAvailable() is false; today's terminalSetupHint(). */
 	// pi-herdr-agents extension

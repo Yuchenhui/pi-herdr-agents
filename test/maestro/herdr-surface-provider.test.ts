@@ -125,6 +125,10 @@ describe("HerdrSurfaceProvider", () => {
 				"--no-focus",
 			],
 		);
+		assert.equal(
+			calls.some((args) => args[0] === "worktree"),
+			false,
+		);
 		assert.deepEqual(
 			calls.find((args) => args[0] === "pane" && args[1] === "split"),
 			[

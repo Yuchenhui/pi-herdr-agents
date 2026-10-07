@@ -1,6 +1,6 @@
 # ADR-0011: Authorize explicit worktree cleanup by cwd containment
 
-- **Status:** Accepted
+- **Status:** Accepted; amended by [ADR-0015](0015-report-opened-primary-workspace.md)
 - **Date:** 2026-09-17
 - **Scope:** Managed subagent worktree cleanup (issue #45)
 
