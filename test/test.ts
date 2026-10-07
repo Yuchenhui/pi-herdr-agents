@@ -13383,31 +13383,6 @@ describe("herdr.ts", () => {
 			);
 		});
 
-		it("matches only the expected Pi session and cwd", () => {
-			const process = {
-				pid: 200,
-				name: "pi",
-				argv: ["pi", "--session", "/tmp/session.jsonl"],
-				cwd: "/tmp/worktree",
-			};
-			assert.equal(
-				__herdrTest__.isExpectedPiProcess(
-					process,
-					"/tmp/session.jsonl",
-					"/tmp/worktree",
-				),
-				true,
-			);
-			assert.equal(
-				__herdrTest__.isExpectedPiProcess(
-					process,
-					"/tmp/other.jsonl",
-					"/tmp/worktree",
-				),
-				false,
-			);
-		});
-
 		it("parses pane process-info identities", () => {
 			const result = __herdrTest__.parsePaneProcessInfo(
 				JSON.stringify({

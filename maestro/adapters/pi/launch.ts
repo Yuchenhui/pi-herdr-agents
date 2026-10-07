@@ -24,9 +24,11 @@ import type {
 import {
 	getSubagentProcessIdentityFile,
 	linuxProcessProbe,
+	readLinuxProcessEnvironment,
 	readProcessIdentityRecord,
 	verifyProcessIdentityRecord,
 	type PiProcessIdentity,
+	type ProcessEnvironmentReader,
 	type ProcessIdentityProbe,
 } from "./process-identity.ts";
 import {
@@ -201,22 +203,28 @@ function worktreeSurfaceForLaunch(
 	return surface;
 }
 
+/**
+ * Names the launched session in the Pi process's exec-time environment. Pi
+ * rewrites its command line, so `--session` is never readiness evidence.
+ * Nothing inside Pi reads it.
+ */
+export const PI_LAUNCH_SESSION_ENV = "PI_HERDR_AGENTS_SESSION";
+
 export function isExpectedPiProcess(
 	process: {
+		pid: number;
 		name?: string;
 		argv0?: string;
-		argv?: string[];
 		cwd?: string;
 	},
 	sessionFile: string,
 	cwd: string,
+	readEnvironment: ProcessEnvironmentReader = readLinuxProcessEnvironment,
 ): boolean {
-	const sessionIndex = process.argv?.indexOf("--session") ?? -1;
 	return (
 		(process.name === "pi" || process.argv0?.split("/").pop() === "pi") &&
-		sessionIndex >= 0 &&
-		process.argv?.[sessionIndex + 1] === sessionFile &&
-		process.cwd === cwd
+		process.cwd === cwd &&
+		readEnvironment(process.pid)?.get(PI_LAUNCH_SESSION_ENV) === sessionFile
 	);
 }
 
@@ -235,15 +243,17 @@ async function waitForSurfacePiReady(
 	while (Date.now() <= deadline) {
 		try {
 			const info = await Promise.resolve(provider.getProcessInfo(surface));
-			if (
-				info.foregroundProcesses.some((process) =>
-					isExpectedPiProcess(process, sessionFile, cwd),
-				)
-			) {
-				return;
+			// An unreadable process (one that is exiting) proves nothing, but must
+			// not hide a matching sibling.
+			for (const process of info.foregroundProcesses) {
+				try {
+					if (isExpectedPiProcess(process, sessionFile, cwd)) return;
+				} catch (error) {
+					lastError = errorMessage(error);
+				}
 			}
 		} catch (error) {
-			lastError = error instanceof Error ? error.message : String(error);
+			lastError = errorMessage(error);
 		}
 		if (Date.now() >= deadline) break;
 		await new Promise((resolve) => setTimeout(resolve, intervalMs));
@@ -861,7 +871,7 @@ function buildPiCommand(
 		}
 	}
 
-	const env: string[] = [];
+	const env = [`${PI_LAUNCH_SESSION_ENV}=${shellQuote(artifacts.sessionFile)}`];
 	if (artifacts.localAgentDir) {
 		env.push(`PI_CODING_AGENT_DIR=${shellQuote(artifacts.localAgentDir)}`);
 	} else if (process.env.PI_CODING_AGENT_DIR) {

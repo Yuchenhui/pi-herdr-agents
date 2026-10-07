@@ -10,9 +10,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import {
+	isExpectedPiProcess,
 	launchOperationsFromSurface,
+	PI_LAUNCH_SESSION_ENV,
 	launchPiSubagent,
 	launchPiWorktreeHandoff,
 	type FreshPiLaunchRequest,
@@ -266,6 +269,7 @@ describe("Pi launch", () => {
 		) => infer Result
 			? Awaited<Result>
 			: never,
+		reason = /expected Pi process not observed/,
 	) {
 		const provider = new FakeSurfaceProvider();
 		provider.createSurface({ name: "ready", cwd: "/repo" });
@@ -286,59 +290,175 @@ describe("Pi launch", () => {
 					"/tmp/child.jsonl",
 					"/repo",
 				),
-				/Timed out waiting for Pi session \/tmp\/child\.jsonl in Herdr pane fake-surface-1: expected Pi process not observed/,
+				new RegExp(
+					`Timed out waiting for Pi session /tmp/child\\.jsonl in Herdr pane fake-surface-1: ${reason.source}`,
+				),
 			);
 		} finally {
 			Date.now = originalNow;
 		}
 	}
 
-	it("provider Pi readiness accepts original exact Pi identity variants", async () => {
-		await assertPiReady({
-			pids: [42],
-			foregroundProcesses: [
-				{
-					pid: 42,
-					argv0: "/usr/local/bin/pi",
-					argv: ["pi", "--session", "/tmp/child.jsonl"],
-					cwd: "/repo",
-				},
-			],
-		});
-		await assertPiReady({
-			pids: [43],
-			foregroundProcesses: [
-				{
-					pid: 43,
-					name: "pi",
-					argv0: "/not/pi/",
-					argv: ["pi", "--session", "/tmp/child.jsonl"],
-					cwd: "/repo",
-				},
-			],
+	/** A live process whose exec-time environment names one launched session. */
+	async function withLaunchedSessionProcess(
+		sessionFile: string | undefined,
+		run: (pid: number) => Promise<void>,
+	) {
+		const env = { ...process.env };
+		delete env[PI_LAUNCH_SESSION_ENV];
+		if (sessionFile !== undefined) env[PI_LAUNCH_SESSION_ENV] = sessionFile;
+		const child = spawn(
+			process.execPath,
+			["-e", "setInterval(() => {}, 1e3)"],
+			{
+				env,
+				stdio: "ignore",
+			},
+		);
+		try {
+			await once(child, "spawn");
+			assert.ok(child.pid);
+			await run(child.pid);
+		} finally {
+			child.kill("SIGKILL");
+		}
+	}
+
+	const linuxOnly = { skip: process.platform !== "linux" };
+
+	it("Pi readiness matches the launched session by environment, not rewritten argv", () => {
+		// Herdr 0.9.3 pane process-info for a live Pi: its title rewrite leaves no `--session`.
+		const herdrReported = {
+			pid: 42,
+			name: "pi",
+			argv: ["pi"],
+			cwd: "/repo",
+		};
+		const environments = new Map([
+			[42, new Map([[PI_LAUNCH_SESSION_ENV, "/tmp/child.jsonl"]])],
+			[43, new Map([[PI_LAUNCH_SESSION_ENV, "/tmp/other.jsonl"]])],
+			[44, new Map<string, string>()],
+		]);
+		const read = (pid: number) => environments.get(pid);
+		assert.equal(
+			isExpectedPiProcess(herdrReported, "/tmp/child.jsonl", "/repo", read),
+			true,
+		);
+		for (const process of [
+			{ ...herdrReported, pid: 43 },
+			{ ...herdrReported, pid: 44 },
+			{ ...herdrReported, pid: 45 },
+			{
+				...herdrReported,
+				pid: 43,
+				argv: ["pi", "--session", "/tmp/child.jsonl"],
+			},
+			{ ...herdrReported, cwd: "/wrong" },
+			{ ...herdrReported, name: "node" },
+		]) {
+			assert.equal(
+				isExpectedPiProcess(process, "/tmp/child.jsonl", "/repo", read),
+				false,
+				JSON.stringify(process),
+			);
+		}
+	});
+
+	it(
+		'provider Pi readiness accepts a Pi whose argv was rewritten to ["pi"]',
+		linuxOnly,
+		async () => {
+			await withLaunchedSessionProcess("/tmp/child.jsonl", async (pid) => {
+				await assertPiReady({
+					pids: [pid],
+					foregroundProcesses: [
+						{ pid, name: "pi", argv: ["pi"], cwd: "/repo" },
+					],
+				});
+				await assertPiReady({
+					pids: [pid],
+					foregroundProcesses: [
+						{ pid, argv0: "/usr/local/bin/pi", argv: ["pi"], cwd: "/repo" },
+					],
+				});
+				await assertPiReady({
+					pids: [pid],
+					foregroundProcesses: [
+						{ pid, name: "pi", argv0: "/not/pi/", argv: ["pi"], cwd: "/repo" },
+					],
+				});
+			});
+		},
+	);
+
+	it(
+		"provider Pi readiness never accepts another session's Pi",
+		linuxOnly,
+		async () => {
+			await withLaunchedSessionProcess("/tmp/other.jsonl", async (pid) => {
+				for (const argv of [["pi"], ["pi", "--session", "/tmp/child.jsonl"]]) {
+					await assertPiReadyRejects({
+						pids: [pid],
+						foregroundProcesses: [{ pid, name: "pi", argv, cwd: "/repo" }],
+					});
+				}
+			});
+			await withLaunchedSessionProcess(undefined, async (pid) => {
+				await assertPiReadyRejects({
+					pids: [pid],
+					foregroundProcesses: [
+						{ pid, name: "pi", argv: ["pi"], cwd: "/repo" },
+					],
+				});
+			});
+		},
+	);
+
+	it("provider Pi readiness treats an unreadable environment as unproven without hiding a match", {
+		skip: process.platform !== "linux" || process.getuid?.() === 0,
+	}, async () => {
+		// PID 1 belongs to root, so its environment is EACCES, as for an exiting Pi.
+		const unreadable = { pid: 1, name: "pi", argv: ["pi"], cwd: "/repo" };
+		await assertPiReadyRejects(
+			{ pids: [1], foregroundProcesses: [unreadable] },
+			/EACCES/,
+		);
+		await withLaunchedSessionProcess("/tmp/child.jsonl", async (pid) => {
+			await assertPiReady({
+				pids: [1, pid],
+				foregroundProcesses: [
+					unreadable,
+					{ pid, name: "pi", argv: ["pi"], cwd: "/repo" },
+				],
+			});
 		});
 	});
 
-	it("provider Pi readiness rejects each identity mismatch independently", async () => {
-		const correct = {
-			pid: 42,
-			name: "pi",
-			argv0: "/usr/local/bin/pi",
-			argv: ["pi", "--session", "/tmp/child.jsonl"],
-			cwd: "/repo",
-		};
-		for (const process of [
-			{ ...correct, argv: ["pi", "--session", "/tmp/other.jsonl"] },
-			{ ...correct, cwd: "/wrong" },
-			{ ...correct, name: undefined, argv0: "/usr/local/bin/python" },
-			{ ...correct, name: undefined, argv0: "/usr/local/bin/pi/" },
-		]) {
-			await assertPiReadyRejects({
-				pids: [process.pid],
-				foregroundProcesses: [process],
+	it(
+		"provider Pi readiness rejects each identity mismatch independently",
+		linuxOnly,
+		async () => {
+			await withLaunchedSessionProcess("/tmp/child.jsonl", async (pid) => {
+				const correct = {
+					pid,
+					name: "pi",
+					argv0: "/usr/local/bin/pi",
+					argv: ["pi"],
+					cwd: "/repo",
+				};
+				for (const process of [
+					{ ...correct, cwd: "/wrong" },
+					{ ...correct, name: undefined, argv0: "/usr/local/bin/python" },
+					{ ...correct, name: undefined, argv0: "/usr/local/bin/pi/" },
+				]) {
+					await assertPiReadyRejects({
+						pids: [process.pid],
+						foregroundProcesses: [process],
+					});
+				}
 			});
-		}
-	});
+		},
+	);
 
 	it("records recovered worktree metadata from provider provisioning errors", async () => {
 		await withFixture(async ({ request, project, sessionDir, root }) => {
@@ -504,6 +624,11 @@ describe("Pi launch", () => {
 			assert.match(command, /PI_SUBAGENT_AUTO_EXIT=1/);
 			// Documented child-context hint: fresh children receive PI_SUBAGENT_ID.
 			assert.match(command, /PI_SUBAGENT_ID='child-1'/);
+			assert.ok(
+				command.includes(
+					`${PI_LAUNCH_SESSION_ENV}=${expectedShellQuote(running.sessionFile)}`,
+				),
+			);
 			assert.match(command, /'' '\/skill:tdd' '@[^']+\.md'/);
 
 			const taskPath = command.match(/'@([^']+\.md)'/)?.[1];
@@ -1652,6 +1777,11 @@ describe("Pi launch", () => {
 			assert.doesNotMatch(
 				command,
 				/subagent-done|PI_SUBAGENT_|__SUBAGENT_DONE_/,
+			);
+			assert.ok(
+				command.includes(
+					`${PI_LAUNCH_SESSION_ENV}=${expectedShellQuote(result.running.sessionFile)}`,
+				),
 			);
 			assert.doesNotMatch(command, /Implement the bounded change/);
 			const child = JSON.parse(

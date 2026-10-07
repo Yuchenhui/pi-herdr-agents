@@ -1190,52 +1190,6 @@ function isHerdrShellReady(info: HerdrPaneProcessInfo): boolean {
 	);
 }
 
-function isExpectedPiProcess(
-	process: HerdrForegroundProcess,
-	sessionFile: string,
-	cwd: string,
-): boolean {
-	const sessionIndex = process.argv?.indexOf("--session") ?? -1;
-	return (
-		(process.name === "pi" || process.argv0?.split("/").pop() === "pi") &&
-		sessionIndex >= 0 &&
-		process.argv?.[sessionIndex + 1] === sessionFile &&
-		process.cwd === cwd
-	);
-}
-
-export async function waitForHerdrPiReady(
-	surface: string,
-	sessionFile: string,
-	cwd: string,
-	options: { timeoutMs?: number; intervalMs?: number } = {},
-): Promise<void> {
-	const timeoutMs = options.timeoutMs ?? 10_000;
-	const intervalMs = options.intervalMs ?? 50;
-	const deadline = Date.now() + timeoutMs;
-	let lastError = "expected Pi process not observed";
-
-	while (Date.now() <= deadline) {
-		try {
-			const info = await getHerdrPaneProcessInfoAsync(surface);
-			if (
-				info.foregroundProcesses.some((process) =>
-					isExpectedPiProcess(process, sessionFile, cwd),
-				)
-			) {
-				return;
-			}
-		} catch (error) {
-			lastError = error instanceof Error ? error.message : String(error);
-		}
-		if (Date.now() >= deadline) break;
-		await new Promise((resolve) => setTimeout(resolve, intervalMs));
-	}
-	throw new Error(
-		`Timed out waiting for Pi session ${sessionFile} in Herdr pane ${surface}: ${lastError}`,
-	);
-}
-
 export async function waitForHerdrShellReady(
 	surface: string,
 	options: {
@@ -1394,6 +1348,5 @@ export const __herdrTest__ = {
 	parseHerdrPaneSnapshot,
 	parsePaneProcessInfo,
 	isHerdrShellReady,
-	isExpectedPiProcess,
 	withMockHerdrExec,
 };

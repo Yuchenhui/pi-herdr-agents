@@ -11,7 +11,10 @@ import {
 import { basename, dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { PiHarnessAdapter } from "../../maestro/adapters/pi/pi-harness-adapter.ts";
-import { launchOperationsFromSurface } from "../../maestro/adapters/pi/launch.ts";
+import {
+	isExpectedPiProcess,
+	launchOperationsFromSurface,
+} from "../../maestro/adapters/pi/launch.ts";
 import { createWorktreeOperations } from "../../maestro/runtime/worktree-operations.ts";
 import type { SpawnOptions } from "../../maestro/core/harness-adapter.ts";
 import {
@@ -288,9 +291,18 @@ async function fixture(
 						async () =>
 							!(
 								await surface.getProcessInfo(child.surface)
-							).foregroundProcesses.some((process) =>
-								process.argv?.includes(child.sessionFile),
-							),
+							).foregroundProcesses.some((process) => {
+								try {
+									return isExpectedPiProcess(
+										process,
+										child.sessionFile,
+										handle.cwd,
+									);
+								} catch {
+									// An exiting process's environment is unreadable; that is not exit evidence.
+									return true;
+								}
+							}),
 						`${kind} Pi process exit`,
 					);
 				} catch (error) {

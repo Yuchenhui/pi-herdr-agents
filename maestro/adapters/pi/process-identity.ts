@@ -123,6 +123,44 @@ export function createLinuxProcessProbe(
 
 export const linuxProcessProbe = createLinuxProcessProbe();
 
+/**
+ * A process's environment as it was at exec. Unlike its command line, Pi's
+ * process-title rewrite leaves this intact. `undefined` only when no such PID
+ * exists; throws on non-Linux hosts and any other read failure.
+ */
+export type ProcessEnvironmentReader = (
+	pid: number,
+) => Map<string, string> | undefined;
+
+export function createLinuxProcessEnvironmentReader(
+	read: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): ProcessEnvironmentReader {
+	return (pid) => {
+		if (process.platform !== "linux")
+			throw new Error(
+				`process environment is unreadable on ${process.platform}; only Linux /proc is read`,
+			);
+		let text: string;
+		try {
+			text = read(`/proc/${pid}/environ`);
+		} catch (error) {
+			const code = error instanceof Error ? errnoCode(error) : undefined;
+			if (code === "ENOENT" || code === "ESRCH") return undefined;
+			throw error;
+		}
+		const environment = new Map<string, string>();
+		for (const entry of text.split("\0")) {
+			const separator = entry.indexOf("=");
+			if (separator > 0 && !environment.has(entry.slice(0, separator)))
+				environment.set(entry.slice(0, separator), entry.slice(separator + 1));
+		}
+		return environment;
+	};
+}
+
+export const readLinuxProcessEnvironment =
+	createLinuxProcessEnvironmentReader();
+
 /** The calling process's identity; throws when this host cannot establish it. */
 export function readOwnProcessIdentity(
 	probe: ProcessIdentityProbe = linuxProcessProbe,
