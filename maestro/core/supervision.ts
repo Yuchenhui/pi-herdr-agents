@@ -166,14 +166,25 @@ export class SupervisionCoordinator {
 		}
 		if (entry.fallback) return this.poll(signal);
 		return new Promise((resolve, reject) => {
-			const onAbort = () => {
-				entry.resolve = undefined;
-				reject(new Error("Aborted while waiting for subagent to finish"));
-			};
-			entry.resolve = (reason) => {
+			// Polling keeps its own timer referenced. A wake wait has only this
+			// promise, so retain the unref'd directory watch until it settles.
+			const release = this.wakeRegistry.retain();
+			let settled = false;
+			const finish = (settle: () => void) => {
+				if (settled) return;
+				settled = true;
 				signal.removeEventListener("abort", onAbort);
 				entry.resolve = undefined;
-				resolve(reason);
+				release();
+				settle();
+			};
+			const onAbort = () => {
+				finish(() =>
+					reject(new Error("Aborted while waiting for subagent to finish")),
+				);
+			};
+			entry.resolve = (reason) => {
+				finish(() => resolve(reason));
 			};
 			signal.addEventListener("abort", onAbort, { once: true });
 		});

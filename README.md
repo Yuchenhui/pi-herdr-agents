@@ -553,9 +553,12 @@ project definitions keep their precedence over them.
 
 On supported local filesystems, supervision uses file wake-ups plus one shared
 4.8-second pane reconciliation. A wake-up only prompts fresh evidence
-collection; it never establishes a result by itself. If the watcher or shared
-pane inspection becomes unavailable, supervision quietly returns to the legacy
-one-second polling cadence. No caller action is required.
+collection; it never establishes a result by itself. A wait for that check keeps
+its file watch referenced until the wait settles or is aborted, so the sidecar
+is still observed when the parent has no other event-loop work. A watch with no
+waiter stays unreferenced and does not keep the process running. If the watcher
+or shared pane inspection becomes unavailable, supervision quietly returns to
+the legacy one-second polling cadence. No caller action is required.
 
 Set `supervision.forcePolling` to `true` in the durable user `config.json` to
 disable wake-ups and use that legacy cadence deliberately. The setting is read

@@ -76,6 +76,14 @@ function withDir(run: (dir: string) => Promise<void> | void) {
 	};
 }
 
+// Capture timers are unref'd so a background attempt cannot hold the process
+// open. These tests await that attempt directly, so they keep the loop alive
+// the way a parent session does. Capture deadlines stay the ones under test.
+function whileParentLoopAlive(run: () => Promise<void>): Promise<void> {
+	const anchor = setTimeout(() => {}, 2 ** 31 - 1);
+	return run().finally(() => clearTimeout(anchor));
+}
+
 // A real process records its identity through the child-extension hook, then
 // rewrites its title exactly as Pi's CLI setup does.
 const IDENTITY_CHILD = `
@@ -343,75 +351,83 @@ describe("process identity", () => {
 
 	it(
 		"times out without a record and never invents one",
-		withDir(async (dir) => {
-			await assert.rejects(
-				captureSurfacePiProcessIdentity(
-					paneOf(process.pid),
-					"pane",
-					{ file: join(dir, "none.json"), id: "run", sessionFile: "/s.jsonl" },
-					{ timeoutMs: 60, intervalMs: 20 },
-				),
-				/not captured within 60ms: the child has not recorded its process identity/,
-			);
-		}),
+		withDir((dir) =>
+			whileParentLoopAlive(async () => {
+				await assert.rejects(
+					captureSurfacePiProcessIdentity(
+						paneOf(process.pid),
+						"pane",
+						{
+							file: join(dir, "none.json"),
+							id: "run",
+							sessionFile: "/s.jsonl",
+						},
+						{ timeoutMs: 60, intervalMs: 20 },
+					),
+					/not captured within 60ms: the child has not recorded its process identity/,
+				);
+			}),
+		),
 	);
 
 	it(
 		"bounds Herdr process info by the capture deadline and drops a late answer",
-		withDir(async (dir) => {
-			const file = join(dir, "s.jsonl.process.json");
-			writeProcessIdentityRecord(file, record());
-			const { probe } = fakeProbe([
-				[20, stat()],
-				[10, stat("1", "S", 1)],
-			]);
-			const expected = { file, id: "run", sessionFile: "/s.jsonl" };
-			let calls = 0;
-			const release: Array<() => void> = [];
-			// Every answer is valid, but only after the test releases it.
-			const stalled = {
-				getProcessInfo: () => {
-					calls++;
-					return new Promise<PaneInfo>((resolve) =>
-						release.push(() => resolve(paneOf(10).getProcessInfo())),
-					);
-				},
-			};
-			const started = Date.now();
-			const capture = captureSurfacePiProcessIdentity(
-				stalled,
-				"pane",
-				expected,
-				{
-					timeoutMs: 40,
-					intervalMs: 10,
-					probe,
-				},
-			);
-			await assert.rejects(
-				capture,
-				/not captured within 40ms: Herdr process info for pane pane timed out/,
-			);
-			assert.ok(Date.now() - started < 1_000, "rejected on time");
-			assert.equal(calls, 1, "no further query after the deadline");
-			for (const answer of release) answer();
-			await new Promise((resolve) => setTimeout(resolve, 10));
-			await assert.rejects(capture, /not captured within 40ms/);
-			// Negative control: an answer inside the deadline is accepted.
-			const prompt = {
-				getProcessInfo: async () => {
-					await new Promise((resolve) => setTimeout(resolve, 5));
-					return paneOf(10).getProcessInfo();
-				},
-			};
-			assert.deepEqual(
-				await captureSurfacePiProcessIdentity(prompt, "pane", expected, {
-					timeoutMs: 1_000,
-					probe,
-				}),
-				identity,
-			);
-		}),
+		withDir((dir) =>
+			whileParentLoopAlive(async () => {
+				const file = join(dir, "s.jsonl.process.json");
+				writeProcessIdentityRecord(file, record());
+				const { probe } = fakeProbe([
+					[20, stat()],
+					[10, stat("1", "S", 1)],
+				]);
+				const expected = { file, id: "run", sessionFile: "/s.jsonl" };
+				let calls = 0;
+				const release: Array<() => void> = [];
+				// Every answer is valid, but only after the test releases it.
+				const stalled = {
+					getProcessInfo: () => {
+						calls++;
+						return new Promise<PaneInfo>((resolve) =>
+							release.push(() => resolve(paneOf(10).getProcessInfo())),
+						);
+					},
+				};
+				const started = Date.now();
+				const capture = captureSurfacePiProcessIdentity(
+					stalled,
+					"pane",
+					expected,
+					{
+						timeoutMs: 40,
+						intervalMs: 10,
+						probe,
+					},
+				);
+				await assert.rejects(
+					capture,
+					/not captured within 40ms: Herdr process info for pane pane timed out/,
+				);
+				assert.ok(Date.now() - started < 1_000, "rejected on time");
+				assert.equal(calls, 1, "no further query after the deadline");
+				for (const answer of release) answer();
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				await assert.rejects(capture, /not captured within 40ms/);
+				// Negative control: an answer inside the deadline is accepted.
+				const prompt = {
+					getProcessInfo: async () => {
+						await new Promise((resolve) => setTimeout(resolve, 5));
+						return paneOf(10).getProcessInfo();
+					},
+				};
+				assert.deepEqual(
+					await captureSurfacePiProcessIdentity(prompt, "pane", expected, {
+						timeoutMs: 1_000,
+						probe,
+					}),
+					identity,
+				);
+			}),
+		),
 	);
 
 	it(

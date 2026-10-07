@@ -27,6 +27,7 @@ export class FileWakeRegistry {
 	private readonly directories = new Map<string, DirectoryWatcher>();
 	private readonly watchDirectory: typeof watch;
 	private closed = false;
+	private retained = 0;
 
 	constructor(watchDirectory: typeof watch = watch) {
 		this.watchDirectory = watchDirectory;
@@ -57,7 +58,10 @@ export class FileWakeRegistry {
 					}
 				});
 				current = { watcher, entries: new Set() };
+				// Idle watches must not keep the process running. A parked waiter
+				// retains them so this callback can still run.
 				watcher.unref();
+				if (this.retained > 0) watcher.ref();
 				watcher.on("error", () => this.failDirectory(directory));
 				this.directories.set(directory, current);
 			} catch {
@@ -85,10 +89,37 @@ export class FileWakeRegistry {
 		return this.directories.size;
 	}
 
+	/**
+	 * Pin every active directory watch until the returned function runs.
+	 * A bare wake promise does not keep the event loop alive, and idle watches
+	 * are unref'd, so without this the callback never runs when that promise is
+	 * the only pending work.
+	 */
+	retain(): () => void {
+		this.retained++;
+		if (this.retained === 1) this.applyWatcherRef(true);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (this.closed || this.retained === 0) return;
+			this.retained--;
+			if (this.retained === 0) this.applyWatcherRef(false);
+		};
+	}
+
 	close(): void {
 		this.closed = true;
+		this.retained = 0;
 		for (const { watcher } of this.directories.values()) watcher.close();
 		this.directories.clear();
+	}
+
+	private applyWatcherRef(active: boolean): void {
+		for (const { watcher } of this.directories.values()) {
+			if (active) watcher.ref();
+			else watcher.unref();
+		}
 	}
 
 	private failDirectory(directory: string): void {
