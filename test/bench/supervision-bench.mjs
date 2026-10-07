@@ -254,6 +254,9 @@ async function trial(lab, mode, count, round, sequence) {
 			child.resolvedAt = now();
 			return result;
 		});
+		// Unregistering rejects a wait still parked when the window fails early;
+		// that must not surface as an unhandled rejection over the real error.
+		promise.catch(() => {});
 		return { registration, promise };
 	});
 	try {

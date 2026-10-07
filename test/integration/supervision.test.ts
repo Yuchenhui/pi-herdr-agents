@@ -99,6 +99,14 @@ function makeSupervisor(
 	};
 }
 
+// Unregistering rejects a wait that is still parked. When an assertion fails
+// before a completion is awaited, the cleanup must not add an unhandled
+// rejection on top of the real failure.
+function settledOnUnregister<T>(completion: Promise<T>): Promise<T> {
+	completion.catch(() => {});
+	return completion;
+}
+
 async function watchOutcome(
 	sessionFile: string,
 	forcePolling: boolean,
@@ -108,13 +116,15 @@ async function watchOutcome(
 	const registration = supervisor.register(sessionFile, "child-pane");
 	try {
 		const startedAt = Date.now();
-		const completion = waitForCompletion(new AbortController().signal, {
-			intervalMs: POLLING_INTERVAL_MS,
-			sessionFile,
-			readTerminalTail: async () => "",
-			inspectPane: registration.inspectPane,
-			waitForNextCheck: registration.wait,
-		});
+		const completion = settledOnUnregister(
+			waitForCompletion(new AbortController().signal, {
+				intervalMs: POLLING_INTERVAL_MS,
+				sessionFile,
+				readTerminalTail: async () => "",
+				inspectPane: registration.inspectPane,
+				waitForNextCheck: registration.wait,
+			}),
+		);
 		await sleep(35);
 		publishSidecar(sessionFile, payload);
 		const result = await completion;
@@ -143,13 +153,15 @@ describe("event-driven supervision integration", { timeout: 30_000 }, () => {
 						deliveries += 1;
 					},
 				};
-				const completion = waitForCompletion(new AbortController().signal, {
-					intervalMs: POLLING_INTERVAL_MS,
-					sessionFile,
-					readTerminalTail: async () => "",
-					inspectPane: registration.inspectPane,
-					waitForNextCheck: registration.wait,
-				});
+				const completion = settledOnUnregister(
+					waitForCompletion(new AbortController().signal, {
+						intervalMs: POLLING_INTERVAL_MS,
+						sessionFile,
+						readTerminalTail: async () => "",
+						inspectPane: registration.inspectPane,
+						waitForNextCheck: registration.wait,
+					}),
+				);
 				await sleep(35);
 				publishSidecar(sessionFile, { type: "done" });
 				assert.equal((await completion).reason, "done");
@@ -183,19 +195,21 @@ describe("event-driven supervision integration", { timeout: 30_000 }, () => {
 			try {
 				const delivered: string[] = [];
 				let observed = 0;
-				const completion = waitForCompletion(new AbortController().signal, {
-					intervalMs: POLLING_INTERVAL_MS,
-					sessionFile,
-					readTerminalTail: async () => "",
-					inspectPane: registration.inspectPane,
-					waitForNextCheck: registration.wait,
-					onLocalEvidence: () => {
-						const events = readPersistentTaskEvents(sessionFile);
-						for (const event of events.slice(observed))
-							delivered.push(event.task);
-						observed = events.length;
-					},
-				});
+				const completion = settledOnUnregister(
+					waitForCompletion(new AbortController().signal, {
+						intervalMs: POLLING_INTERVAL_MS,
+						sessionFile,
+						readTerminalTail: async () => "",
+						inspectPane: registration.inspectPane,
+						waitForNextCheck: registration.wait,
+						onLocalEvidence: () => {
+							const events = readPersistentTaskEvents(sessionFile);
+							for (const event of events.slice(observed))
+								delivered.push(event.task);
+							observed = events.length;
+						},
+					}),
+				);
 				await sleep(35);
 				appendPersistentTaskEvent(sessionFile, {
 					type: "task-done",
@@ -238,13 +252,15 @@ describe("event-driven supervision integration", { timeout: 30_000 }, () => {
 				renameSync(root, oldRoot);
 				mkdirSync(root);
 				const startedAt = Date.now();
-				const completion = waitForCompletion(new AbortController().signal, {
-					intervalMs: POLLING_INTERVAL_MS,
-					sessionFile,
-					readTerminalTail: async () => "",
-					inspectPane: registration.inspectPane,
-					waitForNextCheck: registration.wait,
-				});
+				const completion = settledOnUnregister(
+					waitForCompletion(new AbortController().signal, {
+						intervalMs: POLLING_INTERVAL_MS,
+						sessionFile,
+						readTerminalTail: async () => "",
+						inspectPane: registration.inspectPane,
+						waitForNextCheck: registration.wait,
+					}),
+				);
 				publishSidecar(sessionFile, { type: "done" });
 				assert.equal((await completion).reason, "done");
 				assert.ok(Date.now() - startedAt < RECONCILE_BUDGET_MS);
@@ -272,13 +288,15 @@ describe("event-driven supervision integration", { timeout: 30_000 }, () => {
 				await registration.wait(new AbortController().signal);
 				failLists = true;
 				const parentSteers: string[] = [];
-				const completion = waitForCompletion(new AbortController().signal, {
-					intervalMs: POLLING_INTERVAL_MS,
-					sessionFile,
-					readTerminalTail: async () => "",
-					inspectPane: registration.inspectPane,
-					waitForNextCheck: registration.wait,
-				});
+				const completion = settledOnUnregister(
+					waitForCompletion(new AbortController().signal, {
+						intervalMs: POLLING_INTERVAL_MS,
+						sessionFile,
+						readTerminalTail: async () => "",
+						inspectPane: registration.inspectPane,
+						waitForNextCheck: registration.wait,
+					}),
+				);
 
 				// The next batch failure switches this registration to the legacy
 				// cadence. A transport transition is internal and has no parent API.

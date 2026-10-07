@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import { captureSurfacePiProcessIdentity } from "../../maestro/adapters/pi/launch.ts";
 import {
 	createLinuxProcessProbe,
@@ -65,15 +65,86 @@ const stat = (startTime = "5000", state = "S", ppid = 10): ProcessStat => ({
 const errno = (code: string) =>
 	Object.assign(new Error(`${code}: test`), { code });
 
-function withDir(run: (dir: string) => Promise<void> | void) {
-	return async () => {
+function withDir(run: (dir: string, t: TestContext) => Promise<void> | void) {
+	return async (t: TestContext) => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-identity-test-"));
 		try {
-			await run(dir);
+			await run(dir, t);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	};
+}
+
+const ANCHORED_TEST_TIMEOUT_MS = 10_000;
+
+// Capture timers are unref'd so a background attempt cannot hold the process
+// open. These tests await that attempt directly, so they keep the loop alive
+// the way a parent session does. Capture deadlines stay the ones under test.
+// The anchor must never outlive the test: a capture that misses its deadline
+// has to fail the file, not hang it.
+function whileParentLoopAlive(
+	t: TestContext,
+	run: () => Promise<void>,
+): Promise<void> {
+	const anchor = setTimeout(() => {}, ANCHORED_TEST_TIMEOUT_MS);
+	const drop = () => clearTimeout(anchor);
+	t.signal.addEventListener("abort", drop, { once: true });
+	return run().finally(() => {
+		t.signal.removeEventListener("abort", drop);
+		drop();
+	});
+}
+
+// Runs one capture in a fresh process that holds nothing else open. The
+// process exits on its own only if every timer the capture leaves pending is
+// unref'd.
+const DRAINING_CAPTURE_CHILD = `
+const [launch, file, stall] = process.argv.slice(1);
+const { captureSurfacePiProcessIdentity } = await import(launch);
+const provider = {
+	getProcessInfo: () =>
+		stall === "herdr"
+			? new Promise(() => {})
+			: { shellPid: process.pid, pids: [], foregroundProcesses: [] },
+};
+captureSurfacePiProcessIdentity(
+	provider,
+	"pane",
+	{ file, id: "run", sessionFile: "/s.jsonl" },
+	{ timeoutMs: 60_000, intervalMs: 60_000 },
+).then(
+	() => process.stdout.write("settled\\n"),
+	() => process.stdout.write("settled\\n"),
+);
+`;
+async function captureDrains(file: string, stall: "record" | "herdr") {
+	const child = spawn(
+		process.execPath,
+		[
+			"--experimental-strip-types",
+			"--no-warnings",
+			"--input-type=module",
+			"-e",
+			DRAINING_CAPTURE_CHILD,
+			"--",
+			new URL("../../maestro/adapters/pi/launch.ts", import.meta.url).href,
+			file,
+			stall,
+		],
+		{ stdio: ["ignore", "pipe", "inherit"] },
+	);
+	let output = "";
+	child.stdout.on("data", (chunk) => {
+		output += String(chunk);
+	});
+	const held = setTimeout(() => child.kill("SIGKILL"), 5_000);
+	try {
+		const [code, signal] = await once(child, "exit");
+		return { code, signal, output };
+	} finally {
+		clearTimeout(held);
+	}
 }
 
 // A real process records its identity through the child-extension hook, then
@@ -343,74 +414,102 @@ describe("process identity", () => {
 
 	it(
 		"times out without a record and never invents one",
-		withDir(async (dir) => {
-			await assert.rejects(
-				captureSurfacePiProcessIdentity(
-					paneOf(process.pid),
-					"pane",
-					{ file: join(dir, "none.json"), id: "run", sessionFile: "/s.jsonl" },
-					{ timeoutMs: 60, intervalMs: 20 },
-				),
-				/not captured within 60ms: the child has not recorded its process identity/,
-			);
-		}),
+		{ timeout: ANCHORED_TEST_TIMEOUT_MS },
+		withDir((dir, t) =>
+			whileParentLoopAlive(t, async () => {
+				await assert.rejects(
+					captureSurfacePiProcessIdentity(
+						paneOf(process.pid),
+						"pane",
+						{
+							file: join(dir, "none.json"),
+							id: "run",
+							sessionFile: "/s.jsonl",
+						},
+						{ timeoutMs: 60, intervalMs: 20 },
+					),
+					/not captured within 60ms: the child has not recorded its process identity/,
+				);
+			}),
+		),
 	);
 
 	it(
 		"bounds Herdr process info by the capture deadline and drops a late answer",
+		{ timeout: ANCHORED_TEST_TIMEOUT_MS },
+		withDir((dir, t) =>
+			whileParentLoopAlive(t, async () => {
+				const file = join(dir, "s.jsonl.process.json");
+				writeProcessIdentityRecord(file, record());
+				const { probe } = fakeProbe([
+					[20, stat()],
+					[10, stat("1", "S", 1)],
+				]);
+				const expected = { file, id: "run", sessionFile: "/s.jsonl" };
+				let calls = 0;
+				const release: Array<() => void> = [];
+				// Every answer is valid, but only after the test releases it.
+				const stalled = {
+					getProcessInfo: () => {
+						calls++;
+						return new Promise<PaneInfo>((resolve) =>
+							release.push(() => resolve(paneOf(10).getProcessInfo())),
+						);
+					},
+				};
+				const started = Date.now();
+				const capture = captureSurfacePiProcessIdentity(
+					stalled,
+					"pane",
+					expected,
+					{
+						timeoutMs: 40,
+						intervalMs: 10,
+						probe,
+					},
+				);
+				await assert.rejects(
+					capture,
+					/not captured within 40ms: Herdr process info for pane pane timed out/,
+				);
+				assert.ok(Date.now() - started < 1_000, "rejected on time");
+				assert.equal(calls, 1, "no further query after the deadline");
+				for (const answer of release) answer();
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				await assert.rejects(capture, /not captured within 40ms/);
+				// Negative control: an answer inside the deadline is accepted.
+				const prompt = {
+					getProcessInfo: async () => {
+						await new Promise((resolve) => setTimeout(resolve, 5));
+						return paneOf(10).getProcessInfo();
+					},
+				};
+				assert.deepEqual(
+					await captureSurfacePiProcessIdentity(prompt, "pane", expected, {
+						timeoutMs: 1_000,
+						probe,
+					}),
+					identity,
+				);
+			}),
+		),
+	);
+
+	it(
+		"never holds the process open while waiting for a record between attempts",
+		withDir(async (dir) => {
+			const exit = await captureDrains(join(dir, "none.json"), "record");
+			assert.deepEqual(exit, { code: 0, signal: null, output: "" });
+		}),
+	);
+
+	it(
+		"never holds the process open while waiting for Herdr process info",
 		withDir(async (dir) => {
 			const file = join(dir, "s.jsonl.process.json");
 			writeProcessIdentityRecord(file, record());
-			const { probe } = fakeProbe([
-				[20, stat()],
-				[10, stat("1", "S", 1)],
-			]);
-			const expected = { file, id: "run", sessionFile: "/s.jsonl" };
-			let calls = 0;
-			const release: Array<() => void> = [];
-			// Every answer is valid, but only after the test releases it.
-			const stalled = {
-				getProcessInfo: () => {
-					calls++;
-					return new Promise<PaneInfo>((resolve) =>
-						release.push(() => resolve(paneOf(10).getProcessInfo())),
-					);
-				},
-			};
-			const started = Date.now();
-			const capture = captureSurfacePiProcessIdentity(
-				stalled,
-				"pane",
-				expected,
-				{
-					timeoutMs: 40,
-					intervalMs: 10,
-					probe,
-				},
-			);
-			await assert.rejects(
-				capture,
-				/not captured within 40ms: Herdr process info for pane pane timed out/,
-			);
-			assert.ok(Date.now() - started < 1_000, "rejected on time");
-			assert.equal(calls, 1, "no further query after the deadline");
-			for (const answer of release) answer();
-			await new Promise((resolve) => setTimeout(resolve, 10));
-			await assert.rejects(capture, /not captured within 40ms/);
-			// Negative control: an answer inside the deadline is accepted.
-			const prompt = {
-				getProcessInfo: async () => {
-					await new Promise((resolve) => setTimeout(resolve, 5));
-					return paneOf(10).getProcessInfo();
-				},
-			};
-			assert.deepEqual(
-				await captureSurfacePiProcessIdentity(prompt, "pane", expected, {
-					timeoutMs: 1_000,
-					probe,
-				}),
-				identity,
-			);
+			const exit = await captureDrains(file, "herdr");
+			assert.deepEqual(exit, { code: 0, signal: null, output: "" });
 		}),
 	);
 
