@@ -447,8 +447,8 @@ describe("reporting an opened primary workspace", () => {
 		it(`fails closed when ${name}`, async () => {
 			const script = scriptedHerdr({
 				"worktree list": [worktreeList("w1")],
-				"workspace get": queues["workspace get"],
-				"pane list": "pane list" in queues ? queues["pane list"] : [],
+				"workspace get": [...queues["workspace get"]],
+				"pane list": "pane list" in queues ? [...queues["pane list"]] : [],
 				"pane process-info": [],
 			});
 			await __herdrTest__.withMockHerdrExec(script.exec, () => {

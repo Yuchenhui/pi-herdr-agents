@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS } from "../../maestro/core/opened-primary-workspace.ts";
 import { HerdrSurfaceProvider } from "../../maestro/surfaces/herdr/herdr-surface-provider.ts";
 import { __herdrTest__ } from "../../maestro/surfaces/herdr/herdr.ts";
 
@@ -325,7 +326,17 @@ describe("HerdrSurfaceProvider", () => {
 			calls.filter(
 				(call) => call.args[0] === "worktree" && call.args[1] === "list",
 			),
-			[{ args: ["worktree", "list", "--cwd", "/repo-a"], timeout: 1234 }],
+			[
+				{
+					args: ["worktree", "list", "--cwd", "/repo-created"],
+					timeout: OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
+				},
+				{
+					args: ["worktree", "list", "--cwd", "/repo-created"],
+					timeout: OPENED_PRIMARY_SNAPSHOT_TIMEOUT_MS,
+				},
+				{ args: ["worktree", "list", "--cwd", "/repo-a"], timeout: 1234 },
+			],
 		);
 	});
 
