@@ -756,12 +756,27 @@ describe("cleanup operating-system probes", () => {
 			});
 		// The cleanup operations spawn git with the inherited environment, so
 		// isolate the whole process from global hooksPath and similar settings.
-		const savedEnv = {
-			GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
-			GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM,
+		// Hooks export an absolute GIT_DIR and GIT_INDEX_FILE; inheriting them
+		// would point fixture commands at the host repository.
+		const overriddenEnv = {
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_NOSYSTEM: "1",
 		};
-		process.env.GIT_CONFIG_GLOBAL = "/dev/null";
-		process.env.GIT_CONFIG_NOSYSTEM = "1";
+		const removedEnv = [
+			"GIT_DIR",
+			"GIT_INDEX_FILE",
+			"GIT_WORK_TREE",
+			"GIT_CONFIG_COUNT",
+			"GIT_CONFIG_PARAMETERS",
+		];
+		const savedEnv = Object.fromEntries(
+			[...Object.keys(overriddenEnv), ...removedEnv].map((key) => [
+				key,
+				process.env[key],
+			]),
+		);
+		Object.assign(process.env, overriddenEnv);
+		for (const key of removedEnv) delete process.env[key];
 		try {
 			git(["init", "-q", "-b", "task"]);
 			git(["config", "user.name", "Cleanup test"]);
