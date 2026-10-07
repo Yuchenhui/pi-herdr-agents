@@ -1258,6 +1258,8 @@ npm run lint
 npm pack --dry-run
 ```
 
+`npm run lint` needs Node.js 22.18 or newer because oxlint loads its TypeScript configuration, `oxlint.config.ts`, natively. Older Node versions fail before linting with `Unknown file extension ".ts"`. This is a contributor tooling floor, not a runtime requirement for package users.
+
 Run the required end-to-end suite from inside Herdr:
 
 ```bash

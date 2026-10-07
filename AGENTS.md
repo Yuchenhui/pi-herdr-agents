@@ -96,6 +96,8 @@ npm pack --dry-run
 git diff --check
 ```
 
+`npm run lint` needs Node.js 22.18 or newer to load `oxlint.config.ts`.
+
 Run LSP diagnostics on every changed TypeScript file; lint and tests do not catch every TypeScript error.
 
 For Herdr or lifecycle changes, run the deterministic suite from inside Herdr. Run only one integration suite at a time on a Herdr instance; concurrent suites compete for terminal focus and process capacity and can cause false timeouts or leaked test resources.
