@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -211,6 +212,34 @@ describe("wake retain accounting before close", () => {
 			assert.equal(registry.retainedWaits, 0);
 			assert.equal(watchers[0].referenced, false);
 			registration.unregister();
+		} finally {
+			supervisor.close();
+		}
+	});
+
+	test("a settled wait removes its abort listener from a long-lived signal", async () => {
+		const { registry, watchers } = fakeWatches();
+		const supervisor = coordinator(registry);
+		const signal = new AbortController().signal;
+		const listeners = () => getEventListeners(signal, "abort").length;
+		try {
+			const registration = supervisor.register("/a/child.jsonl", "child");
+			assert.equal(await registration.wait(signal), "reconcile");
+			const woken = registration.wait(signal);
+			assert.equal(listeners(), 1);
+			watchers[0].emit("child.jsonl.exit");
+			assert.equal(await woken, "wake");
+			assert.equal(listeners(), 0, "a woken wait detaches");
+
+			const parked = registration.wait(signal);
+			await assert.rejects(
+				registration.wait(signal),
+				/already has a parked wait/,
+			);
+			assert.equal(listeners(), 1, "a rejected wait attaches nothing");
+			registration.unregister();
+			await assert.rejects(parked, /registration was unregistered/);
+			assert.equal(listeners(), 0, "an unregistered wait detaches");
 		} finally {
 			supervisor.close();
 		}
