@@ -1275,6 +1275,8 @@ Run the required end-to-end suite from inside Herdr:
 npm run test:integration
 ```
 
+The Herdr server itself must run on Node.js 22.19+, because test panes inherit the server's environment, not the test runner's: Pi 1.0.0 needs Node.js 22.19+ and crashes at startup on versions older than 22.15.
+
 The deterministic suite launches real Pi sessions, Herdr panes, and worktrees without provider credentials. The optional live-provider smoke test is not a merge gate:
 
 ```bash
