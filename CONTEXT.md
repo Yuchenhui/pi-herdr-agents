@@ -71,6 +71,13 @@ verified by the parent against the Herdr pane. A worktree cancel signals and
 judges exit only by it.
 _Avoid_: argv match, foreground process, shell visibility
 
+**Pi startup confirmation**:
+The bounded check that a `/worktree` handoff's Pi is running before its
+workspace is focused: a Pi process in the root pane with the worktree cwd whose
+launch-time environment names the launched session in
+`PI_HERDR_AGENTS_SESSION`. Nothing inside Pi reads that marker.
+_Avoid_: argv match, `--session` visibility, child-context hint
+
 **No-progress advisory**:
 An internal warning that an active child shows no durable progress in its session
 JSONL or activity snapshot. It is advisory only and never changes the child's

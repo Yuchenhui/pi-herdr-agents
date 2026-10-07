@@ -866,6 +866,8 @@ is no other parent/child protocol.
 
 `/worktree <worktree> [task]` creates a Herdr-managed worktree from the current committed branch and launches a new interactive Pi session there with the active conversation branch. The original session remains available. Use `/worktree list` or `worktree_list({})` to inspect managed worktrees, including cross-session orphans, whose canonical source repositories are inside the session's cwd subtree. This is a new-process handoff, not an in-place move of the existing shell or Pi process.
 
+The destination workspace is focused only after Pi startup is confirmed. Every fresh launch, including the handoff, sets `PI_HERDR_AGENTS_SESSION` to its session file; confirmation requires a Pi process in the root pane with the worktree cwd whose launch-time environment carries that value. Pi rewrites its process title, so command-line text is never evidence. Nothing inside Pi reads the variable, and it is not a child-context hint. Confirmation reads Linux `/proc`; see [Worktree subagents](docs/worktree-subagents.md).
+
 ---
 
 ### Explicit worktree cleanup

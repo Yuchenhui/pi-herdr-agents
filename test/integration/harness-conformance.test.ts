@@ -11,7 +11,10 @@ import {
 import { basename, dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { PiHarnessAdapter } from "../../maestro/adapters/pi/pi-harness-adapter.ts";
-import { launchOperationsFromSurface } from "../../maestro/adapters/pi/launch.ts";
+import {
+	isExpectedPiProcess,
+	launchOperationsFromSurface,
+} from "../../maestro/adapters/pi/launch.ts";
 import { createWorktreeOperations } from "../../maestro/runtime/worktree-operations.ts";
 import type { SpawnOptions } from "../../maestro/core/harness-adapter.ts";
 import {
@@ -289,7 +292,7 @@ async function fixture(
 							!(
 								await surface.getProcessInfo(child.surface)
 							).foregroundProcesses.some((process) =>
-								process.argv?.includes(child.sessionFile),
+								isExpectedPiProcess(process, child.sessionFile, handle.cwd),
 							),
 						`${kind} Pi process exit`,
 					);
