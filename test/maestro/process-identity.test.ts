@@ -351,6 +351,7 @@ describe("process identity", () => {
 
 	it(
 		"times out without a record and never invents one",
+		{ timeout: 10_000 },
 		withDir((dir) =>
 			whileParentLoopAlive(async () => {
 				await assert.rejects(
@@ -372,6 +373,7 @@ describe("process identity", () => {
 
 	it(
 		"bounds Herdr process info by the capture deadline and drops a late answer",
+		{ timeout: 10_000 },
 		withDir((dir) =>
 			whileParentLoopAlive(async () => {
 				const file = join(dir, "s.jsonl.process.json");

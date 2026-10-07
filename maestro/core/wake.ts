@@ -89,6 +89,11 @@ export class FileWakeRegistry {
 		return this.directories.size;
 	}
 
+	/** Outstanding retains; every directory watch is referenced while nonzero. */
+	get retainedWaits(): number {
+		return this.retained;
+	}
+
 	/**
 	 * Pin every active directory watch until the returned function runs.
 	 * A bare wake promise does not keep the event loop alive, and idle watches
@@ -96,6 +101,7 @@ export class FileWakeRegistry {
 	 * the only pending work.
 	 */
 	retain(): () => void {
+		if (this.closed) return () => {};
 		this.retained++;
 		if (this.retained === 1) this.applyWatcherRef(true);
 		let released = false;

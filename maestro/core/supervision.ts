@@ -8,6 +8,10 @@ import {
 export const RECONCILE_INTERVAL_MS = 4_800;
 export const POLLING_INTERVAL_MS = 1_000;
 const BATCH_UNHEALTHY_MS = 5_000;
+const ABORT_MESSAGE = "Aborted while waiting for subagent to finish";
+const UNREGISTERED_MESSAGE = "Supervision registration was unregistered";
+const CONCURRENT_WAIT_MESSAGE =
+	"Supervision registration already has a parked wait";
 
 export interface PaneListEntry {
 	paneId: string;
@@ -30,10 +34,16 @@ interface Entry {
 	generation: number;
 	wakeRegistration?: WakeRegistration;
 	pending?: WakeReason;
-	resolve?: (reason: WakeReason) => void;
+	parked?: ParkedWait;
+	unregistered?: boolean;
 	inspection?: PaneInspection;
 	fallback: boolean;
 	fileFallback: boolean;
+}
+
+interface ParkedWait {
+	resolve(reason: WakeReason): void;
+	reject(error: Error): void;
 }
 
 export interface SupervisionDiagnostics {
@@ -138,12 +148,15 @@ export class SupervisionCoordinator {
 	}
 
 	private unregister(entry: Entry): void {
+		entry.unregistered = true;
 		entry.wakeRegistration?.unregister();
 		this.entries.delete(entry);
 		if (this.entries.size === 0 && this.timer) {
 			clearInterval(this.timer);
 			this.timer = undefined;
 		}
+		// Nothing can wake a parked wait now; settle it so its retain is released.
+		entry.parked?.reject(new Error(UNREGISTERED_MESSAGE));
 	}
 
 	private enterFallback(entry: Entry): void {
@@ -155,10 +168,12 @@ export class SupervisionCoordinator {
 	}
 
 	private wait(entry: Entry, signal: AbortSignal): Promise<WakeReason> {
-		if (signal.aborted)
-			return Promise.reject(
-				new Error("Aborted while waiting for subagent to finish"),
-			);
+		if (signal.aborted) return Promise.reject(new Error(ABORT_MESSAGE));
+		if (entry.unregistered)
+			return Promise.reject(new Error(UNREGISTERED_MESSAGE));
+		// One completion loop consumes a registration: `pending` queues a single
+		// reason for a single waiter, so a second concurrent wait is a caller bug.
+		if (entry.parked) return Promise.reject(new Error(CONCURRENT_WAIT_MESSAGE));
 		if (entry.pending) {
 			const reason = entry.pending;
 			entry.pending = undefined;
@@ -174,17 +189,16 @@ export class SupervisionCoordinator {
 				if (settled) return;
 				settled = true;
 				signal.removeEventListener("abort", onAbort);
-				entry.resolve = undefined;
+				entry.parked = undefined;
 				release();
 				settle();
 			};
 			const onAbort = () => {
-				finish(() =>
-					reject(new Error("Aborted while waiting for subagent to finish")),
-				);
+				finish(() => reject(new Error(ABORT_MESSAGE)));
 			};
-			entry.resolve = (reason) => {
-				finish(() => resolve(reason));
+			entry.parked = {
+				resolve: (reason) => finish(() => resolve(reason)),
+				reject: (error) => finish(() => reject(error)),
 			};
 			signal.addEventListener("abort", onAbort, { once: true });
 		});
@@ -198,7 +212,7 @@ export class SupervisionCoordinator {
 			}, POLLING_INTERVAL_MS);
 			const onAbort = () => {
 				clearTimeout(timer);
-				reject(new Error("Aborted while waiting for subagent to finish"));
+				reject(new Error(ABORT_MESSAGE));
 			};
 			signal.addEventListener("abort", onAbort, { once: true });
 		});
@@ -207,7 +221,7 @@ export class SupervisionCoordinator {
 	private signal(entry: Entry, reason: WakeReason): void {
 		if (this.closed) return;
 		if (reason === "wake") entry.inspection = undefined;
-		if (entry.resolve) entry.resolve(reason);
+		if (entry.parked) entry.parked.resolve(reason);
 		// A wake must never downgrade a queued reconciliation: the reconcile
 		// reason carries the epoch's pane inspection, and skipping it would
 		// defer pane-disappearance detection past the documented 5s bound.
