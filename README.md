@@ -341,21 +341,22 @@ launch; no Windows PowerShell 5 fallback or execution-policy bypass is used.
 | Tool | Contract |
 | --- | --- |
 | `cli_agents_list({})` | Passive configuration/file availability, authentication/model access unknown; does not execute clients or autoauthorize. Also reports owned run IDs and artifact paths. |
-| `cli_agent({ name, cli, task, cwd?, model?, effort?, autonomous?, trustWorkspace?, timeoutSeconds? })` | Returns an `accepted/launching` receipt, not proof of client spawn. One automatic `cli_agent_result` follows terminal protocol evidence and confirmed exit. No caller polling is needed. |
+| `cli_agent({ name, cli, task, cwd?, model?, effort?, autonomous?, trustWorkspace?, allowUnsandboxed?, timeoutSeconds? })` | Returns an `accepted/launching` receipt, not proof of client spawn. One automatic `cli_agent_result` follows terminal protocol evidence and confirmed exit. No caller polling is needed. |
 | `cli_agent_cancel({ id })` | Requests cancellation only for that parent's owned native run. Unconfirmed termination stays owned/controllable; a kill request is not a completed cancellation. |
 
 These tools are parent-only (not registered in Pi subagent contexts).
 `cwd` defaults to the parent cwd. agy task text is limited to 8,000 characters
 for safe native prompt argv; use local context-file references for larger briefs.
-Cursor reads a private task file and Claude receives task text on stdin. Cursor's optional `trustWorkspace: true` requires explicit user approval for both the `cwd` workspace and host-created extra task directory; it is false by default, independent of `autonomous`/`--force`, and the Cursor client may persist trust records for those specific directories.
+Cursor reads a private task file and Claude receives task text on stdin. Cursor's optional `trustWorkspace: true` requires explicit user approval for both the `cwd` workspace and host-created extra task directory; it is false by default, independent of `autonomous`/`--force`, and the Cursor client may persist trust records for those specific directories. Native Windows Cursor requires `allowUnsandboxed: true` with explicit user approval on that call because Cursor's sandbox is unsupported there; this switches that run to the CLI allowlist mode, not OS isolation, and is not a universal read-only guarantee. The option is absent/false by default and rejected for other clients/platforms. No global sandbox configuration is changed.
 `model` is a **CLI-native** string, not a Pi
 `provider/model` reference; omission keeps the client's own default. `effort`
 accepts `low`, `medium`, `high`, `xhigh`, or `max` for agy/Claude; Cursor rejects
 it because no effort flag is verified. The client can reject a model/effort
 combination, and that failure is reported without retry. `autonomous` defaults
 to `false`: agy/Claude use plan permission mode and Cursor uses ask mode with
-sandbox enabled. `true` explicitly adds native `--dangerously-skip-permissions`
-(agy/Claude) or `--force` (Cursor, still sandbox enabled). This grants the
+sandbox enabled except for the explicitly approved native Windows allowlist-mode
+exception above. `true` explicitly adds native `--dangerously-skip-permissions`
+(agy/Claude) or `--force` (Cursor). This grants the
 client's native permissions, not Pi's tool whitelist, and is not a universal
 read-only/security guarantee. Review client behavior and task scope first.
 Timeout is an integer 1–600 seconds, default 180 (or `externalCli.timeoutSeconds`).

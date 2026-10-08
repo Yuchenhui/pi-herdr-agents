@@ -163,7 +163,9 @@ try {
 				"--workspace",
 				m.cwd,
 				"--sandbox",
-				"enabled",
+				process.platform === "win32" && m.allowUnsandboxed === true
+					? "disabled"
+					: "enabled",
 				...(m.autonomous ? ["--force"] : ["--mode", "ask"]),
 				...(m.trustWorkspace === true ? ["--trust"] : []),
 				"--add-dir",

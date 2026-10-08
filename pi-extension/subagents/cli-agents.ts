@@ -421,7 +421,7 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 		name: "cli_agent",
 		label: "Launch native CLI",
 		description:
-			"Launch one agy, Cursor, or Claude native one-shot client in this parent's environment in an owned Herdr pane. Returns an accepted receipt, then one automatic cli_agent_result. Native model strings only; no Pi sessions, routing, retries, worktrees or polling needed. autonomous defaults false; true explicitly enables the client's dangerous/force permission flag. trustWorkspace is a separate Cursor-only opt-in and requires explicit user approval for both cwd/workspace and the host-created extra task directory; it does not imply autonomous permission.",
+			"Launch one agy, Cursor, or Claude native one-shot client in this parent's environment in an owned Herdr pane. Returns an accepted receipt, then one automatic cli_agent_result. Native model strings only; no Pi sessions, routing, retries, worktrees or polling needed. autonomous defaults false; true explicitly enables the client's dangerous/force permission flag. trustWorkspace is a separate Cursor-only opt-in and requires explicit user approval for both cwd/workspace and the host-created extra task directory; it does not imply autonomous permission. On native Windows, Cursor's unsupported sandbox requires per-call allowUnsandboxed: true with explicit user approval; this uses the CLI allowlist, not OS isolation.",
 		parameters: Type.Object({
 			name: Type.String({ minLength: 1, maxLength: 100 }),
 			cli: Type.Union(ids.map((id) => Type.Literal(id))),
@@ -437,6 +437,7 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 			),
 			autonomous: Type.Optional(Type.Boolean()),
 			trustWorkspace: Type.Optional(Type.Boolean()),
+			allowUnsandboxed: Type.Optional(Type.Boolean()),
 			timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 600 })),
 		}),
 		async execute(_id, p, _signal, _update, ctx) {
@@ -446,6 +447,12 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 				throw new Error(`Native CLI ${p.cli} is not whitelisted`);
 			if (p.trustWorkspace === true && p.cli !== "cursor")
 				throw new Error("trustWorkspace is supported only for Cursor");
+			if (p.allowUnsandboxed === true && p.cli !== "cursor")
+				throw new Error("allowUnsandboxed is supported only for Cursor");
+			if (p.allowUnsandboxed === true && process.platform !== "win32")
+				throw new Error("allowUnsandboxed is supported only for native Windows Cursor");
+			if (process.platform === "win32" && p.cli === "cursor" && p.allowUnsandboxed !== true)
+				throw new Error("Native Windows Cursor sandbox is unsupported; launch requires explicit per-call allowUnsandboxed approval (CLI allowlist mode, not OS isolation)");
 			if (p.cli === "cursor" && p.effort !== undefined)
 				throw new Error(
 					"Cursor effort is unsupported; no verified native effort flag",
