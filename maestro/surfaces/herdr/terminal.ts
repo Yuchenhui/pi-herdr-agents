@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { shellQuote } from "../../core/shell.ts";
@@ -130,8 +130,39 @@ export function runScriptInPane(
 	scriptLines.push(command);
 	writeFileSync(scriptPath, `${scriptLines.join("\n")}\n`, { mode: 0o755 });
 
-	runInPane(paneId, `bash ${shellQuote(scriptPath)}`);
+	runInPane(paneId, buildScriptLaunchCommand(scriptPath));
 	return scriptPath;
+}
+
+/** pane run types into the outer shell. On Windows the ASCII-only trampoline
+ * supports PowerShell, cmd.exe and Git Bash with powershell.exe on PATH.
+ * WSL panes must be launched by a WSL/Linux parent, not a native Windows Pi.
+ */
+export function buildScriptLaunchCommand(
+	scriptPath: string,
+	platform: NodeJS.Platform = process.platform,
+	exists: (path: string) => boolean = existsSync,
+): string {
+	if (platform !== "win32") return `bash ${shellQuote(scriptPath)}`;
+	const roots = [
+		process.env.ProgramFiles,
+		process.env["ProgramFiles(x86)"],
+		"C:/Program Files",
+		"C:/Program Files (x86)",
+	].filter(Boolean);
+	const candidates = roots.flatMap((root) =>
+		["bin/bash.exe", "usr/bin/bash.exe"].map((suffix) =>
+			`${root}/Git/${suffix}`.replaceAll("\\", "/"),
+		),
+	);
+	const bash = candidates.find(exists);
+	if (!bash)
+		throw new Error(
+			"Windows subagents require Git Bash (Git/bin/bash.exe or Git/usr/bin/bash.exe); bare bash/WSL is not supported.",
+		);
+	const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+	const payload = `& ${quote(bash)} ${quote(scriptPath.replaceAll("\\", "/"))}; exit $LASTEXITCODE`;
+	return `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(payload, "utf16le").toString("base64")}`;
 }
 
 export function readPane(paneId: PaneId, lines = 50): string {

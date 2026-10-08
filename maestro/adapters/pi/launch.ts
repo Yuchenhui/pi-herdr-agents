@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { getSubagentActivityFile } from "./activity-file.ts";
@@ -40,6 +40,13 @@ import {
 } from "./session.ts";
 
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+
+// Paths here are interpreted inside Git Bash, never by the outer pane shell.
+function quoteLaunchPath(path: string): string {
+	return shellQuote(
+		process.platform === "win32" ? path.replaceAll("\\", "/") : path,
+	);
+}
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
@@ -550,7 +557,7 @@ function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
 			? agentDir
 			: (request.parent.invocationCwd ?? request.parent.cwd);
 	const sourceCwd = rawCwd
-		? rawCwd.startsWith("/")
+		? isAbsolute(rawCwd)
 			? rawCwd
 			: join(cwdBase, rawCwd)
 		: request.parent.cwd;
@@ -839,10 +846,10 @@ function buildPiCommand(
 	const parts = [
 		"pi",
 		"--session",
-		shellQuote(artifacts.sessionFile),
+		quoteLaunchPath(artifacts.sessionFile),
 		...(request.handoff
 			? []
-			: ["-e", shellQuote(join(SUBAGENTS_DIR, "child", "subagent-done.ts"))]),
+			: ["-e", quoteLaunchPath(join(SUBAGENTS_DIR, "child", "subagent-done.ts"))]),
 		"--model",
 		shellQuote(request.runtimePlan.model),
 		"--thinking",
@@ -853,7 +860,7 @@ function buildPiCommand(
 			request.behavior.systemPromptMode === "replace"
 				? "--system-prompt"
 				: "--append-system-prompt",
-			shellQuote(artifacts.systemPromptFile),
+			quoteLaunchPath(artifacts.systemPromptFile),
 		);
 	}
 	const toolAllowlist = buildSubagentToolAllowlist(
@@ -867,16 +874,20 @@ function buildPiCommand(
 			resolved.taskDelivery,
 			artifacts.taskArg,
 		)) {
-			parts.push(shellQuote(prompt));
+			parts.push(
+				resolved.taskDelivery === "artifact" && prompt === artifacts.taskArg
+					? quoteLaunchPath(prompt)
+					: shellQuote(prompt),
+			);
 		}
 	}
 
-	const env = [`${PI_LAUNCH_SESSION_ENV}=${shellQuote(artifacts.sessionFile)}`];
+	const env = [`${PI_LAUNCH_SESSION_ENV}=${quoteLaunchPath(artifacts.sessionFile)}`];
 	if (artifacts.localAgentDir) {
-		env.push(`PI_CODING_AGENT_DIR=${shellQuote(artifacts.localAgentDir)}`);
+		env.push(`PI_CODING_AGENT_DIR=${quoteLaunchPath(artifacts.localAgentDir)}`);
 	} else if (process.env.PI_CODING_AGENT_DIR) {
 		env.push(
-			`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`,
+			`PI_CODING_AGENT_DIR=${quoteLaunchPath(process.env.PI_CODING_AGENT_DIR)}`,
 		);
 	}
 	if (!request.handoff) {
@@ -898,18 +909,18 @@ function buildPiCommand(
 				`PI_SUBAGENT_TASK_ID=${shellQuote(request.behavior.taskId ?? "")}`,
 			);
 		}
-		env.push(`PI_SUBAGENT_SESSION=${shellQuote(artifacts.sessionFile)}`);
+		env.push(`PI_SUBAGENT_SESSION=${quoteLaunchPath(artifacts.sessionFile)}`);
 		env.push(`PI_SUBAGENT_ID=${shellQuote(resolved.id)}`);
-		env.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(artifacts.activityFile)}`);
+		env.push(`PI_SUBAGENT_ACTIVITY_FILE=${quoteLaunchPath(artifacts.activityFile)}`);
 		env.push(`PI_SUBAGENT_SURFACE=${shellQuote(artifacts.surface)}`);
 		if (artifacts.processIdentityFile)
 			env.push(
-				`PI_SUBAGENT_PROCESS_FILE=${shellQuote(artifacts.processIdentityFile)}`,
+				`PI_SUBAGENT_PROCESS_FILE=${quoteLaunchPath(artifacts.processIdentityFile)}`,
 			);
 	}
 
 	const piCommand =
-		`cd ${shellQuote(artifacts.targetCwd)} && ` +
+		`cd ${quoteLaunchPath(artifacts.targetCwd)} && ` +
 		`${env.join(" ")} ${parts.join(" ")}`;
 	return request.handoff
 		? piCommand
@@ -1048,15 +1059,15 @@ async function launchResumedPiSubagent(
 
 		const env = [
 			...(process.env.PI_CODING_AGENT_DIR
-				? [`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`]
+				? [`PI_CODING_AGENT_DIR=${quoteLaunchPath(process.env.PI_CODING_AGENT_DIR)}`]
 				: []),
 			...(policy.deniedTools.length > 0
 				? [`PI_DENY_TOOLS=${shellQuote(policy.deniedTools.join(","))}`]
 				: []),
 			`PI_SUBAGENT_NAME=${shellQuote(request.name)}`,
-			`PI_SUBAGENT_SESSION=${shellQuote(request.sessionFile)}`,
+			`PI_SUBAGENT_SESSION=${quoteLaunchPath(request.sessionFile)}`,
 			`PI_SUBAGENT_ID=${shellQuote(id)}`,
-			`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
+			`PI_SUBAGENT_ACTIVITY_FILE=${quoteLaunchPath(activityFile)}`,
 			`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`,
 		];
 		const toolAllowlist = buildSubagentToolAllowlist(
@@ -1067,11 +1078,11 @@ async function launchResumedPiSubagent(
 			...env,
 			"pi",
 			"--session",
-			shellQuote(request.sessionFile),
+			quoteLaunchPath(request.sessionFile),
 			...(toolAllowlist ? ["--tools", shellQuote(toolAllowlist)] : []),
 			"-e",
-			shellQuote(join(SUBAGENTS_DIR, "child", "subagent-done.ts")),
-			...(messageFile ? [shellQuote(`@${messageFile}`)] : []),
+			quoteLaunchPath(join(SUBAGENTS_DIR, "child", "subagent-done.ts")),
+			...(messageFile ? [quoteLaunchPath(`@${messageFile}`)] : []),
 		].join(" ");
 		const launchScriptFile = await operations.runScript(
 			surface,
