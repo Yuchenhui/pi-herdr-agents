@@ -313,10 +313,10 @@ launch workflow.
 
 ## Native one-shot CLI tools (opt-in)
 
-`cli_agent` runs only `agy`, `cursor`, or `claude` in a disposable owned Herdr
+`cli_agent` has adapters for `agy`, `cursor`, `claude`, and `codex` in a disposable owned Herdr
 pane and independent tab, in the **same OS/environment as the parent**.
 Tab/pane labels identify the real engine and name, e.g. `agy: Gemini scout`,
-`cursor: Grok scout`, or `claude: review`. It is independent of Pi
+`cursor: Grok scout`, `claude: review`, or `codex: implementation`. It is independent of Pi
 subagents: no roles, Pi model routing, conversation fork/resume, persistence,
 worktrees, retries, remote/WSL bridge, or fallback. These clients use their own
 saved authentication and subscription/account settings; availability does not
@@ -330,7 +330,7 @@ Launches are denied unless the real durable configuration contains a valid
 map of absolute native executable paths. The example leaves the whitelist
 empty. Configure only approved clients; native binaries are trusted executable
 code. Windows accepts `.exe` and Cursor's native `cursor-agent.ps1` launcher
-(not `*-yolo` wrappers or arbitrary shell strings); POSIX requires executable
+(not `*-yolo` wrappers or arbitrary shell strings); **Windows Codex accepts only a native `.exe`, never `.cmd`, `.bat`, or `.ps1` npm shims**. POSIX requires executable
 native binaries/scripts, never Windows shims. No clients are installed, logged
 in, updated, or probed automatically. The extension does not edit global client
 settings; vendor flags may record user-authorized trust decisions.
@@ -341,22 +341,24 @@ launch; no Windows PowerShell 5 fallback or execution-policy bypass is used.
 | Tool | Contract |
 | --- | --- |
 | `cli_agents_list({})` | Passive configuration/file availability, authentication/model access unknown; does not execute clients or autoauthorize. Also reports owned run IDs and artifact paths. |
-| `cli_agent({ name, cli, task, cwd?, model?, effort?, autonomous?, trustWorkspace?, allowUnsandboxed?, timeoutSeconds? })` | Returns an `accepted/launching` receipt, not proof of client spawn. One automatic `cli_agent_result` follows terminal protocol evidence and confirmed exit. No caller polling is needed. |
+| `cli_agent({ name, cli, task, cwd?, model?, effort?, autonomous?, codexSandbox?, trustWorkspace?, allowUnsandboxed?, timeoutSeconds? })` | Returns an `accepted/launching` receipt, not proof of client spawn. One automatic `cli_agent_result` follows terminal protocol evidence and confirmed exit. No caller polling is needed. |
 | `cli_agent_cancel({ id })` | Requests cancellation only for that parent's owned native run. Unconfirmed termination stays owned/controllable; a kill request is not a completed cancellation. |
 
 These tools are parent-only (not registered in Pi subagent contexts).
 `cwd` defaults to the parent cwd. agy task text is limited to 8,000 characters
 for safe native prompt argv; use local context-file references for larger briefs.
-Cursor reads a private task file and Claude receives task text on stdin. Cursor's optional `trustWorkspace: true` requires explicit user approval for both the `cwd` workspace and host-created extra task directory; it is false by default, independent of `autonomous`/`--force`, and the Cursor client may persist trust records for those specific directories. Native Windows Cursor requires `allowUnsandboxed: true` with explicit user approval on that call because Cursor's sandbox is unsupported there; this switches that run to the CLI allowlist mode, not OS isolation, and is not a universal read-only guarantee. The option is absent/false by default and rejected for other clients/platforms. No global sandbox configuration is changed.
+Cursor reads a private task file; Claude and Codex receive task text on stdin. Cursor's optional `trustWorkspace: true` requires explicit user approval for both the `cwd` workspace and host-created extra task directory; it is false by default, independent of `autonomous`/`--force`, and the Cursor client may persist trust records for those specific directories. Native Windows Cursor requires `allowUnsandboxed: true` with explicit user approval on that call because Cursor's sandbox is unsupported there; this switches that run to the CLI allowlist mode, not OS isolation, and is not a universal read-only guarantee. The option is absent/false by default and rejected for other clients/platforms. No global sandbox configuration is changed.
 `model` is a **CLI-native** string, not a Pi
 `provider/model` reference; omission keeps the client's own default. `effort`
-accepts `low`, `medium`, `high`, `xhigh`, or `max` for agy/Claude; Cursor rejects
-it because no effort flag is verified. The client can reject a model/effort
+accepts `low`, `medium`, `high`, `xhigh`, or `max` for agy/Claude; Codex maps only
+`low`, `medium`, `high`, and `xhigh` to `-c model_reasoning_effort="..."` and this
+adapter rejects `max`. Cursor rejects it because no effort flag is verified. The client can reject a model/effort
 combination, and that failure is reported without retry. `autonomous` defaults
 to `false`: agy/Claude use plan permission mode and Cursor uses ask mode with
 sandbox enabled except for the explicitly approved native Windows allowlist-mode
 exception above. `true` explicitly adds native `--dangerously-skip-permissions`
-(agy/Claude) or `--force` (Cursor). This grants the
+(agy/Claude) or `--force` (Cursor); Codex rejects `autonomous: true` entirely.
+Codex uses the separate sandbox gate described below. This grants the
 client's native permissions, not Pi's tool whitelist, and is not a universal
 read-only/security guarantee. Review client behavior and task scope first.
 Timeout is an integer 1–600 seconds, default 180 (or `externalCli.timeoutSeconds`).
@@ -371,6 +373,18 @@ evidence.
 Results contain name, CLI, cwd, pane ID, requested and observed model (or
 `unknown`), exit code, bounded output/error/stderr, and artifact paths. Success
 requires a valid vendor terminal success result, nonempty answer, and exit 0.
+Codex additionally requires valid `thread.started` and `turn.started` events,
+exactly one well-formed `turn.completed` with token usage, and no top-level
+`error`/`turn.failed`, malformed, duplicate, conflicting, or nonblank post-terminal
+events. Well-formed completed `item.error` warnings are nonfatal diagnostics:
+they may occur after `thread.started` before `turn.started`, or during the turn,
+and remain in the raw stdout artifact. Only that completed error-item form is
+allowed before the turn; other item kinds still require `turn.started`. It returns
+only the **last completed `agent_message`** text, not earlier progress messages,
+reasoning, or command output. The parser targets
+[Codex CLI 0.161.0 exec JSONL](https://raw.githubusercontent.com/openai/codex/rust-v0.161.0/codex-rs/exec/src/exec_events.rs);
+unknown protocol events fail closed. That protocol does not report the model:
+Codex `observedModel` remains `unknown`, never inferred from a request or config.
 Tasks, launch manifests, bounded stdout/stderr (4 MiB each), and atomic sidecars
 are kept in a private temp artifact directory outside the repository; treat
 these retained files as sensitive. Pi proxy/provider/session environment
@@ -384,12 +398,70 @@ are retired only after a valid final sidecar confirms termination. Quitting requ
 cancellation only of these clients. Only confirmed final runs have their owned panes
 closed; user panes are untouched.
 
+### Codex sandbox and native configuration
+
+Codex is a native implementation/verification engine coordinated and reviewed by
+Pi, not a Pi provider adapter. The first authorized native Windows invocation
+returned `HERDR_CODEX_NATIVE_OK_20261008` with exit 0, but the original adapter
+failed on a valid startup warning; that original failed evidence is preserved.
+After the warning fix and offline replay, a separately authorized second call
+completed through the patched source runner: `state: completed`, exit 0, confirmed
+termination, and the exact marker, with no tool events. It requested native
+`gpt-6.1-sol` / `low` in the read-only sandbox; `observedModel` remains `unknown`.
+**This verifies only the native source producer and protocol, not Herdr end-to-end
+delivery.** Billing/route, broader model access, sandbox enforcement and write
+behavior, and cancellation remain unverified. No runtime deployment, installation,
+or saved-config change was performed. Version, help, or login status alone is not
+proof of model access.
+
+- `codexSandbox` is Codex-only, optional, and defaults to `"read-only"`.
+  `"workspace-write"` requires explicit user approval for that task/workspace;
+  it is not `autonomous` or an unsandboxed permission mode. Other clients reject
+  this parameter. Codex rejects Cursor trust/unsandboxed opt-ins.
+- Each [noninteractive invocation](https://developers.openai.com/codex/noninteractive/)
+  uses `codex exec --json --color never --sandbox <mode>` and
+  `-c approval_policy="never"`, with the prompt on stdin via `-`. Approvals cannot
+  hang the one-shot run, but sandbox restrictions still apply. There is no
+  dangerous bypass, `danger-full-access`, added writable task directory, or
+  silent Windows sandbox downgrade. Native policy or sandbox errors return failure.
+- Model and effort omission honor Codex's saved native defaults; a requested
+  native model/effort combination may still be rejected. Pi provider IDs are not
+  native Codex model IDs. The runner does not use `--skip-git-repo-check`; the
+  native repository checks still apply. There is no persist/resume framework or
+  separate last-message file.
+- Saved native authentication/configuration remain in force. Only `CODEX_HOME`
+  is additionally forwarded as a Codex configuration-directory selector;
+  `OPENAI_API_KEY`, `CODEX_API_KEY`, and Pi provider secrets are not forwarded.
+  The extension does not read keys or auth files, change auth routes, or prove
+  subscription billing. Review native saved configuration before authorizing use.
+
+The example keeps `allowed: []` (default deny) and an empty `commands.codex`
+placeholder. Before authorized use, set that value in the **durable user config**
+to the installed official native executable and explicitly whitelist `"codex"`.
+For an official Windows npm install, locate the architecture-matching platform
+package (for x64, `@openai/codex-win32-x64`) beneath the installed `@openai/codex`
+package's `node_modules`; its native executable is
+`vendor/x86_64-pc-windows-msvc/bin/codex.exe`. Install layouts can differ: use the
+actual absolute native path, not the `codex.cmd`/`codex.ps1` wrapper returned from
+PATH, and do not copy another machine's personal path. Availability checks are
+passive and do not probe the binary or authorize a run.
+
+**Residual shared limitation:** Windows cancellation can remain unconfirmed when
+the root client exits while descendants retain its pipes; the existing runner
+cannot safely re-target that exited root PID. This Codex addition does not fix
+or validate that deferred lifecycle issue. Unconfirmed runs stay owned, not
+falsely reported as terminated.
+
 ```typescript
 // Requires explicit durable whitelist and native path configuration first.
 cli_agent({ name: "Gemini scout", cli: "agy", task: "Read only; summarize the project entry points." });
 cli_agent({ name: "Cursor scout", cli: "cursor", model: "<native-model-slug>", task: "Read only; return one short summary." });
 // Claude adapter only; verify account/subscription readiness before use.
 cli_agent({ name: "Claude scout", cli: "claude", task: "Read only; return one short summary." });
+// Code examples only, not executed validation; Codex sandbox defaults read-only.
+cli_agent({ name: "Codex scout", cli: "codex", task: "Read only; summarize the project entry points." });
+// Only after explicit approval for implementation and the workspace-write sandbox.
+cli_agent({ name: "Codex implementation", cli: "codex", codexSandbox: "workspace-write", effort: "medium", task: "Implement only the approved change; run only authorized verification. Do not commit or push." });
 ```
 
 ## Async Subagent Flow

@@ -28,7 +28,7 @@ import {
 	waitForShellReady,
 } from "../../maestro/surfaces/herdr/terminal.ts";
 
-const ids = ["agy", "cursor", "claude"] as const;
+const ids = ["agy", "cursor", "claude", "codex"] as const;
 type Cli = (typeof ids)[number];
 type Run = {
 	id: string;
@@ -146,7 +146,7 @@ function nativePowerShell(command: string): string | undefined {
 	}
 	throw new Error("Native PowerShell 7 (pwsh.exe) is unavailable on PATH");
 }
-function commandPath(value: string | undefined): string {
+function commandPath(value: string | undefined, cli: Cli): string {
 	if (!value || !isAbsolute(value) || /[\r\n\0]/.test(value))
 		throw new Error(
 			"Native command must be one absolute executable path, not a shell command",
@@ -163,6 +163,8 @@ function commandPath(value: string | undefined): string {
 			"Cross-environment transports and command wrappers are not supported",
 		);
 	if (process.platform === "win32") {
+		if (cli === "codex" && !/\.exe$/i.test(path))
+			throw new Error("Native Windows Codex requires an .exe, not a shell shim");
 		if (!/\.(exe|ps1)$/i.test(path))
 			throw new Error("Windows native commands require .exe or .ps1");
 		if (
@@ -372,7 +374,7 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 					let command: string | undefined;
 					let unavailable: string | undefined;
 					try {
-						const path = commandPath(c?.commands[cli]);
+						const path = commandPath(c?.commands[cli], cli);
 						nativePowerShell(path);
 						command = path;
 					} catch (e) {
@@ -421,7 +423,7 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 		name: "cli_agent",
 		label: "Launch native CLI",
 		description:
-			"Launch one agy, Cursor, or Claude native one-shot client in this parent's environment in an owned Herdr pane. Returns an accepted receipt, then one automatic cli_agent_result. Native model strings only; no Pi sessions, routing, retries, worktrees or polling needed. autonomous defaults false; true explicitly enables the client's dangerous/force permission flag. trustWorkspace is a separate Cursor-only opt-in and requires explicit user approval for both cwd/workspace and the host-created extra task directory; it does not imply autonomous permission. On native Windows, Cursor's unsupported sandbox requires per-call allowUnsandboxed: true with explicit user approval; this uses the CLI allowlist, not OS isolation.",
+			"Launch one agy, Cursor, Claude, or Codex native one-shot client in this parent's environment in an owned Herdr pane. Returns an accepted receipt, then one automatic cli_agent_result. Native model strings only; no Pi sessions, routing, retries, worktrees or polling needed. autonomous defaults false; true explicitly enables agy/Claude dangerous permissions or Cursor force, and is rejected for Codex. Codex uses codexSandbox (read-only by default; workspace-write requires explicit user approval), with approval_policy never and no sandbox bypass. Codex effort supports low/medium/high/xhigh, not max. trustWorkspace is a separate Cursor-only opt-in and requires explicit user approval for both cwd/workspace and the host-created extra task directory; it does not imply autonomous permission. On native Windows, Cursor's unsupported sandbox requires per-call allowUnsandboxed: true with explicit user approval; this uses the CLI allowlist, not OS isolation.",
 		parameters: Type.Object({
 			name: Type.String({ minLength: 1, maxLength: 100 }),
 			cli: Type.Union(ids.map((id) => Type.Literal(id))),
@@ -436,6 +438,9 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 				),
 			),
 			autonomous: Type.Optional(Type.Boolean()),
+			codexSandbox: Type.Optional(
+				Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write")]),
+			),
 			trustWorkspace: Type.Optional(Type.Boolean()),
 			allowUnsandboxed: Type.Optional(Type.Boolean()),
 			timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 600 })),
@@ -445,6 +450,12 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 			const c = config();
 			if (!c.allowed.includes(p.cli))
 				throw new Error(`Native CLI ${p.cli} is not whitelisted`);
+			if (p.codexSandbox !== undefined && p.cli !== "codex")
+				throw new Error("codexSandbox is supported only for Codex");
+			if (p.cli === "codex" && p.autonomous === true)
+				throw new Error("Codex autonomous is unsupported; use explicit codexSandbox instead");
+			if (p.cli === "codex" && p.effort === "max")
+				throw new Error("Codex effort supports only low, medium, high, or xhigh in this adapter");
 			if (p.trustWorkspace === true && p.cli !== "cursor")
 				throw new Error("trustWorkspace is supported only for Cursor");
 			if (p.allowUnsandboxed === true && p.cli !== "cursor")
@@ -475,7 +486,7 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 				throw new Error(
 					"agy's native prompt argv is limited to 8000 characters; provide a bounded task referencing local context files",
 				);
-			const command = commandPath(c.commands[p.cli]);
+			const command = commandPath(c.commands[p.cli], p.cli);
 			const powershell = nativePowerShell(command);
 			const cwd = realpathSync(resolve(ctx.cwd, p.cwd ?? "."));
 			if (!statSync(cwd).isDirectory())

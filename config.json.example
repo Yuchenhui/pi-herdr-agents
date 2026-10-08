@@ -2,7 +2,9 @@
   "externalCli": {
     "platform": "win32",
     "allowed": [],
-    "commands": {},
+    "commands": {
+      "codex": ""
+    },
     "timeoutSeconds": 180
   },
   "status": {

@@ -37,6 +37,9 @@ let killPending;
 let terminationConfirmed = false;
 let error;
 let terminal;
+let codexThreadStarted = false;
+let codexTurnStarted = false;
+let codexAnswer;
 let observedModel = "unknown";
 let pending = "";
 let malformed = false;
@@ -60,6 +63,83 @@ function log(index, chunk) {
 		}
 	}
 }
+// Codex 0.161.0 exec JSONL: one thread/turn and exactly one terminal event.
+// Only completed agent_message text is an answer; tool output/reasoning are not.
+function parseCodex(event) {
+	if (terminal) throw new Error("Codex event after terminal completion");
+	switch (event.type) {
+		case "thread.started":
+			if (codexThreadStarted || !text(event.thread_id)?.trim())
+				throw new Error("Invalid Codex thread.started");
+			codexThreadStarted = true;
+			return;
+		case "turn.started":
+			if (!codexThreadStarted || codexTurnStarted)
+				throw new Error("Invalid Codex turn.started");
+			codexTurnStarted = true;
+			return;
+		case "turn.completed": {
+			const usage = event.usage;
+			const fields = [
+				"input_tokens",
+				"cached_input_tokens",
+				"output_tokens",
+				"reasoning_output_tokens",
+			];
+			if (
+				!codexTurnStarted ||
+				Object.prototype.toString.call(usage) !== "[object Object]" ||
+				fields.some((key) => !Number.isSafeInteger(usage[key]) || usage[key] < 0) ||
+				(usage.cache_write_input_tokens !== undefined &&
+					(!Number.isSafeInteger(usage.cache_write_input_tokens) ||
+						usage.cache_write_input_tokens < 0))
+			)
+				throw new Error("Invalid Codex turn.completed usage");
+			terminal = event;
+			return;
+		}
+		case "turn.failed":
+		case "error": {
+			const message =
+				event.type === "turn.failed" ? event.error?.message : event.message;
+			if (!text(message)?.trim() || (event.type === "turn.failed" && !codexTurnStarted))
+				throw new Error("Invalid Codex error event");
+			error ??= message.slice(0, 4096);
+			terminal = event;
+			return;
+		}
+		case "item.started":
+		case "item.updated":
+		case "item.completed": {
+			const item = event.item;
+			if (
+				!codexThreadStarted ||
+				!text(item?.id)?.trim() ||
+				![
+					"agent_message", "reasoning", "command_execution", "file_change",
+					"mcp_tool_call", "collab_tool_call", "web_search", "todo_list", "error",
+				].includes(item.type)
+			)
+				throw new Error("Invalid Codex item event");
+			// Native warnings are completed error items, including before turn.started.
+			// They are nonfatal diagnostics retained in stdout, not terminal errors.
+			if (item.type === "error") {
+				if (event.type !== "item.completed" || !text(item.message)?.trim())
+					throw new Error("Invalid Codex warning item");
+				return;
+			}
+			if (!codexTurnStarted) throw new Error("Codex item before turn.started");
+			if (item.type === "agent_message" || item.type === "reasoning") {
+				if (text(item.text) === undefined) throw new Error("Invalid Codex message text");
+				if (item.type === "agent_message" && event.type === "item.completed")
+					codexAnswer = item.text;
+			}
+			return;
+		}
+		default:
+			throw new Error("Unknown Codex exec event");
+	}
+}
 function parse(line) {
 	if (!line.trim()) return;
 	try {
@@ -69,6 +149,10 @@ function parse(line) {
 			!text(m.cli === "agy" ? event.event : event.type)
 		)
 			throw new Error("Invalid stream-json event");
+		if (m.cli === "codex") {
+			parseCodex(event);
+			return; // Exec events do not report an observed model.
+		}
 		if (terminal && m.cli === "cursor") malformed = true;
 		const model =
 			m.cli === "agy"
@@ -130,7 +214,8 @@ let timer;
 try {
 	if (
 		m.platform !== process.platform ||
-		!["agy", "cursor", "claude"].includes(m.cli)
+		!["agy", "cursor", "claude", "codex"].includes(m.cli) ||
+		(m.codexSandbox !== undefined && m.cli !== "codex")
 	)
 		throw new Error("Invalid native launch manifest");
 	if (existsSync(join(dir, "cancel"))) {
@@ -171,8 +256,34 @@ try {
 				"--add-dir",
 				dir,
 			);
+		if (m.cli === "codex") {
+			if (
+				!text(m.command) ||
+				!isAbsolute(m.command) ||
+				/[\r\n\0]/.test(m.command) ||
+				(process.platform === "win32" && !/\.exe$/i.test(m.command)) ||
+				!text(m.task)?.trim() ||
+				m.autonomous === true ||
+				m.trustWorkspace === true ||
+				m.allowUnsandboxed === true ||
+				(m.codexSandbox !== undefined &&
+					!["read-only", "workspace-write"].includes(m.codexSandbox)) ||
+				(m.effort !== undefined &&
+					!["low", "medium", "high", "xhigh"].includes(m.effort))
+			)
+				throw new Error("Invalid Codex native command, sandbox, permissions, or effort");
+			args = [
+				"exec",
+				"--json",
+				"--color", "never",
+				"--sandbox", m.codexSandbox ?? "read-only",
+				"-c", 'approval_policy="never"',
+			];
+			if (m.effort) args.push("-c", `model_reasoning_effort="${m.effort}"`);
+		}
 		if (m.model) args.push("--model", m.model);
-		if (m.effort) args.push("--effort", m.effort);
+		if (m.effort && m.cli !== "codex") args.push("--effort", m.effort);
+		if (m.cli === "codex") args.push("-");
 		if (m.cli === "cursor")
 			args.push(
 				`Read the complete task from the private file at ${join(dir, "task.txt")}. Follow it and return the final answer.`,
@@ -215,6 +326,12 @@ try {
 		if (m.cli === "claude") {
 			for (const key of ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"]) {
 				if (process.env[key]) env[key] = process.env[key];
+			}
+		}
+		// Codex-native directory selection only; never forward API keys or Pi provider secrets.
+		if (m.cli === "codex") {
+			for (const [key, value] of Object.entries(process.env)) {
+				if (/^CODEX_HOME$/i.test(key)) env[key] = value;
 			}
 		}
 		const deadline = Date.now() + m.timeoutSeconds * 1000;
@@ -266,7 +383,7 @@ try {
 		child.stdin.on("error", (e) => {
 			error ??= e.message;
 		});
-		if (m.cli === "claude") child.stdin.end(m.task);
+		if (m.cli === "claude" || m.cli === "codex") child.stdin.end(m.task);
 		else child.stdin.end();
 		timer = setInterval(() => {
 			if (existsSync(join(dir, "cancel"))) requestCancel("cancelled");
@@ -295,11 +412,15 @@ try {
 }
 clearInterval(timer);
 for (const item of logs) closeSync(item.fd);
-const output = m.cli === "agy" ? terminal?.response : terminal?.result;
-const semanticSuccess =
+let output = m.cli === "agy" ? terminal?.response : terminal?.result;
+let semanticSuccess =
 	m.cli === "agy"
 		? terminal?.status === "SUCCESS"
 		: terminal?.subtype === "success" && terminal?.is_error === false;
+if (m.cli === "codex") {
+	output = codexAnswer;
+	semanticSuccess = terminal?.type === "turn.completed";
+}
 const success = Boolean(
 	!intent &&
 	!error &&
@@ -309,11 +430,14 @@ const success = Boolean(
 	text(output) &&
 	output.trim().length > 0
 );
+const protocolFailure = m.cli === "codex"
+	? "Malformed, duplicate, conflicting, or post-terminal Codex exec event"
+	: "Malformed or duplicate stream-json result";
 const failure = String(
 	error ||
 		terminal?.error ||
 		(malformed
-			? "Malformed or duplicate stream-json result"
+			? protocolFailure
 			: intent || JSON.stringify(terminal || "Missing terminal result")),
 ).slice(0, 4096);
 const diagnostic = `${failure}\n${stderrTail}`;
