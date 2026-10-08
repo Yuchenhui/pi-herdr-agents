@@ -332,7 +332,8 @@ empty. Configure only approved clients; native binaries are trusted executable
 code. Windows accepts `.exe` and Cursor's native `cursor-agent.ps1` launcher
 (not `*-yolo` wrappers or arbitrary shell strings); POSIX requires executable
 native binaries/scripts, never Windows shims. No clients are installed, logged
-in, updated, or probed automatically. No global client settings are changed.
+in, updated, or probed automatically. The extension does not edit global client
+settings; vendor flags may record user-authorized trust decisions.
 Windows Cursor `.ps1` launches require native PowerShell 7 (`pwsh.exe`) on PATH
 (desktop or Microsoft Store/app alias). Its absolute path is resolved once per
 launch; no Windows PowerShell 5 fallback or execution-policy bypass is used.
@@ -340,13 +341,13 @@ launch; no Windows PowerShell 5 fallback or execution-policy bypass is used.
 | Tool | Contract |
 | --- | --- |
 | `cli_agents_list({})` | Passive configuration/file availability, authentication/model access unknown; does not execute clients or autoauthorize. Also reports owned run IDs and artifact paths. |
-| `cli_agent({ name, cli, task, cwd?, model?, effort?, autonomous?, timeoutSeconds? })` | Returns an `accepted/launching` receipt, not proof of client spawn. One automatic `cli_agent_result` follows terminal protocol evidence and confirmed exit. No caller polling is needed. |
+| `cli_agent({ name, cli, task, cwd?, model?, effort?, autonomous?, trustWorkspace?, timeoutSeconds? })` | Returns an `accepted/launching` receipt, not proof of client spawn. One automatic `cli_agent_result` follows terminal protocol evidence and confirmed exit. No caller polling is needed. |
 | `cli_agent_cancel({ id })` | Requests cancellation only for that parent's owned native run. Unconfirmed termination stays owned/controllable; a kill request is not a completed cancellation. |
 
 These tools are parent-only (not registered in Pi subagent contexts).
 `cwd` defaults to the parent cwd. agy task text is limited to 8,000 characters
 for safe native prompt argv; use local context-file references for larger briefs.
-Cursor reads a private task file and Claude receives task text on stdin.
+Cursor reads a private task file and Claude receives task text on stdin. Cursor's optional `trustWorkspace: true` requires explicit user approval for both the `cwd` workspace and host-created extra task directory; it is false by default, independent of `autonomous`/`--force`, and the Cursor client may persist trust records for those specific directories.
 `model` is a **CLI-native** string, not a Pi
 `provider/model` reference; omission keeps the client's own default. `effort`
 accepts `low`, `medium`, `high`, `xhigh`, or `max` for agy/Claude; Cursor rejects

@@ -165,6 +165,7 @@ try {
 				"--sandbox",
 				"enabled",
 				...(m.autonomous ? ["--force"] : ["--mode", "ask"]),
+				...(m.trustWorkspace === true ? ["--trust"] : []),
 				"--add-dir",
 				dir,
 			);
