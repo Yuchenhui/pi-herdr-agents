@@ -143,7 +143,7 @@ mapping and pack-compatibility notes.
 
 ![Pi Herdr Agents lifecycle: spawn a child, run it in Herdr, supervise live state, and deliver one bounded result to the parent.](https://raw.githubusercontent.com/giuseppecrj/pi-herdr-agents/main/docs/assets/async-subagent-lifecycle.png)
 
-A `subagent` call selects the target checkout, reuses its Herdr workspace, and gives the child a pane in an extension-owned `Agents` tab. Four panes fit in each tab by default; overflow opens another tab in the same workspace. A worktree is created only when explicitly requested for checkout isolation. The call launches a child Pi session and returns `started`. The parent watcher combines Herdr process state with child activity details and projects the result into a live widget:
+With the shipped `panes.mode: "tab"` example, each ordinary `subagent` gets an independent Herdr tab. Opt-in `"grouped"` placement selects the target checkout's existing workspace and fills extension-owned `Agents` tabs, four panes per tab by default; overflow opens another tab in the same workspace. A worktree is created only when explicitly requested for checkout isolation. The call launches a child Pi session and returns `started`. The parent watcher combines Herdr process state with child activity details and projects the result into a live widget:
 
 ```text
 ╭─ Subagents ──────────────────── 1 active · 1 open ─╮
@@ -239,8 +239,8 @@ valid. A bare launch without `agent` always works. An explicitly named role that
 is missing or invalid fails before Herdr creates a pane or worktree; it is never
 silently replaced by a bare agent.
 
-All subagents execute through Pi. Claude models remain available through normal
-Pi provider/model routing. Legacy role definitions that contain `cli` fail before
+All `subagent` runs execute through Pi. Claude models remain available through normal
+Pi provider/model routing. The separate opt-in native tools below do not change this contract. Legacy role definitions that contain `cli` fail before
 Herdr creates a pane or worktree; remove `cli` and `cli-model`, then select an
 authenticated Pi `provider/model-id`.
 
@@ -310,6 +310,82 @@ See [Custom Agents](#custom-agents) for the complete create, package, verify, an
 launch workflow.
 
 ---
+
+## Native one-shot CLI tools (opt-in)
+
+`cli_agent` runs only `agy`, `cursor`, or `claude` in a disposable owned Herdr
+pane and independent tab, in the **same OS/environment as the parent**.
+Tab/pane labels identify the real engine and name, e.g. `agy: Gemini scout`,
+`cursor: Grok scout`, or `claude: review`. It is independent of Pi
+subagents: no roles, Pi model routing, conversation fork/resume, persistence,
+worktrees, retries, remote/WSL bridge, or fallback. These clients use their own
+saved authentication and subscription/account settings; availability does not
+prove authentication, quota, model access, or subscription billing. Claude's
+adapter is available, but an account/subscription problem is an error, not a
+reason to switch to an API route.
+
+Launches are denied unless the real durable configuration contains a valid
+`externalCli` namespace with the current `platform` (`win32`, `linux`, or
+`darwin`), an explicit `allowed` whitelist of supported IDs, and `commands`
+map of absolute native executable paths. The example leaves the whitelist
+empty. Configure only approved clients; native binaries are trusted executable
+code. Windows accepts `.exe` and Cursor's native `cursor-agent.ps1` launcher
+(not `*-yolo` wrappers or arbitrary shell strings); POSIX requires executable
+native binaries/scripts, never Windows shims. No clients are installed, logged
+in, updated, or probed automatically. No global client settings are changed.
+
+| Tool | Contract |
+| --- | --- |
+| `cli_agents_list({})` | Passive configuration/file availability, authentication/model access unknown; does not execute clients or autoauthorize. Also reports owned run IDs and artifact paths. |
+| `cli_agent({ name, cli, task, cwd?, model?, effort?, autonomous?, timeoutSeconds? })` | Returns an `accepted/launching` receipt, not proof of client spawn. One automatic `cli_agent_result` follows terminal protocol evidence and confirmed exit. No caller polling is needed. |
+| `cli_agent_cancel({ id })` | Requests cancellation only for that parent's owned native run. Unconfirmed termination stays owned/controllable; a kill request is not a completed cancellation. |
+
+These tools are parent-only (not registered in Pi subagent contexts).
+`cwd` defaults to the parent cwd. agy task text is limited to 8,000 characters
+for safe native prompt argv; use local context-file references for larger briefs.
+Cursor reads a private task file and Claude receives task text on stdin.
+`model` is a **CLI-native** string, not a Pi
+`provider/model` reference; omission keeps the client's own default. `effort`
+accepts `low`, `medium`, `high`, `xhigh`, or `max` for agy/Claude; Cursor rejects
+it because no effort flag is verified. The client can reject a model/effort
+combination, and that failure is reported without retry. `autonomous` defaults
+to `false`: agy/Claude use plan permission mode and Cursor uses ask mode with
+sandbox enabled. `true` explicitly adds native `--dangerously-skip-permissions`
+(agy/Claude) or `--force` (Cursor, still sandbox enabled). This grants the
+client's native permissions, not Pi's tool whitelist, and is not a universal
+read-only/security guarantee. Review client behavior and task scope first.
+Timeout is an integer 1–600 seconds, default 180 (or `externalCli.timeoutSeconds`).
+Client startup evidence has a separate 25-second advisory bound from command
+dispatch (after shell readiness). Without a matching startup sidecar, cancellation
+is requested and one metadata-only `cli_agent_notice` reports startup not confirmed
+and termination unknown. This is not a final result: the run and pane remain owned.
+If the producer never ran, it cannot confirm cancellation or return a final result;
+the notice does not resolve that limitation. Absence of a sidecar is not termination
+evidence.
+
+Results contain name, CLI, cwd, pane ID, requested and observed model (or
+`unknown`), exit code, bounded output/error/stderr, and artifact paths. Success
+requires a valid vendor terminal success result, nonempty answer, and exit 0.
+Tasks, launch manifests, bounded stdout/stderr (4 MiB each), and atomic sidecars
+are kept in a private temp artifact directory outside the repository; treat
+these retained files as sensitive. Pi proxy/provider/session environment
+overrides are not forwarded; normal OS context and HTTP(S)/NO_PROXY settings
+(case-insensitive names) and native saved user settings/authentication remain
+in force. Each run belongs to the exact launching Pi session ID. `/reload` in
+that same session preserves the producer and one automatic final return. An actual
+session change requests cancellation of old runs and suppresses their notices/results
+in the newly selected session; unconfirmed runs remain owned/controllable. Old runs
+are retired only after a valid final sidecar confirms termination. Quitting requests
+cancellation only of these clients. Only confirmed final runs have their owned panes
+closed; user panes are untouched.
+
+```typescript
+// Requires explicit durable whitelist and native path configuration first.
+cli_agent({ name: "Gemini scout", cli: "agy", task: "Read only; summarize the project entry points." });
+cli_agent({ name: "Cursor scout", cli: "cursor", model: "<native-model-slug>", task: "Read only; return one short summary." });
+// Claude adapter only; verify account/subscription readiness before use.
+cli_agent({ name: "Claude scout", cli: "claude", task: "Read only; return one short summary." });
+```
 
 ## Async Subagent Flow
 
@@ -390,7 +466,7 @@ or re-run `/subagents-init`.
     "hangWarningMinutes": 15
   },
   "panes": {
-    "mode": "grouped",
+    "mode": "tab",
     "direction": "right",
     "maxPerTab": 4
   }
@@ -608,11 +684,12 @@ was 4.82 s. The benchmark measures `/proc` CPU ticks for the supervisor and
 isolated Herdr tree, not parent-model latency; raw samples are written to
 `/tmp/issue29-bench/` by `test/bench/supervision-bench.mjs`.
 
-`panes.mode` defaults to `"grouped"` when omitted. Ordinary public `subagent` and `subagent_resume` launches, including bare forks, fill extension-owned `Agents`, `Agents 2`, etc. tabs in the target checkout's existing workspace. `panes.maxPerTab` is a positive safe integer, defaults to `4`, and counts all live panes in each owned tab, including user-added panes and retained shells. Overlapping launches in one parent respect this cap. It is independent of `persistent.maxAgents`.
+The shipped example sets `panes.mode: "tab"` for independent ordinary child tabs;
+`"grouped"` remains opt-in (and the parser fallback when mode is omitted). In grouped mode, ordinary public `subagent` and `subagent_resume` launches, including bare forks, fill extension-owned `Agents`, `Agents 2`, etc. tabs in the target checkout's existing workspace. `panes.maxPerTab` is a positive safe integer, defaults to `4`, and counts all live panes in each owned tab, including user-added panes and retained shells. Overlapping launches in one parent respect this cap. It is independent of `persistent.maxAgents`.
 
 Checkout matching uses Herdr's canonical `worktree.checkout_path` and includes descendant directories. Shell working directories do not establish workspace ownership. If no checkout matches (including non-Git directories), placement uses the caller's workspace; overflow never creates a workspace. A reviewer with `cwd` set to a managed checkout joins that workspace without creating another worktree. Resume placement uses the saved session's cwd.
 
-Explicit `panes.mode: "tab"` preserves one new tab per ordinary child in the caller's workspace. Explicit `"split"` preserves splits of the stable parent pane. `panes.direction` is `"right"` (default) or `"down"` and applies to grouped and legacy splits. `maxPerTab` does not affect these legacy modes. Managed worktrees retain their separate workspaces.
+`panes.mode: "tab"` creates one new tab per ordinary child in the caller's workspace. Explicit `"split"` preserves splits of the stable parent pane. `panes.direction` is `"right"` (default) or `"down"` and applies to grouped and legacy splits. `maxPerTab` does not affect these legacy modes. Managed worktrees retain their separate workspaces.
 
 Ownership is tracked by returned pane/tab/workspace IDs, never labels. Separate parent processes own separate groups; `/reload` preserves a parent's in-memory ownership, but a full restart does not adopt old tabs. Placement never moves existing panes or renames user tabs. Background launches preserve focus; Herdr may resize sibling panes when splitting or closing. User-added panes are never closed by automatic tab cleanup. An owned tab remains reusable while user panes remain, even after all child panes close.
 

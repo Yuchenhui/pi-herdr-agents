@@ -57,6 +57,7 @@ import {
 	type ThinkingLevel,
 } from "../../maestro/core/routing.ts";
 import { wrapPiModelRegistry } from "./model-registry.ts";
+import { registerCliAgents } from "./cli-agents.ts";
 import {
 	loadModelConfig,
 	MISSING_CONFIG_REVISION,
@@ -2388,6 +2389,7 @@ export default function subagentsExtension(
 		infrastructure?: PiRunSessionInfrastructure;
 	} = {},
 ) {
+	registerCliAgents(pi);
 	runtime.pi = pi;
 	runtime.session = createDefaultRunSession(
 		{

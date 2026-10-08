@@ -845,6 +845,10 @@ function buildPiCommand(
 	const { request } = resolved;
 	const parts = [
 		"pi",
+		...(!request.handoff &&
+		(request.behavior.autoExit || request.behavior.persistent)
+			? ["--no-approve"]
+			: []),
 		"--session",
 		quoteLaunchPath(artifacts.sessionFile),
 		...(request.handoff
@@ -1077,6 +1081,7 @@ async function launchResumedPiSubagent(
 		const command = [
 			...env,
 			"pi",
+			...(autoExit ? ["--no-approve"] : []),
 			"--session",
 			quoteLaunchPath(request.sessionFile),
 			...(toolAllowlist ? ["--tools", shellQuote(toolAllowlist)] : []),
