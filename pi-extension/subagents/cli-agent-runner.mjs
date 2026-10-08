@@ -8,8 +8,9 @@ import {
 	openSync,
 	writeSync,
 	closeSync,
+	statSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, basename, isAbsolute } from "node:path";
 
 const manifestPath = process.argv[2];
 let m;
@@ -175,6 +176,19 @@ try {
 			);
 		let command = m.command;
 		if (process.platform === "win32" && /\.ps1$/i.test(command)) {
+			if (
+				m.cli !== "cursor" ||
+				!text(command) ||
+				!isAbsolute(command) ||
+				basename(command).toLowerCase() !== "cursor-agent.ps1" ||
+				!text(m.powershell) ||
+				!/^[A-Za-z]:[\\/]/.test(m.powershell) ||
+				/[\r\n\0]/.test(m.powershell) ||
+				basename(m.powershell).toLowerCase() !== "pwsh.exe" ||
+				/[\\/](wsl|msys|cygwin)[\\/]/i.test(m.powershell) ||
+				!statSync(m.powershell).isFile()
+			)
+				throw new Error("Invalid native Cursor PowerShell 7 launcher");
 			args = [
 				"-NoLogo",
 				"-NoProfile",
@@ -183,10 +197,8 @@ try {
 				command,
 				...args,
 			];
-			command = join(
-				process.env.SystemRoot || "C:/Windows",
-				"System32/WindowsPowerShell/v1.0/powershell.exe",
-			);
+			// Use exactly the absolute native executable validated by the parent.
+			command = m.powershell;
 		}
 		// Keep normal OS context and saved native authentication, not Pi provider/session overrides.
 		const env = Object.fromEntries(
@@ -302,15 +314,24 @@ const failure = String(
 			: intent || JSON.stringify(terminal || "Missing terminal result")),
 ).slice(0, 4096);
 const diagnostic = `${failure}\n${stderrTail}`;
+const scriptPolicyFailure =
+	process.platform === "win32" &&
+	m.cli === "cursor" &&
+	/\.ps1$/i.test(m.command) &&
+	/running scripts is disabled on this system|about_Execution_Policies/i.test(
+		diagnostic,
+	);
 const errorType =
 	intent ||
-	(/quota|rate.?limit|usage.?limit|credit|subscription/i.test(diagnostic)
+	(scriptPolicyFailure
+		? "protocol_or_launch"
+		: /quota|rate.?limit|usage.?limit|credit|subscription/i.test(diagnostic)
 		? "quota"
-		: /auth|login|credential|unauthori[sz]ed/i.test(diagnostic)
-			? "authentication"
-			: malformed || !terminal
-				? "protocol_or_launch"
-				: "client_error");
+			: /auth|login|credential|unauthori[sz]ed/i.test(diagnostic)
+				? "authentication"
+				: malformed || !terminal
+					? "protocol_or_launch"
+					: "client_error");
 atomic("final.json", {
 	state: intent || (success ? "completed" : "failed"),
 	exitCode: child?.exitCode ?? null,

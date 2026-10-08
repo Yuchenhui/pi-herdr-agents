@@ -333,6 +333,9 @@ code. Windows accepts `.exe` and Cursor's native `cursor-agent.ps1` launcher
 (not `*-yolo` wrappers or arbitrary shell strings); POSIX requires executable
 native binaries/scripts, never Windows shims. No clients are installed, logged
 in, updated, or probed automatically. No global client settings are changed.
+Windows Cursor `.ps1` launches require native PowerShell 7 (`pwsh.exe`) on PATH
+(desktop or Microsoft Store/app alias). Its absolute path is resolved once per
+launch; no Windows PowerShell 5 fallback or execution-policy bypass is used.
 
 | Tool | Contract |
 | --- | --- |

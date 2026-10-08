@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { getSubagentsConfigPath } from "./config-path.ts";
 import {
 	closePane,
@@ -111,6 +112,40 @@ function config() {
 		);
 	return { ...c, timeoutSeconds: c.timeoutSeconds ?? 180 };
 }
+function nativePowerShell(command: string): string | undefined {
+	if (process.platform !== "win32" || !/\.ps1$/i.test(command))
+		return undefined;
+	const systemRoot = process.env.SystemRoot;
+	if (!systemRoot || !/^[A-Za-z]:[\\/]/.test(systemRoot))
+		throw new Error("Native Windows SystemRoot is unavailable");
+	const where = join(systemRoot, "System32/where.exe");
+	const result = spawnSync(where, ["$PATH:pwsh.exe"], {
+		shell: false,
+		windowsHide: true,
+		timeout: 5000,
+		maxBuffer: 64 * 1024,
+		encoding: "utf8",
+	});
+	if (!result.error && result.status === 0) {
+		for (const candidate of result.stdout.split(/\r?\n/)) {
+			const path = candidate.trim();
+			if (
+				/^[A-Za-z]:[\\/]/.test(path) &&
+				!/[\r\n\0]/.test(path) &&
+				basename(path).toLowerCase() === "pwsh.exe" &&
+				!/[\\/](wsl|msys|cygwin)[\\/]/i.test(path)
+			) {
+				try {
+					// Keep app-execution aliases intact as well as desktop/Store paths.
+					if (statSync(path).isFile()) return path;
+				} catch {
+					// Skip stale PATH entries; never fall back to Windows PowerShell 5.
+				}
+			}
+		}
+	}
+	throw new Error("Native PowerShell 7 (pwsh.exe) is unavailable on PATH");
+}
 function commandPath(value: string | undefined): string {
 	if (!value || !isAbsolute(value) || /[\r\n\0]/.test(value))
 		throw new Error(
@@ -140,15 +175,6 @@ function commandPath(value: string | undefined): string {
 		if (/\.ps1$/i.test(path)) {
 			if (/\b(wsl|ssh|Invoke-Expression)\b/i.test(readFileSync(path, "utf8")))
 				throw new Error("Cursor launcher contains an unsupported transport");
-			if (
-				!existsSync(
-					join(
-						process.env.SystemRoot || "C:/Windows",
-						"System32/WindowsPowerShell/v1.0/powershell.exe",
-					),
-				)
-			)
-				throw new Error("Native Windows PowerShell launcher is unavailable");
 		}
 	} else {
 		if (/\.(exe|cmd|bat|ps1)$/i.test(path))
@@ -346,7 +372,9 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 					let command: string | undefined;
 					let unavailable: string | undefined;
 					try {
-						command = commandPath(c?.commands[cli]);
+						const path = commandPath(c?.commands[cli]);
+						nativePowerShell(path);
+						command = path;
 					} catch (e) {
 						unavailable = String(e);
 					}
@@ -438,6 +466,7 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 					"agy's native prompt argv is limited to 8000 characters; provide a bounded task referencing local context files",
 				);
 			const command = commandPath(c.commands[p.cli]);
+			const powershell = nativePowerShell(command);
 			const cwd = realpathSync(resolve(ctx.cwd, p.cwd ?? "."));
 			if (!statSync(cwd).isDirectory())
 				throw new Error("cwd is not a directory");
@@ -457,6 +486,7 @@ export function registerCliAgents(pi: ExtensionAPI): void {
 					...p,
 					id,
 					command,
+					powershell,
 					cwd,
 					platform: process.platform,
 					timeoutSeconds,
