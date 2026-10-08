@@ -410,21 +410,22 @@ for (const backend of backends) {
 					BRANCH: branch,
 					MODELS_OVERRIDE: "pi-integration/test",
 				});
-				const worktree = await waitFor(
-					() =>
-						herdrJson(
-							"worktree",
-							"list",
-							"--cwd",
-							env.dir,
-							"--json",
-						).result.worktrees.find(
-							(c: { branch?: string }) => c.branch === branch,
-						),
-					`worktree ${branch}`,
-				);
+				const findWorktree = () =>
+					herdrJson(
+						"worktree",
+						"list",
+						"--cwd",
+						env.dir,
+						"--json",
+					).result.worktrees.find(
+						(c: { branch?: string }) => c.branch === branch,
+					);
+				const worktree = await waitFor(findWorktree, `worktree ${branch}`);
 				workspaceToRemove = worktree.open_workspace_id;
 				await waitForFile(s.startFile, PI_TIMEOUT, /START_/);
+				// Herdr can list a new checkout before it opens the workspace; the
+				// child is running now, so the current row has the workspace id.
+				workspaceToRemove = findWorktree()?.open_workspace_id;
 				assert.ok(
 					workspaceToRemove,
 					"worktree workspace open while child runs",
@@ -528,6 +529,7 @@ for (const backend of backends) {
 				evidence("c: manifest", JSON.stringify(manifest, null, 2));
 				assert.equal(manifest.state, "cancelled");
 				assert.equal(manifest.branch, branch);
+				assert.equal(manifest.workspaceId, workspaceToRemove);
 				unrelatedUntouched(s);
 			} finally {
 				if (workspaceToRemove) {

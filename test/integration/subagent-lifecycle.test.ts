@@ -412,22 +412,26 @@ for (const backend of backends) {
 				extraArgs: `-e ${shellQuote(decoyExtension)}`,
 			});
 
-			let worktree:
-				| { path: string; branch: string; open_workspace_id: string }
-				| undefined;
-			const startedAt = Date.now();
-			while (!worktree && Date.now() - startedAt < PI_TIMEOUT) {
-				const output = execFileSync(
-					"herdr",
-					["worktree", "list", "--cwd", env.dir, "--json"],
-					{
-						encoding: "utf8",
-					},
-				);
-				worktree = JSON.parse(output).result.worktrees.find(
+			type ListedWorktree = {
+				path: string;
+				branch: string;
+				open_workspace_id?: string;
+			};
+			const findWorktree = (): ListedWorktree | undefined =>
+				JSON.parse(
+					execFileSync(
+						"herdr",
+						["worktree", "list", "--cwd", env.dir, "--json"],
+						{ encoding: "utf8" },
+					),
+				).result.worktrees.find(
 					(candidate: { branch?: string }) => candidate.branch === branch,
 				);
-				if (!worktree) await sleep(250);
+			let worktree = findWorktree();
+			const startedAt = Date.now();
+			while (!worktree && Date.now() - startedAt < PI_TIMEOUT) {
+				await sleep(250);
+				worktree = findWorktree();
 			}
 			assert.ok(
 				worktree,
@@ -462,8 +466,11 @@ for (const backend of backends) {
 					}),
 					new RegExp(`Implement ${id}`),
 				);
+				// Herdr can list a new checkout before it opens the workspace, so the
+				// row found above may predate the workspace id.
+				worktree = findWorktree();
 				assert.ok(
-					worktree.open_workspace_id,
+					worktree?.open_workspace_id,
 					"Completed worktree workspace should remain open",
 				);
 				// The completed child's processes may briefly hold the checkout, and
@@ -540,13 +547,14 @@ for (const backend of backends) {
 					}),
 					new RegExp(`Implement ${id}`),
 				);
+				const removedWorkspaceId = worktree.open_workspace_id;
 				const remaining = JSON.parse(
 					execFileSync("herdr", ["workspace", "list"], { encoding: "utf8" }),
 				).result.workspaces;
 				assert.equal(
 					remaining.some(
 						(workspace: { workspace_id: string }) =>
-							workspace.workspace_id === worktree.open_workspace_id,
+							workspace.workspace_id === removedWorkspaceId,
 					),
 					false,
 				);
