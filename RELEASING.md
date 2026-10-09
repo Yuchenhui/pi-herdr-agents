@@ -10,6 +10,8 @@ The published version must be unique on npm.
 
 `3.0.0` is the pack-neutral baseline. It is a major release because it removes the bundled roles, `/plan`, `/skill:orchestrate`, `/iterate`, `/btw`, and `/btw-close`, and makes `roles.bundled` a deprecated no-op. Its hand-written breaking changes and migration notes are in the README [Release notes](README.md#release-notes) section, because `npm version` regenerates `CHANGELOG.md` and would discard hand edits there. Record later breaking-release notes in the same section.
 
+`3.1.0` is a compatible minor release. It adds the request-scoped task-model init events that let a loaded pack approve `/subagents-init` proposals; with no pack offering, the direct writer is unchanged. It was prepared from feature commit `1b6bacd0b5eecb6f83ffba1d5a5ee57a8b0fa944`. It is not published until the release workflow succeeds.
+
 Do not design a release that creates a GitHub Release without a successful npm publish for a new version. The workflow publishes first, then tags and creates the GitHub Release.
 
 ## Prerequisites
