@@ -34,6 +34,11 @@ export function isBoolean(value: any): value is boolean {
 	return value === true || value === false;
 }
 
+/** A callable, including async and generator functions. */
+export function isFunction(value: any): value is (...args: any[]) => any {
+	return value instanceof Function;
+}
+
 export function isPlainObject(value: any): boolean {
 	return isRecord(value);
 }

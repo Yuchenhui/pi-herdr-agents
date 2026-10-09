@@ -192,7 +192,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
 | `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
 | `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
-| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences, optionally conditional on `expectedConfigRevision` |
+| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences, optionally conditional on `expectedConfigRevision` and carrying an unsaved ranking `basis` |
 
 | Skill | Description |
 | ----- | ----------- |
@@ -207,7 +207,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | -------------------------- | ------------------------------------ |
 | `/worktree <name> [task]`  | Continue this session in a new managed worktree (`/worktree list` lists them) |
 | `/subagent <agent> <task>` | Spawn a named agent directly (`/subagent list` lists available agents) |
-| `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences |
+| `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences; a loaded approval extension can own the write |
 
 ### Taxonomy and discovery
 
@@ -461,7 +461,10 @@ JSON without truncating models and reports its model count and JSON character
 count (not a token estimate); large catalogs still consume context. This is the
 current synchronous snapshot: a dynamic provider whose initial catalog refresh
 has not completed might be absent. Init does not refresh providers or probe the
-network for availability.
+network for availability. The brief also includes `configRevision`, the
+revision of the exact config bytes that supplied the saved preferences. Init
+does not start while a turn runs or messages are queued, and an empty registry
+ends with a notice instead of a prompt. Neither case writes anything.
 
 The draft considers current saved task, default, and per-agent preferences.
 Optional command arguments set ranking preferences. Otherwise it favors
@@ -482,8 +485,23 @@ sources, disclose uncertainty and notable exclusions, and avoid duplicate
 upstream models across routes unless deliberate redundancy is explained. Display
 names help identify candidates but, like aliases, do not prove upstream
 equivalence; research is still required. Price or context size alone is not
-quality evidence. It reports `registry-only` when
-search is unavailable or yields no usable evidence; no live model probes run.
+quality evidence. No live model probes run.
+
+The proposal carries a ranking `basis`. It is `{"kind":"registry-only"}` when
+search is unavailable or yields no usable evidence. It is `{"kind":"research"}`
+only with the http(s) `sources` consulted in this run, the `influence` each had
+on the ranking, and the remaining `uncertainty`. Code checks the basis's shape,
+not whether a source was read, so the basis is labeled as submitted and
+unverified.
+
+While init runs, it emits `pi-herdr-subagents:task-models:init:approval:v1`.
+With no offer, the prompt directs the model to `subagents_write_task_models`
+with `expectedConfigRevision`. When exactly one loaded extension offers, init
+opens that extension's flow, and the extension's instructions replace the
+writer instruction; the extension then owns approval and the write. Two or more
+offers, or an invalid one, stop init before any extension opens or a prompt is
+sent. Once an offer is recorded, a refusal or failure also stops init: it never
+falls back to the direct writer. See [Task-model init events](#task-model-init-events).
 
 The writer validates and atomically replaces `models.tasks` and `tasksMeta`,
 preserving unrelated settings. Its tool schema accepts partial nonempty
@@ -491,9 +509,15 @@ categories (omitted categories are removed), rejects empty `tasks: {}` input,
 and rejects exact duplicate refs within a category after trimming;
 IDs remain case-sensitive. Its result includes normalized saved `tasks`,
 `tasksMeta`, `configPath`, `missingCategories`, and `configRevision`. Init requests all six categories
-and a before/after table based on that saved result, not the unsaved draft. It
-must explain missing categories or changed choices; with no available models,
-it must report the limitation without writing.
+and a before/after table based on that saved result, not the unsaved draft, and
+must explain missing categories or changed choices.
+
+Optional `basis` must have the same kind as `tasksMeta.method`. A research basis
+needs at least one source with an http(s) URL that has a host and a nonblank
+`influence`, plus a nonblank `uncertainty`. The writer validates it before
+writing, returns it in the result, and never saves it; only `tasksMeta.method`
+persists. Calls without `basis`, including research calls, keep the earlier
+contract.
 
 Optional `expectedConfigRevision` makes a write conditional on the config the
 proposal was read from. A revision is `sha256:` followed by 64 lowercase hex
@@ -548,6 +572,82 @@ load naming the file and asking you to remove the key. The extension never
 rewrites the file. Other values remain configuration errors, as do unknown keys
 under `roles`. Registered role packs are the entire package layer, and global and
 project definitions keep their precedence over them.
+
+### Task-model init events
+
+Two versioned `pi.events` channels let another extension take part in
+`/subagents-init` without importing this package. Both carry the invoking
+command's live `ExtensionCommandContext`, so they are for trusted extensions in
+the same process. The context is current only while the event is emitted.
+
+The host emits `pi-herdr-subagents:task-models:init:approval:v1` while init
+runs:
+
+```typescript
+type ApprovalRequest = {
+  apiVersion: 1;
+  brief: TaskModelBrief; // frozen: operatorPreferences, categories, configRevision, current, models (never empty)
+  context: ExtensionCommandContext;
+  offer(offer: { owner: string; open(): OpenResult }): "recorded" | "closed";
+};
+type OpenResult =
+  | {
+      kind: "ready";
+      destination: { toolName: string; instructions: string };
+      cancel(): void; // closes the flow this open created
+    }
+  | { kind: "blocked"; reason: string };
+```
+
+- Call `offer` synchronously, before the listener's first `await`. After `emit`
+  returns, `offer` answers `"closed"` and records nothing.
+- Offer whenever your extension owns task-model approval, even when it is busy,
+  and refuse from `open`. `owner` is one printable token without spaces.
+- The host opens nothing until collection ends. Two offers (even with the same
+  owner) or an invalid offer stop init. With one offer, the host calls `open()`
+  once, and it must return synchronously.
+- `ready` must leave `toolName` active. Its `instructions` replace the host's
+  writer instruction in the prompt the host sends.
+- `ready` must include `cancel`. When the host does not hand the prompt to Pi
+  (the tool is inactive, or `pi.sendUserMessage` throws), it calls `cancel()`
+  once before reporting `not-started`. `cancel` must close only the flow that
+  this `open` created, never a later one. A `cancel` that throws is reported
+  with the outcome.
+- A throw, a promise, an invalid result (including a missing `cancel`), or
+  `blocked` stops init with a notice and no prompt. The host cannot undo what
+  `open` changed before failing.
+- Pi accepts the prompt asynchronously. It can still reject it after `start`
+  reports `started`, for example when the selected model has no configured
+  auth; the host refuses up front only when no model is selected. Pi delivers
+  the prompt to `input` handlers (source `"extension"`) before that check and
+  emits `before_agent_start` and `agent_start` only after it passes. An
+  extension whose flow outlives one prompt should close it when other input or
+  a run arrives before those events, so a later request cannot inherit it.
+- Pi's event bus logs and swallows listener exceptions. A listener that throws
+  before offering looks the same as no listener, so init uses the direct
+  writer. An extension that guards the writer still refuses that write.
+
+Another extension's command emits `pi-herdr-subagents:task-models:init:start:v1`
+to start the same init:
+
+```typescript
+type StartRequest = {
+  apiVersion: 1;
+  context: ExtensionCommandContext;
+  preferences: string; // ranking preferences, passed through as typed
+  offer(offer: { owner: string; start(): InitOutcome }): "recorded" | "closed";
+};
+type InitOutcome =
+  | { kind: "started"; destination: string }
+  | { kind: "not-started"; reason: string };
+```
+
+The host offers synchronously as `pi-herdr-agents` and starts nothing until the
+emitter calls `start()`. Call it only when exactly one host offered. `start`
+runs init with the request's context and returns synchronously; the emitter
+shows a `not-started` reason. The host does not listen in subagent sessions
+and unsubscribes at `session_shutdown`. Unsubscribe an approval listener there
+too, as the role-pack bridge does.
 
 ### Supervision transport
 
