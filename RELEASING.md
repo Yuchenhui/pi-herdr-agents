@@ -2,7 +2,7 @@
 
 ## Yuchenhui fork: manual GitHub-only releases
 
-This fork releases through <https://github.com/Yuchenhui/pi-herdr-agents> on the maintenance branch `release/yuchenhui-herdr-1`, not through npm. The npm name stays `pi-herdr-agents`; the original author, MIT license, dependencies, and upstream release history are preserved. Do not run `npm publish`, configure npm credentials, or use the inherited upstream release procedure for this fork. The earliest `detect` job in `.github/workflows/publish.yml` is guarded by `github.repository == 'giuseppecrj/pi-herdr-agents'`, so even future version bumps on fork `main` cannot start upstream npm publication. No fork CI or test trigger is added.
+This fork releases through <https://github.com/Yuchenhui/pi-herdr-agents> on the maintenance branch `main`, not through npm. The npm name stays `pi-herdr-agents`; the original author, MIT license, dependencies, and upstream release history are preserved. Do not run `npm publish`, configure npm credentials, or use the inherited upstream release procedure for this fork. The earliest `detect` job in `.github/workflows/publish.yml` is guarded by `github.repository == 'giuseppecrj/pi-herdr-agents'`, so even future version bumps on fork `main` cannot start upstream npm publication. No fork CI or test trigger is added.
 
 ### Version and source provenance
 
