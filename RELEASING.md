@@ -1,5 +1,38 @@
 # Release guide
 
+## Yuchenhui fork: manual GitHub-only releases
+
+This fork releases through <https://github.com/Yuchenhui/pi-herdr-agents> on the maintenance branch `release/yuchenhui-herdr-1`, not through npm. The npm name stays `pi-herdr-agents`; the original author, MIT license, dependencies, and upstream release history are preserved. Do not run `npm publish`, configure npm credentials, or use the inherited upstream release procedure for this fork. The earliest `detect` job in `.github/workflows/publish.yml` is guarded by `github.repository == 'giuseppecrj/pi-herdr-agents'`, so even future version bumps on fork `main` cannot start upstream npm publication. No fork CI or test trigger is added.
+
+### Version and source provenance
+
+The first fork version is `3.1.0-yuchenhui.1`, with tag `v3.1.0-yuchenhui.1`. Use `3.1.0-yuchenhui.N` for subsequent releases on this upstream basis, incrementing `N`; document any later upstream-basis change explicitly. These are fork identifiers, not claims that the upstream npm package contains the fork changes.
+
+Source baseline: `e217f2a6a6635bdb1cb6d98fca287900199e09a7`, merging fork commit `4c991794acae0c160a1ef02a2ff88f25c2fec90d` with upstream `3.1.0` commit `0bb8bcdc328d152c5cab5eaaf4d261f109055ee4`. The release tag must identify the reviewed metadata commit on top of that baseline, not the source baseline itself. Preserve the Windows launcher and native CLI customizations; this release preparation does not modify runtime implementation.
+
+### Manual release and pinned Windows deployment
+
+The parent release owner performs these steps only after review; this checklist is not evidence that they have already run:
+
+1. Review a clean maintenance checkout and record the full release commit SHA, source baseline, upstream basis, and validation limitations. Verify that a proposed tag does not already identify a different commit. Never move or reuse a release tag.
+2. Preview contents with `npm pack --ignore-scripts --dry-run --json`. Require `README.md`, `CHANGELOG.md`, `AGENTS.md`, `docs/`, `config.json.example`, `examples/role-pack/`, `pi-extension/subagents/index.ts`, the extension helpers and `maestro/` runtime files, and only the host-owned `skills/pi-herdr-agents/SKILL.md`. Exclude bundled roles, plan/workflow skills and workers, private configuration, credentials, sessions, plans, journals, prototypes, generated evidence, test artifacts, and `openspec/`.
+3. Separately create the real package with scripts disabled from that same reviewed checkout. Inspect the actual archive, compute its SHA-256 checksum, and retain the reviewed package and checksum as release assets. A dry-run preview is not a real archive or an independently verified asset checksum.
+4. Perform only the separately authorized isolated offline-load check against the packaged extension. Record the exact Pi/Node versions and result. Do not run models, native CLI clients, regressions, tests, or integration as part of this bounded fork release. An offline load is not full runtime validation.
+5. Push the reviewed maintenance commit to the own fork, create and push the annotated `v3.1.0-yuchenhui.1` tag at its full SHA, and manually create the GitHub Release in `Yuchenhui/pi-herdr-agents`. Include source provenance, tag and exact release SHA, reviewed package filename, SHA-256, changes, and validation limitations; attach the reviewed package and checksum. No npm publication is involved.
+6. Deploy on native Windows only from the verified package or an exact-SHA pinned own-fork checkout. Record the pin and installed source; preserve local configuration, credentials, history, and active sessions. Do not deploy from a moving branch or silently replace the installed upstream source. Have the user fully exit and restart Pi, then distinguish installed-source verification from runtime validation.
+
+Rollback source is the previously retained fork commit `4c991794acae0c160a1ef02a2ff88f25c2fec90d` (`4c99179`). Preserve access to that source and the previous installation pin before deployment. If rollback is needed, the parent restores the prior pinned installation without deleting user state or rewriting release tags, then fully exits and restarts Pi. Record the rollback pin and reason; do not claim rollback was exercised unless it was.
+
+### Validation limits for this preparation
+
+The metadata worker is authorized only for directed static manifest/workflow inspection, `git diff --check`, and the script-disabled dry-run content preview. It does not run tests, builds, installs, regressions, models, native CLI clients, or integration; it does not create a real package, perform offline loading, push, tag, publish, or deploy. Those separately authorized release-owner steps remain pending.
+
+Prior source-sync evidence reported directed strict no-emit diagnostics decreasing from 65 to 63 with zero new diagnostics; LSP coverage was limited and retained one old `TS18048`. This is a historical baseline, not a fresh all-green check. Do not fix unrelated baseline errors here, treat unavailable JSON/YAML language analysis as clean, or imply full runtime validation from static inspection.
+
+## Original upstream npm release process
+
+The remainder documents the original `giuseppecrj/pi-herdr-agents` npm process only. Its npm-first GitHub Release rule and regression gates do not apply to this fork's bounded manual GitHub-only release above.
+
 GitHub Actions publishes this package when the version in `package.json` changes on `main`. The release workflow reads the package name and version from `package.json`, validates the package, publishes to npm, creates a matching `vX.Y.Z` tag, and creates a GitHub Release with generated notes and a link to the npm package.
 
 The published version must be unique on npm.
@@ -12,7 +45,7 @@ The published version must be unique on npm.
 
 `3.1.0` is a compatible minor release. It adds the request-scoped task-model init events that let a loaded pack approve `/subagents-init` proposals; with no pack offering, the direct writer is unchanged. It was prepared from feature commit `1b6bacd0b5eecb6f83ffba1d5a5ee57a8b0fa944`. It is not published until the release workflow succeeds.
 
-Do not design a release that creates a GitHub Release without a successful npm publish for a new version. The workflow publishes first, then tags and creates the GitHub Release.
+For original upstream npm releases, do not design a release that creates a GitHub Release without a successful npm publish for a new version. The workflow publishes first, then tags and creates the GitHub Release.
 
 ## Prerequisites
 

@@ -1,6 +1,6 @@
 {
   "name": "pi-herdr-agents",
-  "version": "3.1.0",
+  "version": "3.1.0-yuchenhui.1",
   "description": "Asynchronous Pi subagents in Herdr, with optional isolated Git worktrees",
   "keywords": [
     "pi-package",
@@ -18,12 +18,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/giuseppecrj/pi-herdr-agents.git"
+    "url": "git+https://github.com/Yuchenhui/pi-herdr-agents.git"
   },
   "bugs": {
-    "url": "https://github.com/giuseppecrj/pi-herdr-agents/issues"
+    "url": "https://github.com/Yuchenhui/pi-herdr-agents/issues"
   },
-  "homepage": "https://github.com/giuseppecrj/pi-herdr-agents#readme",
+  "homepage": "https://github.com/Yuchenhui/pi-herdr-agents#readme",
   "publishConfig": {
     "access": "public"
   },

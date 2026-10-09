@@ -15,6 +15,8 @@ concurrency:
 jobs:
   detect:
     name: Detect version bump
+    # Only upstream owns the npm package; forks use manual GitHub-only releases.
+    if: github.repository == 'giuseppecrj/pi-herdr-agents'
     runs-on: ubuntu-latest
     permissions:
       contents: read
