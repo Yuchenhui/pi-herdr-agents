@@ -91,6 +91,10 @@ import {
 	writeTaskModelConfig,
 } from "../maestro/core/config/model-config.ts";
 import {
+	TASK_MODEL_INIT_APPROVAL_EVENT,
+	TASK_MODEL_INIT_START_EVENT,
+} from "../maestro/core/config/task-model-init.ts";
+import {
 	loadRoleConfig,
 	parseRoleConfig,
 } from "../maestro/core/config/role-config.ts";
@@ -254,6 +258,10 @@ function createMockExtensionApi(extensionEvents = createEventBus()) {
 			},
 			getAllTools() {
 				return [];
+			},
+			// Pi activates registered tools by default.
+			getActiveTools() {
+				return registeredTools.map((tool) => tool.name);
 			},
 		} as any,
 	};
@@ -8621,6 +8629,19 @@ describe("completion.ts", () => {
 	});
 });
 
+/** An idle command context with the given registry; notifications are recorded. */
+function initContext(modelRegistry: any, notifications: string[] = []) {
+	return {
+		modelRegistry,
+		model: { provider: "p", id: "m" },
+		isIdle: () => true,
+		hasPendingMessages: () => false,
+		ui: { notify: (message: string) => notifications.push(message) },
+	};
+}
+
+const INIT_MODEL = { provider: "p", id: "m", reasoning: false };
+
 describe("commands", () => {
 	it("/subagent list labels every visible agent source without spawning one", async () => {
 		await withIsolatedAgentEnv(
@@ -8733,14 +8754,22 @@ describe("commands", () => {
 			(command) => command.name === "subagents-init",
 		);
 		assert.ok(init, "expected /subagents-init to be registered");
-		await init.handler("", {
-			modelRegistry: { find: () => undefined, getAvailable: () => [] },
-		});
+		await init.handler(
+			"",
+			initContext({ find: () => undefined, getAvailable: () => [INIT_MODEL] }),
+		);
 		assert.equal(sentUserMessages.length, 1);
 		assert.match(sentUserMessages[0], /registry object/);
 		assert.match(sentUserMessages[0], /web search/);
 		assert.match(sentUserMessages[0], /registry-only/);
-		assert.match(sentUserMessages[0], /subagents_write_task_models/);
+		assert.match(
+			sentUserMessages[0],
+			/call subagents_write_task_models with the reviewed draft/,
+		);
+		assert.match(
+			sentUserMessages[0],
+			/expectedConfigRevision equal to configRevision from the brief/,
+		);
 		assert.match(sentUserMessages[0], /\/reload/);
 	});
 
@@ -8816,7 +8845,7 @@ describe("commands", () => {
 			)!;
 			await init.handler(
 				"  Prefer capability over price; keep\nexisting coding choices.  ",
-				{ modelRegistry: registry },
+				initContext(registry),
 			);
 			assert.equal(sentUserMessages.length, 1);
 			const message = sentUserMessages[0];
@@ -8848,6 +8877,11 @@ describe("commands", () => {
 					method: "registry-only",
 				},
 			});
+			assert.equal(
+				brief.configRevision,
+				`sha256:${createHash("sha256").update(before).digest("hex")}`,
+				"the revision covers the same bytes as current",
+			);
 			assert.equal(brief.models.length, 30);
 			assert.deepEqual(
 				brief.models.map((m: any) => m.ref),
@@ -8935,9 +8969,7 @@ describe("commands", () => {
 		}));
 		await registeredCommands
 			.find((command) => command.name === "subagents-init")!
-			.handler("", {
-				modelRegistry: { getAvailable: () => models },
-			});
+			.handler("", initContext({ getAvailable: () => models }));
 		const message = sentUserMessages[0];
 		const json = message.match(/```json\n([\s\S]*?)\n```/);
 		assert.ok(json);
@@ -8964,14 +8996,15 @@ describe("commands", () => {
 		subagentsModule.default(api);
 		await registeredCommands
 			.find((command) => command.name === "subagents-init")!
-			.handler("", {
-				modelRegistry: {
+			.handler(
+				"",
+				initContext({
 					getAvailable: () => [
 						{ provider: "dynamic", id: "model", reasoning: false },
 					],
 					getProviderAuthStatus: () => undefined,
-				},
-			});
+				}),
+			);
 		const json = sentUserMessages[0].match(/```json\n([\s\S]*?)\n```/);
 		assert.ok(json);
 		assert.deepEqual(JSON.parse(json[1]).models[0].auth, { configured: true });
@@ -9000,29 +9033,273 @@ describe("commands", () => {
 		);
 	});
 
-	it("supplies an honest empty init brief without inventing models or writing configuration", async () => {
+	it("reports an empty registry without prompting, asking an approval extension, or writing", async () => {
 		const { api, registeredCommands, sentUserMessages } =
 			createMockExtensionApi();
 		subagentsModule.default(api);
+		let requests = 0;
+		api.events.on(TASK_MODEL_INIT_APPROVAL_EVENT, () => {
+			requests += 1;
+		});
+		const notifications: string[] = [];
 		await registeredCommands
 			.find((command) => command.name === "subagents-init")!
-			.handler("   ", {
-				modelRegistry: {
-					find: () => undefined,
-					getAvailable: () => [],
-					getAll: () => {
-						throw new Error("no fallback catalog");
+			.handler(
+				"   ",
+				initContext(
+					{
+						find: () => undefined,
+						getAvailable: () => [],
+						getAll: () => {
+							throw new Error("no fallback catalog");
+						},
 					},
-				},
+					notifications,
+				),
+			);
+		assert.deepEqual(sentUserMessages, []);
+		assert.equal(requests, 0);
+		assert.deepEqual(notifications, [
+			"Task-model init not started: the active registry has no authenticated models, so there is nothing to rank. Configure a provider, then run /subagents-init again. Nothing was written.",
+		]);
+	});
+
+	it("refuses init without a selected model before asking anyone or prompting", async () => {
+		const { api, registeredCommands, sentUserMessages } =
+			createMockExtensionApi();
+		subagentsModule.default(api);
+		let requests = 0;
+		api.events.on(TASK_MODEL_INIT_APPROVAL_EVENT, () => {
+			requests += 1;
+		});
+		const notifications: string[] = [];
+		await registeredCommands
+			.find((command) => command.name === "subagents-init")!
+			.handler("", {
+				...initContext({ getAvailable: () => [INIT_MODEL] }, notifications),
+				model: undefined,
 			});
+		assert.deepEqual(sentUserMessages, []);
+		assert.equal(requests, 0);
+		assert.deepEqual(notifications, [
+			"Task-model init not started: no model is selected, so Pi cannot run the init prompt. Select a model, then retry. Nothing was written.",
+		]);
+	});
+
+	it("refuses init while a turn runs or messages are queued", async () => {
+		for (const busy of [
+			{ isIdle: () => false },
+			{ hasPendingMessages: () => true },
+		]) {
+			const { api, registeredCommands, sentUserMessages } =
+				createMockExtensionApi();
+			subagentsModule.default(api);
+			let requests = 0;
+			api.events.on(TASK_MODEL_INIT_APPROVAL_EVENT, () => {
+				requests += 1;
+			});
+			const notifications: string[] = [];
+			await registeredCommands
+				.find((command) => command.name === "subagents-init")!
+				.handler("", {
+					...initContext({ getAvailable: () => [INIT_MODEL] }, notifications),
+					...busy,
+				});
+			assert.deepEqual(sentUserMessages, []);
+			assert.equal(requests, 0);
+			assert.deepEqual(notifications, [
+				"Task-model init not started: a turn is in progress or messages are queued. Nothing was queued; retry when idle. Nothing was written.",
+			]);
+		}
+	});
+
+	it("gives the prompt's destination to the one extension that offers approval, in either load order", async () => {
+		for (const order of ["before", "after"]) {
+			const events = createEventBus();
+			const { api, registeredCommands, registeredTools, sentUserMessages } =
+				createMockExtensionApi(events);
+			const requests: any[] = [];
+			const listen = () =>
+				events.on(TASK_MODEL_INIT_APPROVAL_EVENT, (request: any) => {
+					requests.push(request);
+					request.offer({
+						owner: "test-approval",
+						open: () => {
+							registeredTools.push({ name: "test_apply" });
+							return {
+								kind: "ready",
+								destination: {
+									toolName: "test_apply",
+									instructions: "Propose through test_apply once.",
+								},
+								cancel: () => assert.fail("a submitted flow is not cancelled"),
+							};
+						},
+					});
+				});
+			if (order === "before") listen();
+			subagentsModule.default(api);
+			if (order === "after") listen();
+			const ctx = initContext({ getAvailable: () => [INIT_MODEL] });
+			await registeredCommands
+				.find((command) => command.name === "subagents-init")!
+				.handler("prefer x", ctx);
+			assert.equal(requests.length, 1, order);
+			const [request] = requests;
+			assert.equal(request.apiVersion, 1);
+			assert.equal(request.context, ctx, "the live command context");
+			assert.ok(Object.isFrozen(request));
+			assert.ok(Object.isFrozen(request.brief.models[0]));
+			assert.equal(request.brief.operatorPreferences, "prefer x");
+			assert.deepEqual(
+				request.brief.models.map((model: any) => model.ref),
+				["p/m"],
+			);
+			assert.equal(sentUserMessages.length, 1, order);
+			assert.match(
+				sentUserMessages[0],
+				/\n\nPropose through test_apply once\.\n\n/,
+			);
+			assert.doesNotMatch(
+				sentUserMessages[0],
+				/call subagents_write_task_models/i,
+			);
+		}
+	});
+
+	it("never falls back to the direct writer when approval offers conflict or fail", async () => {
+		const offers: Array<[string, (request: any) => void, RegExp]> = [
+			[
+				"two offers",
+				(request) => {
+					request.offer({ owner: "b-pack", open: () => undefined });
+					request.offer({ owner: "a-pack", open: () => undefined });
+				},
+				/more than one extension offered to approve task-model writes \(a-pack, b-pack\)/,
+			],
+			[
+				"a failing opener",
+				(request) => {
+					request.offer({
+						owner: "a-pack",
+						open: () => {
+							throw new Error("cannot open");
+						},
+					});
+				},
+				/a-pack failed to open its approval flow \(cannot open\)/,
+			],
+			[
+				"a refusal",
+				(request) => {
+					request.offer({
+						owner: "a-pack",
+						open: () => ({ kind: "blocked", reason: "no dialog" }),
+					});
+				},
+				/a-pack refused: no dialog/,
+			],
+		];
+		for (const [label, listener, reason] of offers) {
+			const { api, registeredCommands, sentUserMessages } =
+				createMockExtensionApi();
+			subagentsModule.default(api);
+			api.events.on(TASK_MODEL_INIT_APPROVAL_EVENT, listener);
+			const notifications: string[] = [];
+			await registeredCommands
+				.find((command) => command.name === "subagents-init")!
+				.handler(
+					"",
+					initContext({ getAvailable: () => [INIT_MODEL] }, notifications),
+				);
+			assert.deepEqual(sentUserMessages, [], label);
+			assert.equal(notifications.length, 1, label);
+			assert.match(notifications[0], reason, label);
+			assert.match(notifications[0], /Nothing was written\.$/, label);
+		}
+	});
+
+	it("cannot tell a listener that throws before offering from no listener", async () => {
+		const { api, registeredCommands, sentUserMessages } =
+			createMockExtensionApi();
+		subagentsModule.default(api);
+		api.events.on(TASK_MODEL_INIT_APPROVAL_EVENT, () => {
+			throw new Error("broken before offering");
+		});
+		const logged: unknown[][] = [];
+		const consoleError = console.error;
+		console.error = (...args: unknown[]) => {
+			logged.push(args);
+		};
+		try {
+			await registeredCommands
+				.find((command) => command.name === "subagents-init")!
+				.handler("", initContext({ getAvailable: () => [INIT_MODEL] }));
+			await new Promise((resolve) => setImmediate(resolve));
+		} finally {
+			console.error = consoleError;
+		}
+		assert.equal(String(logged[0]?.[1]), "Error: broken before offering");
+		assert.equal(sentUserMessages.length, 1);
+		assert.match(
+			sentUserMessages[0],
+			/call subagents_write_task_models with the reviewed draft/,
+			"the direct prompt runs; an approval extension's writer gate still applies",
+		);
+	});
+
+	it("offers to run init for another extension's start request and leaves rendering to it", async () => {
+		const { api, sentUserMessages } = createMockExtensionApi();
+		subagentsModule.default(api);
+		const notifications: string[] = [];
+		const ctx = initContext(
+			{ getAvailable: () => [INIT_MODEL] },
+			notifications,
+		);
+		const offers: any[] = [];
+		const offer = (value: any) => {
+			offers.push(value);
+			return "recorded";
+		};
+		api.events.emit(TASK_MODEL_INIT_START_EVENT, {
+			apiVersion: 1,
+			context: ctx,
+			preferences: " cheap recon ",
+			offer,
+		});
+		assert.deepEqual(
+			offers.map((entry) => entry.owner),
+			["pi-herdr-agents"],
+		);
+		// Not deepEqual: its assertion signature would narrow the array to never[].
+		assert.equal(sentUserMessages.length, 0, "offering starts nothing");
+		assert.deepEqual(offers[0].start(), {
+			kind: "started",
+			destination: "subagents_write_task_models",
+		});
+		assert.equal(sentUserMessages.length, 1);
 		const json = sentUserMessages[0].match(/```json\n([\s\S]*?)\n```/);
-		assert.ok(json);
-		const brief = JSON.parse(json[1]);
-		assert.equal(brief.operatorPreferences, "");
-		assert.deepEqual(brief.models, []);
-		assert.deepEqual(brief.current, { agents: {} });
-		assert.match(sentUserMessages[0], /no available models.*do not write/i);
-		assert.match(sentUserMessages[0], /not proof of.*successful.*request/i);
+		assert.equal(JSON.parse(json![1]).operatorPreferences, "cheap recon");
+		assert.deepEqual(notifications, [], "the requesting command renders");
+		api.events.emit(TASK_MODEL_INIT_START_EVENT, {
+			apiVersion: 1,
+			context: {},
+			preferences: "x",
+			offer,
+		});
+		api.events.emit(TASK_MODEL_INIT_START_EVENT, {
+			apiVersion: 2,
+			context: ctx,
+			preferences: "x",
+			offer,
+		});
+		assert.equal(offers.length, 2, "only v1 requests get an answer");
+		assert.deepEqual(offers[1].start(), {
+			kind: "not-started",
+			reason:
+				"the start request lacks a usable command context or preferences text",
+		});
+		assert.equal(sentUserMessages.length, 1);
 	});
 
 	it("returns saved tool details and text from normalized config while preserving unrelated preferences", async () => {
@@ -9147,6 +9424,136 @@ describe("commands", () => {
 				false,
 				String(revision),
 			);
+	});
+
+	it("accepts an optional ranking basis that matches tasksMeta.method, returns it, and never saves it", async () => {
+		const dir = createTestDir();
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		try {
+			const { api, registeredTools } = createMockExtensionApi();
+			subagentsModule.default(api);
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					status: { enabled: false },
+					models: { default: "fake/default" },
+				}),
+			);
+			const writer = registeredTools.find(
+				(tool) => tool.name === "subagents_write_task_models",
+			)!;
+			const model = { provider: "fake", id: "worker", reasoning: false };
+			const ctx = {
+				modelRegistry: {
+					find: (provider: string, id: string) =>
+						provider === "fake" && id === "worker" ? model : undefined,
+					getAvailable: () => [model],
+					hasConfiguredAuth: () => true,
+				},
+			};
+			const tasks = { coding: ["fake/worker"] };
+			const research = {
+				generatedAt: "2026-10-09T00:00:00Z",
+				method: "research",
+			};
+			const basis = {
+				kind: "research",
+				sources: [
+					{
+						url: "https://vendor.example/evals",
+						influence: "coding: ranks worker first on its agentic suite",
+					},
+				],
+				uncertainty: "vendor-reported results only",
+			};
+			assert.equal(
+				Value.Check(writer.parameters, { tasks, tasksMeta: research, basis }),
+				true,
+			);
+			const result = await writer.execute(
+				"with-basis",
+				{ tasks, tasksMeta: research, basis },
+				undefined,
+				undefined,
+				ctx,
+			);
+			assert.deepEqual(result.details.basis, basis);
+			assert.ok(result.content[0].text.includes("vendor.example/evals"));
+			const saved = readFileSync(configPath, "utf8");
+			assert.deepEqual(JSON.parse(saved), {
+				status: { enabled: false },
+				models: { default: "fake/default", tasks, tasksMeta: research },
+			});
+			assert.equal(
+				result.details.configRevision,
+				readConfigRevision(configPath),
+			);
+
+			const legacy = await writer.execute(
+				"legacy-research",
+				{ tasks, tasksMeta: research },
+				undefined,
+				undefined,
+				ctx,
+			);
+			assert.equal(Object.hasOwn(legacy.details, "basis"), false);
+			const before = readFileSync(configPath, "utf8");
+
+			const registryOnly = {
+				generatedAt: "2026-10-09T00:00:00Z",
+				method: "registry-only",
+			};
+			const invalid: Array<[object, unknown, RegExp]> = [
+				[research, { kind: "registry-only" }, /must equal tasksMeta\.method/],
+				[registryOnly, basis, /must equal tasksMeta\.method/],
+				[research, { ...basis, sources: [] }, /at least one source/],
+				[
+					research,
+					{ ...basis, sources: [{ url: "ftp://x.example/a", influence: "x" }] },
+					/http\(s\) URL/,
+				],
+				[
+					research,
+					{ ...basis, sources: [{ url: "not a url", influence: "x" }] },
+					/http\(s\) URL/,
+				],
+				[
+					research,
+					{ ...basis, sources: [{ url: "https://x.example", influence: " " }] },
+					/influence must say/,
+				],
+				[research, { ...basis, uncertainty: "\n" }, /uncertainty/],
+				[registryOnly, { kind: "registry-only", note: "x" }, /no other fields/],
+				[registryOnly, null, /must be an object/],
+			];
+			for (const [tasksMeta, value, reason] of invalid)
+				await assert.rejects(
+					writer.execute(
+						"invalid-basis",
+						{ tasks: { review: ["fake/worker"] }, tasksMeta, basis: value },
+						undefined,
+						undefined,
+						ctx,
+					),
+					reason,
+					JSON.stringify(value),
+				);
+			assert.equal(readFileSync(configPath, "utf8"), before, "nothing written");
+			assert.equal(
+				Value.Check(writer.parameters, {
+					tasks,
+					tasksMeta: research,
+					basis: { ...basis, sources: [] },
+				}),
+				false,
+			);
+		} finally {
+			restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("refuses a conditional tool write after a later change to the approved config snapshot", async () => {

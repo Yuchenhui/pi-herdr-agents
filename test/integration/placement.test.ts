@@ -89,6 +89,41 @@ function panes(
 	).result.panes;
 }
 
+type LifecycleEvent = { reason?: "quit" };
+
+/**
+ * Mirrors Pi's extension lifecycle registry: each `on` call appends a handler,
+ * and an emit awaits every handler in registration order. A single-valued map
+ * would let a later `session_shutdown` registration replace host shutdown.
+ */
+function createLifecycleHandlers<Context>() {
+	const registered = new Map<string, Function[]>();
+	return {
+		on(name: string, handler: Function) {
+			registered.set(name, [...(registered.get(name) ?? []), handler]);
+			return () =>
+				registered.set(
+					name,
+					(registered.get(name) ?? []).filter((entry) => entry !== handler),
+				);
+		},
+		// Like Pi, a failing handler does not skip later ones; unlike Pi, the
+		// fixture surfaces those failures instead of reporting and continuing.
+		async emit(name: string, event: LifecycleEvent, ctx: Context) {
+			const errors: unknown[] = [];
+			for (const handler of registered.get(name) ?? []) {
+				try {
+					await handler(event, ctx);
+				} catch (error) {
+					errors.push(error);
+				}
+			}
+			if (errors.length > 0)
+				throw new AggregateError(errors, `${name} handler failed`);
+		},
+	};
+}
+
 const PLACEMENT_TEST_COUNT = 14;
 const PLACEMENT_SUITE_TIMEOUT = PLACEMENT_TEST_COUNT * 30_000;
 
@@ -433,7 +468,7 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 				const previousId = process.env.PI_SUBAGENT_ID;
 				delete process.env.PI_SUBAGENT_ID;
 				const tools = new Map<string, any>();
-				const handlers = new Map<string, Function>();
+				const lifecycle = createLifecycleHandlers<typeof ctx>();
 				const deliveries: Array<{
 					type: string;
 					panes: string[];
@@ -441,7 +476,7 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 				}> = [];
 				const api: Partial<ExtensionAPI> = {
 					events: createEventBus(),
-					on: (name: string, handler: Function) => handlers.set(name, handler),
+					on: lifecycle.on,
 					registerTool: (tool: any) => tools.set(tool.name, tool),
 					registerCommand() {},
 					registerShortcut() {},
@@ -492,7 +527,7 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 				try {
 					// SAFETY: this host implements the public SDK methods exercised by these tools.
 					subagentsExtension(api as ExtensionAPI);
-					handlers.get("session_start")?.({}, ctx);
+					await lifecycle.emit("session_start", {}, ctx);
 					const baseline = new Set(
 						panes(env.workspaceId).map((pane) => pane.pane_id),
 					);
@@ -613,7 +648,7 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 						);
 					}
 				} finally {
-					await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+					await lifecycle.emit("session_shutdown", { reason: "quit" }, ctx);
 					if (previousId === undefined) delete process.env.PI_SUBAGENT_ID;
 					else process.env.PI_SUBAGENT_ID = previousId;
 				}
@@ -624,7 +659,7 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 				const previousId = process.env.PI_SUBAGENT_ID;
 				delete process.env.PI_SUBAGENT_ID;
 				const tools = new Map<string, any>();
-				const handlers = new Map<string, Function>();
+				const lifecycle = createLifecycleHandlers<typeof ctx>();
 				let childSurface: string;
 				let childPid: number | undefined;
 				let rejectedDeliveries = 0;
@@ -632,7 +667,7 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 				let worktree: { workspaceId: string; path: string } | undefined;
 				const api: Partial<ExtensionAPI> = {
 					events: createEventBus(),
-					on: (name: string, handler: Function) => handlers.set(name, handler),
+					on: lifecycle.on,
 					registerTool: (tool: any) => tools.set(tool.name, tool),
 					registerCommand() {},
 					registerShortcut() {},
@@ -656,7 +691,8 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 							)?.pid;
 							// Quit while a real task event remains undelivered. A later
 							// drain would hit the same unavailable parent SDK binding.
-							shutdown = handlers.get("session_shutdown")!(
+							shutdown = lifecycle.emit(
+								"session_shutdown",
 								{ reason: "quit" },
 								ctx,
 							);
@@ -708,7 +744,7 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 					}
 					// SAFETY: headless host implements the public SDK methods used here.
 					subagentsExtension(api as ExtensionAPI);
-					handlers.get("session_start")?.({}, ctx);
+					await lifecycle.emit("session_start", {}, ctx);
 					const baseline = panes(env.workspaceId).map((pane) => pane.pane_id);
 					type PersistentQuitParams = {
 						name: string;
@@ -778,7 +814,7 @@ writeFileSync(${JSON.stringify(report)}, JSON.stringify(result));
 						"quit must not drain pending task events again",
 					);
 				} finally {
-					await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+					await lifecycle.emit("session_shutdown", { reason: "quit" }, ctx);
 					if (worktree) {
 						execFileSync("herdr", [
 							"worktree",

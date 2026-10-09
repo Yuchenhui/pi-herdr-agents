@@ -15,6 +15,8 @@ import { dirname, join } from "node:path";
 import { isPlainObject, isString } from "./type-guards.ts";
 
 import {
+	type RankingBasis,
+	type ResearchSource,
 	TASK_CATEGORIES,
 	type TaskCategory,
 	type TaskPreferences,
@@ -199,18 +201,28 @@ export function resolveModelDefault(
 }
 
 export function loadModelConfig(configDir: string): ModelConfig {
+	return readModelConfigSnapshot(configDir).config;
+}
+
+export interface ModelConfigSnapshot {
+	config: ModelConfig;
+	/** Revision of the exact bytes `config` was parsed from. */
+	revision: string;
+}
+
+/** Parse the saved model settings and revision them from one read of the file. */
+export function readModelConfigSnapshot(
+	configDir: string,
+): ModelConfigSnapshot {
 	const configPath = join(configDir, "config.json");
-	let raw: string;
+	const bytes = readBytesIfExists(configPath);
+	if (bytes == null)
+		return { config: { agents: {} }, revision: MISSING_CONFIG_REVISION };
 	try {
-		raw = readFileSync(configPath, "utf8");
-	} catch (error) {
-		// SAFETY: readFileSync errors expose the Node errno code.
-		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			return { agents: {} };
-		throw error;
-	}
-	try {
-		return parseModelConfig(JSON.parse(raw), configPath);
+		return {
+			config: parseModelConfig(JSON.parse(bytes.toString("utf8")), configPath),
+			revision: computeConfigRevision(bytes),
+		};
 	} catch (error) {
 		if (error instanceof SyntaxError)
 			throw new Error(
@@ -218,6 +230,67 @@ export function loadModelConfig(configDir: string): ModelConfig {
 			);
 		throw error;
 	}
+}
+
+function invalidBasis(message: string): never {
+	throw new Error(`Invalid ranking basis: ${message}`);
+}
+
+function isUsableUrl(value: string): boolean {
+	const url = URL.parse(value);
+	return (
+		url !== null &&
+		(url.protocol === "https:" || url.protocol === "http:") &&
+		url.hostname !== ""
+	);
+}
+
+/**
+ * Validate a writer call's optional ranking basis against its tasksMeta.method.
+ * Code checks shape and consistency only; it cannot prove a source was read.
+ */
+export function parseRankingBasis(
+	value: any,
+	method: TaskPreferencesMeta["method"],
+): RankingBasis {
+	if (!isPlainObject(value)) invalidBasis("basis must be an object");
+	if (value.kind !== method)
+		invalidBasis(
+			`basis.kind ${JSON.stringify(value.kind)} must equal tasksMeta.method ${JSON.stringify(method)}`,
+		);
+	if (value.kind === "registry-only") {
+		if (Object.keys(value).length !== 1)
+			invalidBasis("a registry-only basis has no other fields");
+		return { kind: "registry-only" };
+	}
+	if (
+		Object.keys(value).some(
+			(key) => key !== "kind" && key !== "sources" && key !== "uncertainty",
+		)
+	)
+		invalidBasis("a research basis has only kind, sources and uncertainty");
+	if (!Array.isArray(value.sources) || value.sources.length === 0)
+		invalidBasis(
+			"research needs at least one source that informed the ranking",
+		);
+	// SAFETY: the check above rejected an empty list, and map keeps its length.
+	const sources = value.sources.map((source: any, index: number) => {
+		if (
+			!isPlainObject(source) ||
+			Object.keys(source).some((key) => key !== "url" && key !== "influence")
+		)
+			invalidBasis(`sources[${index}] has only url and influence`);
+		if (!isString(source.url) || !isUsableUrl(source.url))
+			invalidBasis(`sources[${index}].url must be an http(s) URL with a host`);
+		if (!isString(source.influence) || source.influence.trim() === "")
+			invalidBasis(
+				`sources[${index}].influence must say how the source informed the ranking`,
+			);
+		return { url: source.url, influence: source.influence };
+	}) as [ResearchSource, ...ResearchSource[]];
+	if (!isString(value.uncertainty) || value.uncertainty.trim() === "")
+		invalidBasis("research must disclose its remaining uncertainty");
+	return { kind: "research", sources, uncertainty: value.uncertainty };
 }
 
 export interface SavedTaskModelConfig {

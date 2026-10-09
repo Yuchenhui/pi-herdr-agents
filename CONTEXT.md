@@ -210,7 +210,9 @@ architecture to planning and diagnosis, coding to workers, review to reviewers,
 QA to software and test runners, and docs to documentation workers. Categories
 describe work, not complexity. `/subagents-init [preferences]` drafts them from
 the active extension-loaded registry's synchronous snapshot and existing saved
-choices, with source-based research when available. A dynamic provider awaiting
+choices, with source-based research when available. A single loaded extension
+that offers on the task-model init approval event owns approval and the write
+instead of the host writer. A dynamic provider awaiting
 its initial catalog refresh might be absent. `task:<category>` is a subagent
 model selector, not a command or parent model change. Ordered authenticated
 candidate plans resolve before launch; ordinary nonpersistent runs can retry
@@ -226,6 +228,14 @@ independent. Cross-family verification must not use this fallback. Family is
 the independence boundary; project policy may separately require a
 different provider.
 _Avoid_: Generic tier, reviewer-family enforcement, per-step routing
+
+**Ranking basis**:
+What a task-model proposal's ranking rests on, as the proposing model submitted
+it: `registry-only`, or `research` with the http(s) sources consulted in that
+run, how each influenced the ranking, and the remaining uncertainty. It travels
+with one write for review and is never saved; `tasksMeta.method` keeps its kind.
+Code checks its shape, not that a source was read.
+_Avoid_: Verified research, evidence store
 
 **Loop template**:
 A future reusable orchestration definition beside `models`, describing stages,
